@@ -1,0 +1,15 @@
+{
+  "name": "gsasl",
+  "version": "2.2.2",
+  "port-version": 100,
+  "description": "GNU SASL library, built from the release tarball's pre-generated configure script (no autoreconf, so no autoconf-archive needed)",
+  "homepage": "https://www.gnu.org/software/gsasl/",
+  "license": "LGPL-2.1-or-later",
+  "supports": "!windows & !uwp",
+  "dependencies": [
+    {
+      "name": "vcpkg-make",
+      "host": true
+    }
+  ]
+}

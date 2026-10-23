@@ -14,6 +14,7 @@ cluster used to exercise the `hdfs` extension end-to-end.
 - `sql/hdfs_permissions.test` — permission-error handling. Run separately with
   `HADOOP_USER_NAME=guest` (a non-superuser; the main suite's superuser bypasses
   HDFS permission checks and can never see an AccessControlException).
+- `cpp/hdfs_glob_test.cpp` — unit tests for the glob engine (`make test_glob`).
 - `docker/` — a single-node HDFS (NameNode + DataNode) image + compose file.
 - `hdfs-conf/` — host-side Hadoop client config (`core-site.xml` /
   `hdfs-site.xml`) for talking to that cluster. Pointed at via `HADOOP_CONF_DIR`.

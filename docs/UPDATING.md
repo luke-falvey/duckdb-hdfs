@@ -12,6 +12,17 @@ When a new DuckDB is released, update the extension to target it as follows:
   - Do **not** pass `duckdb_version`: with a `duckdb` submodule present, CI uses the commit it pins. That keeps local
     and CI builds on the same DuckDB.
 
+# Updating libhdfs3
+The HDFS client is built by the vcpkg overlay port in `vcpkg_ports/libhdfs3/`, pinned to a ClickHouse/libhdfs3 commit.
+To move to a newer commit:
+
+- Update `REF` and `SHA512` in `vcpkg_ports/libhdfs3/portfile.cmake` (`curl -L <archive url> | shasum -a 512`) and
+  `version-date` in `vcpkg_ports/libhdfs3/vcpkg.json`.
+- Check that the patches in that directory still apply, and drop any that upstream has absorbed.
+- Check `vcpkg_ports/libhdfs3/build/CMakeLists.txt` against upstream's source list (ClickHouse's
+  `contrib/libhdfs3-cmake/CMakeLists.txt` is a good reference).
+- Rebuild from scratch and run `make test`, `make test_glob` and `test/scripts/run_hdfs_tests.sh`.
+
 # API changes
 DuckDB extensions built with this extension template are built against the internal C++ API of DuckDB. This API is not guaranteed to be stable.
 What this means for extension development is that when updating your extensions DuckDB target version using the above steps, you may run into the fact that your extension no longer builds properly.

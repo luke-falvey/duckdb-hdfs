@@ -1,9 +1,9 @@
 # DuckDB HDFS extension
 
 `hdfs` adds a native HDFS filesystem to DuckDB: read and write `hdfs://` URLs
-directly — no JVM, no `libhdfs`. It is backed by the pure-Rust
-[`hdfs-native`](https://github.com/Kimahriman/hdfs-native) client through a
-thin C FFI bridge (`hdfs-bridge/`).
+directly — no JVM, no `libhdfs`. It is backed by the native C++
+[`libhdfs3`](https://github.com/ClickHouse/libhdfs3) client (ClickHouse's
+maintained fork), which speaks the Hadoop RPC and DataNode protocols itself.
 
 ```sql
 -- Read
@@ -22,10 +22,19 @@ COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORM
 - Globbing, directory listing, file metadata, and directory/file management
   (create/remove directories, remove files, rename).
 - Concurrent positional reads (DuckDB's parallel Parquet reader).
-- HDFS encryption zones (Transparent Data Encryption): data is
-  decrypted/encrypted client-side, unwrapping keys via the KMS over TLS.
-  Requires the Hadoop key provider to be configured
-  (`hadoop.security.key.provider.path` / `dfs.encryption.key.provider.uri`).
+- NameNode HA (`dfs.nameservices`, e.g. `hdfs://mycluster/path`) and
+  erasure-coded files.
+
+## Not supported yet
+
+- **Kerberos** (`hadoop.security.authentication=kerberos`): connecting fails
+  with a clear error. Only simple authentication works.
+- **Encryption zones** (Transparent Data Encryption): reading or writing a
+  file in an encryption zone fails with an error rather than returning
+  encrypted bytes.
+- **Wire encryption** (`hadoop.rpc.protection` = integrity/privacy,
+  `dfs.data.transfer.protection`).
+- Renaming over an existing file is not atomic: the target is deleted first.
 
 ## Listing and metadata
 
@@ -93,14 +102,13 @@ SET hdfs_list_parallelism = 64;
 
 ### Connection configuration
 
-`hdfs-native` resolves connection config from the standard Hadoop
-environment, exactly as the Hadoop CLI tools do:
+Connection config comes from the standard Hadoop environment, as for the
+Hadoop CLI tools:
 
 - **Cluster config** (`core-site.xml` / `hdfs-site.xml`): `HADOOP_CONF_DIR`,
   or failing that `HADOOP_HOME/etc/hadoop`.
 - **Effective user**: `HADOOP_USER_NAME` (or `HADOOP_PROXY_USER`), else the
-  current OS account; on a Kerberos-secured cluster the identity comes from
-  the ticket/keytab.
+  current OS account.
 
 ```sh
 export HADOOP_CONF_DIR=/etc/hadoop/conf
@@ -112,16 +120,19 @@ the client is created lazily.
 
 ## Building
 
-Targets DuckDB v2.0.0 (the commit pinned by the `duckdb` submodule). Requires
-a Rust toolchain (for the bridge) plus the usual DuckDB extension build
-prerequisites; dependencies are managed with vcpkg.
+Targets DuckDB v2.0.0 (the commit pinned by the `duckdb` submodule). Needs a
+C++17 compiler, CMake, and [vcpkg](https://vcpkg.io) for the HDFS client and
+its dependencies (protobuf, libxml2, gsasl), plus `make` and `pkg-config`.
+vcpkg builds libhdfs3 and gsasl from the overlay ports in `vcpkg_ports/`.
 
 ```sh
 git submodule update --init --recursive
+git clone https://github.com/microsoft/vcpkg ~/vcpkg && ~/vcpkg/bootstrap-vcpkg.sh
+export VCPKG_TOOLCHAIN_PATH=~/vcpkg/scripts/buildsystems/vcpkg.cmake
 ```
 
 ```sh
-make            # builds hdfs-bridge (cargo) + the extension + duckdb
+make            # builds libhdfs3 (via vcpkg) + the extension + duckdb
 ```
 
 DuckDB v2 no longer derives its version from `git describe`, so a plain local
@@ -144,7 +155,8 @@ Artifacts:
 Tests that don't need a cluster run with:
 
 ```sh
-make test
+make test         # SQL tests (cluster tests are skipped)
+make test_glob    # unit tests for the glob engine
 ```
 
 The HDFS integration tests (`test/sql/hdfs.test`) run against a real
@@ -175,7 +187,22 @@ reachable from the host is advertising the DataNode as `localhost` and setting
 - `src/` — DuckDB extension (C++): `hdfs_extension.cpp` registers the filesystem
   and settings; `hdfs_filesystem.cpp` implements the `FileSystem`;
   `hdfs_functions.cpp` implements the metadata SQL functions.
-- `hdfs-bridge/` — Rust staticlib wrapping `hdfs-native` behind a C ABI; its
-  header (`hdfs-bridge/include/hdfs_bridge.h`) is generated from the Rust
-  definitions by cbindgen on `cargo build` (do not edit).
+- `src/hdfs_bridge.cpp` — the HDFS client layer on top of libhdfs3, behind the
+  small C API in `src/include/hdfs_bridge.h` (the only file that includes
+  libhdfs3 headers): connections, reads, writes, and the parallel streaming
+  directory walk. `src/hdfs_glob.cpp` is the glob engine.
+- `vcpkg_ports/libhdfs3/` — vcpkg port that builds libhdfs3 (pinned commit,
+  our own CMake build, and small patches). `vcpkg_ports/gsasl/` builds gsasl
+  from its release tarball, so CI images don't need extra autotools packages.
 - `test/` — SQL tests, Docker cluster, and helper scripts.
+
+## Third-party code
+
+The extension statically links:
+[libhdfs3](https://github.com/ClickHouse/libhdfs3) (Apache-2.0),
+[protobuf](https://github.com/protocolbuffers/protobuf) and
+[Abseil](https://github.com/abseil/abseil-cpp) (BSD-3-Clause / Apache-2.0),
+[libxml2](https://gitlab.gnome.org/GNOME/libxml2) (MIT), zlib (zlib), and
+[GNU SASL](https://www.gnu.org/software/gsasl/) (LGPL-2.1-or-later). Static
+linking of an LGPL library carries obligations (e.g. allowing relinking);
+review them before redistributing binaries.
