@@ -54,7 +54,7 @@ struct HdfsEntry {
 struct HdfsFileHandle : public FileHandle {
 	HdfsFileHandle(FileSystem &fs, string path, FileOpenFlags flags, std::shared_ptr<hdfs_client_t> client,
 	               hdfs_reader_t *reader, hdfs_writer_t *writer)
-	    : FileHandle(fs, std::move(path), flags), client(std::move(client)), reader(reader), writer(writer) {
+	    : FileHandle(fs, std::move(path), std::move(flags)), client(std::move(client)), reader(reader), writer(writer) {
 	}
 
 	~HdfsFileHandle() override {
@@ -144,6 +144,15 @@ public:
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
+	// The option-taking variants DuckDB's COPY uses to create and clean up its
+	// output directories. CreateDirectoryExtended reports whether this call
+	// created the directory (HDFS mkdirs also creates missing parents, so SINGLE
+	// behaves like RECURSIVE). RemoveDirectoryExtended in SINGLE mode removes
+	// only an existing, empty directory and returns false otherwise.
+	bool CreateDirectoryExtended(const string &directory, const CreateDirectoryOptions &options,
+	                             optional_ptr<FileOpener> opener = nullptr) override;
+	bool RemoveDirectoryExtended(const string &directory, const RemoveDirectoryOptions &options,
+	                             optional_ptr<FileOpener> opener = nullptr) override;
 	// Extended listing: each entry carries type/size/last-modified in
 	// OpenFileInfo::extended_info, so DuckDB doesn't re-stat per file. The base
 	// FileSystem::ListFiles(name, is_dir) overload routes through this.

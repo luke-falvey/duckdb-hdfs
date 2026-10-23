@@ -64,3 +64,9 @@ statement error
 SELECT * FROM hdfs_ls('hdfs://localhost:9000/permtest/locked/**', skip_permission_errors := true);
 ----
 Permission denied
+
+# hdfs_exists reports a permission failure as an error, not as "does not exist".
+statement error
+SELECT hdfs_exists('hdfs://localhost:9000/permtest/locked/b.csv');
+----
+Permission denied

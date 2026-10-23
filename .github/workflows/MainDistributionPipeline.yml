@@ -14,13 +14,13 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
     with:
-      duckdb_version: v1.5.4
-      ci_tools_version: v1.5-variegata
+      ci_tools_version: v2.0-cyanoptera
       extension_name: hdfs
       # The Rust FFI bridge (hdfs-bridge) is built via Corrosion during cmake.
-      extra_toolchains: "rust"
+      # DuckDB itself is built from the commit pinned by the duckdb submodule.
+      enable_rust: true
       # hdfs-native depends on tokio (async networking), which cannot target
       # WebAssembly, and the rustls/aws-lc TLS stack is not built for Windows
       # here. Restrict to the Linux/macOS desktop+server platforms.
@@ -28,10 +28,9 @@ jobs:
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v2.0-cyanoptera
     with:
-      duckdb_version: v1.5.4
-      ci_tools_version: v1.5-variegata
+      ci_tools_version: v2.0-cyanoptera
       extension_name: hdfs
       format_checks: "format;tidy"
       # clang-tidy configures the cmake build, which builds the Rust bridge.

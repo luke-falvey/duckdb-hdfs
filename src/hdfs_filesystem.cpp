@@ -431,6 +431,52 @@ void HdfsFileSystem::RemoveDirectory(const string &directory, optional_ptr<FileO
 	}
 }
 
+bool HdfsFileSystem::CreateDirectoryExtended(const string &directory, const CreateDirectoryOptions &options,
+                                             optional_ptr<FileOpener> opener) {
+	if (DirectoryExists(directory, opener)) {
+		return false;
+	}
+	CreateDirectory(directory, opener);
+	return true;
+}
+
+bool HdfsFileSystem::RemoveDirectoryExtended(const string &directory, const RemoveDirectoryOptions &options,
+                                             optional_ptr<FileOpener> opener) {
+	if (options.mode == RemoveDirectoryMode::RECURSIVE) {
+		if (!DirectoryExists(directory, opener)) {
+			return false;
+		}
+		RemoveDirectory(directory, opener);
+		return true;
+	}
+	// SINGLE: never remove contents. Check the target is an empty directory
+	// (hidden entries count) before a non-recursive delete.
+	if (!DirectoryExists(directory, opener)) {
+		return false;
+	}
+	HdfsWalkOptions walk;
+	walk.include_hidden = true;
+	auto stream = OpenListStream(directory, 1, walk);
+	vector<HdfsEntry> children;
+	if (stream->Next(children, 1)) {
+		return false;
+	}
+	string authority;
+	string hdfs_path;
+	ParseHdfsPath(directory, authority, hdfs_path);
+	BridgeStatus status;
+	Execute(authority, status, [&](const std::shared_ptr<hdfs_client_t> &client, hdfs_status_t *st) {
+		return hdfs_bridge_delete(client.get(), hdfs_path.c_str(), /*recursive=*/false, st) == 0;
+	});
+	if (status.Ok()) {
+		return true;
+	}
+	if (status.IsNotFound()) {
+		return false;
+	}
+	throw IOException("Failed to remove HDFS directory '%s': %s", directory, status.Message());
+}
+
 void HdfsFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	string authority;
 	string hdfs_path;

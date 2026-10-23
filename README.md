@@ -112,11 +112,25 @@ the client is created lazily.
 
 ## Building
 
-Requires a Rust toolchain (for the bridge) plus the usual DuckDB extension
-build prerequisites; dependencies are managed with vcpkg.
+Targets DuckDB v2.0.0 (the commit pinned by the `duckdb` submodule). Requires
+a Rust toolchain (for the bridge) plus the usual DuckDB extension build
+prerequisites; dependencies are managed with vcpkg.
+
+```sh
+git submodule update --init --recursive
+```
 
 ```sh
 make            # builds hdfs-bridge (cargo) + the extension + duckdb
+```
+
+DuckDB v2 no longer derives its version from `git describe`, so a plain local
+build reports `v2.0.0-devN`. A loadable extension built that way only loads
+into that same build. To build one that loads into a stock DuckDB v2.0.0, set
+the version explicitly (CI does this automatically):
+
+```sh
+DUCKDB_VERSION=v2.0.0 make
 ```
 
 Artifacts:

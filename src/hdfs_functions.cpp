@@ -7,6 +7,7 @@
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
 namespace duckdb {
@@ -51,7 +52,7 @@ enum ColumnIndex : idx_t {
 	COL_COUNT
 };
 
-void DefineMetadataSchema(vector<LogicalType> &types, vector<string> &names) {
+void DefineMetadataSchema(vector<LogicalType> &types, vector<Identifier> &names) {
 	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::BIGINT,
 	         LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::USMALLINT,
 	         LogicalType::INTEGER, LogicalType::BIGINT,  LogicalType::TIMESTAMP, LogicalType::TIMESTAMP};
@@ -81,7 +82,7 @@ struct HdfsMetaBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> HdfsMetaBind(ClientContext &context, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<HdfsTableFunctionInfo>();
 	auto result = make_uniq<HdfsMetaBindData>();
 	result->hdfs = info.hdfs;
@@ -178,18 +179,18 @@ void HdfsMetaExecute(ClientContext &context, TableFunctionInput &data_p, DataChu
 		state.offset += count;
 	}
 
-	auto path_data = FlatVector::GetData<string_t>(output.data[COL_PATH]);
-	auto name_data = FlatVector::GetData<string_t>(output.data[COL_NAME]);
-	auto type_data = FlatVector::GetData<string_t>(output.data[COL_TYPE]);
-	auto size_data = FlatVector::GetData<int64_t>(output.data[COL_SIZE]);
-	auto owner_data = FlatVector::GetData<string_t>(output.data[COL_OWNER]);
-	auto group_data = FlatVector::GetData<string_t>(output.data[COL_GROUP]);
-	auto perm_data = FlatVector::GetData<string_t>(output.data[COL_PERMISSIONS]);
-	auto mode_data = FlatVector::GetData<uint16_t>(output.data[COL_MODE]);
-	auto repl_data = FlatVector::GetData<int32_t>(output.data[COL_REPLICATION]);
-	auto block_data = FlatVector::GetData<int64_t>(output.data[COL_BLOCK_SIZE]);
-	auto mtime_data = FlatVector::GetData<timestamp_t>(output.data[COL_LAST_MODIFIED]);
-	auto atime_data = FlatVector::GetData<timestamp_t>(output.data[COL_LAST_ACCESSED]);
+	auto path_data = FlatVector::GetDataMutable<string_t>(output.data[COL_PATH]);
+	auto name_data = FlatVector::GetDataMutable<string_t>(output.data[COL_NAME]);
+	auto type_data = FlatVector::GetDataMutable<string_t>(output.data[COL_TYPE]);
+	auto size_data = FlatVector::GetDataMutable<int64_t>(output.data[COL_SIZE]);
+	auto owner_data = FlatVector::GetDataMutable<string_t>(output.data[COL_OWNER]);
+	auto group_data = FlatVector::GetDataMutable<string_t>(output.data[COL_GROUP]);
+	auto perm_data = FlatVector::GetDataMutable<string_t>(output.data[COL_PERMISSIONS]);
+	auto mode_data = FlatVector::GetDataMutable<uint16_t>(output.data[COL_MODE]);
+	auto repl_data = FlatVector::GetDataMutable<int32_t>(output.data[COL_REPLICATION]);
+	auto block_data = FlatVector::GetDataMutable<int64_t>(output.data[COL_BLOCK_SIZE]);
+	auto mtime_data = FlatVector::GetDataMutable<timestamp_t>(output.data[COL_LAST_MODIFIED]);
+	auto atime_data = FlatVector::GetDataMutable<timestamp_t>(output.data[COL_LAST_ACCESSED]);
 
 	for (idx_t i = 0; i < count; i++) {
 		const auto &entry = rows[i];
@@ -217,10 +218,10 @@ void HdfsMetaExecute(ClientContext &context, TableFunctionInput &data_p, DataChu
 		mtime_data[i] = Timestamp::FromEpochMs(static_cast<int64_t>(entry.mtime));
 		atime_data[i] = Timestamp::FromEpochMs(static_cast<int64_t>(entry.atime));
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
-TableFunction MakeMetaFunction(const string &name) {
+TableFunction MakeMetaFunction(const char *name) {
 	// The operation and filesystem are carried on function_info (set at
 	// registration) and read in bind; the schema/execution are shared.
 	return TableFunction(name, {LogicalType::VARCHAR}, HdfsMetaExecute, HdfsMetaBind, HdfsMetaInit);
@@ -229,7 +230,7 @@ TableFunction MakeMetaFunction(const string &name) {
 // hdfs_exists(path) -> BOOLEAN
 void HdfsExistsExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	auto *hdfs = func_expr.function.function_info->Cast<HdfsScalarFunctionInfo>().hdfs;
+	auto *hdfs = func_expr.Function().GetExtraFunctionInfo().Cast<HdfsScalarFunctionInfo>().hdfs;
 	UnaryExecutor::Execute<string_t, bool>(args.data[0], result, args.size(),
 	                                       [&](string_t path) { return hdfs->Exists(path.GetString()); });
 }
@@ -241,8 +242,12 @@ void RegisterHdfsFunctions(ExtensionLoader &loader, HdfsFileSystem *hdfs) {
 	auto ls = MakeMetaFunction("hdfs_ls");
 	ls.function_info = make_shared_ptr<HdfsTableFunctionInfo>(hdfs, HdfsMetaOp::LIST);
 	// Per-call overrides of the same-named hdfs_* settings (both default false).
-	ls.named_parameters["skip_permission_errors"] = LogicalType::BOOLEAN;
-	ls.named_parameters["include_hidden"] = LogicalType::BOOLEAN;
+	// They have no declared default: a call that leaves one out doesn't pass it,
+	// and bind falls back to the setting.
+	ls.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("skip_permission_errors", LogicalType::BOOLEAN);
+		options.Add("include_hidden", LogicalType::BOOLEAN);
+	});
 	loader.RegisterFunction(ls);
 
 	// hdfs_stat(path)
@@ -252,7 +257,10 @@ void RegisterHdfsFunctions(ExtensionLoader &loader, HdfsFileSystem *hdfs) {
 
 	// hdfs_exists(path) -> BOOLEAN
 	ScalarFunction exists("hdfs_exists", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, HdfsExistsExecute);
-	exists.function_info = make_shared_ptr<HdfsScalarFunctionInfo>(hdfs);
+	exists.SetExtraFunctionInfo(make_shared_ptr<HdfsScalarFunctionInfo>(hdfs));
+	// The HDFS lookup can fail (permission denied, NameNode unreachable). Without
+	// this, DuckDB reports any thrown error as a non-fallible-function bug.
+	exists.SetFallible();
 	loader.RegisterFunction(exists);
 }
 

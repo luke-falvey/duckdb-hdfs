@@ -1,0 +1,117 @@
+# name: test/sql/hdfs_no_cluster.test
+# description: Extension surface checks that need no HDFS cluster (run by `make test`).
+# group: [sql]
+
+require hdfs
+
+# --- settings ------------------------------------------------------------------
+# All three extension settings are registered with their documented defaults.
+
+query TT
+SELECT name, value FROM duckdb_settings() WHERE name LIKE 'hdfs_%' ORDER BY name;
+----
+hdfs_include_hidden	false
+hdfs_list_parallelism	16
+hdfs_skip_permission_errors	false
+
+statement ok
+SET hdfs_list_parallelism = 64;
+
+query T
+SELECT current_setting('hdfs_list_parallelism');
+----
+64
+
+statement ok
+RESET hdfs_list_parallelism;
+
+statement ok
+SET hdfs_include_hidden = true;
+
+statement ok
+SET hdfs_skip_permission_errors = true;
+
+statement ok
+RESET hdfs_include_hidden;
+
+statement ok
+RESET hdfs_skip_permission_errors;
+
+# --- metadata function schemas -----------------------------------------------
+# DESCRIBE only binds the function, so no connection is made. Port 1 on
+# loopback is never an HDFS NameNode.
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data'));
+----
+path	VARCHAR
+name	VARCHAR
+type	VARCHAR
+size	BIGINT
+owner	VARCHAR
+group	VARCHAR
+permissions	VARCHAR
+mode	USMALLINT
+replication	INTEGER
+block_size	BIGINT
+last_modified	TIMESTAMP
+last_accessed	TIMESTAMP
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/data'));
+----
+path	VARCHAR
+name	VARCHAR
+type	VARCHAR
+size	BIGINT
+owner	VARCHAR
+group	VARCHAR
+permissions	VARCHAR
+mode	USMALLINT
+replication	INTEGER
+block_size	BIGINT
+last_modified	TIMESTAMP
+last_accessed	TIMESTAMP
+
+# --- hdfs_ls named parameters ------------------------------------------------
+# Both per-call overrides bind (alone, together, any case, either order).
+
+statement ok
+DESCRIBE SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data', include_hidden := true);
+
+statement ok
+DESCRIBE SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data', skip_permission_errors := false, include_hidden := false);
+
+statement ok
+DESCRIBE SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data', INCLUDE_HIDDEN := true);
+
+# Unknown parameters are rejected at bind.
+statement error
+DESCRIBE SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data', recursive := true);
+----
+recursive
+
+# hdfs_stat takes no named parameters.
+statement error
+DESCRIBE SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/data', include_hidden := true);
+----
+include_hidden
+
+# The overrides are named-only.
+statement error
+DESCRIBE SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data', true);
+----
+
+# --- hdfs_exists ---------------------------------------------------------------
+
+query T
+SELECT typeof(hdfs_exists('hdfs://127.0.0.1:1/data'))
+----
+BOOLEAN
+
+# A NameNode that can't be reached is an IO error. It must not be reported as
+# "does not exist", or as an internal error from a function DuckDB thinks can't fail.
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
+----
+IO Error
