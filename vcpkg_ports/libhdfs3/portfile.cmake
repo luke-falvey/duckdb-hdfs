@@ -13,8 +13,8 @@ vcpkg_from_github(
         config-update-merges.patch
 )
 
-file(COPY "${CMAKE_CURRENT_LIST_DIR}/build/CMakeLists.txt" DESTINATION "${SOURCE_PATH}/vcpkg-build")
-file(COPY "${CMAKE_CURRENT_LIST_DIR}/build/libhdfs3-config.cmake.in" DESTINATION "${SOURCE_PATH}/vcpkg-build")
+file(COPY "${CMAKE_CURRENT_LIST_DIR}/cmake/CMakeLists.txt" DESTINATION "${SOURCE_PATH}/vcpkg-build")
+file(COPY "${CMAKE_CURRENT_LIST_DIR}/cmake/libhdfs3-config.cmake.in" DESTINATION "${SOURCE_PATH}/vcpkg-build")
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/absl_log_undef.h" DESTINATION "${SOURCE_PATH}/vcpkg-build")
 
 vcpkg_cmake_configure(

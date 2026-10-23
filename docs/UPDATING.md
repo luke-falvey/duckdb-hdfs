@@ -19,7 +19,7 @@ To move to a newer commit:
 - Update `REF` and `SHA512` in `vcpkg_ports/libhdfs3/portfile.cmake` (`curl -L <archive url> | shasum -a 512`) and
   `version-date` in `vcpkg_ports/libhdfs3/vcpkg.json`.
 - Check that the patches in that directory still apply, and drop any that upstream has absorbed.
-- Check `vcpkg_ports/libhdfs3/build/CMakeLists.txt` against upstream's source list (ClickHouse's
+- Check `vcpkg_ports/libhdfs3/cmake/CMakeLists.txt` against upstream's source list (ClickHouse's
   `contrib/libhdfs3-cmake/CMakeLists.txt` is a good reference).
 - Rebuild from scratch and run `make test`, `make test_glob` and `test/scripts/run_hdfs_tests.sh`.
 
