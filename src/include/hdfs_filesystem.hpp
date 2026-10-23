@@ -79,6 +79,10 @@ struct HdfsFileHandle : public FileHandle {
 	idx_t position = 0;
 	// Cached length for readers; bytes written so far for writers.
 	idx_t length = 0;
+	// Modification time, known from the listing that found the file (or
+	// fetched once on first use), so cache validation costs no RPC.
+	bool has_mtime = false;
+	timestamp_t mtime;
 };
 
 // A streaming listing or glob backing hdfs_ls: a background walk
@@ -127,6 +131,13 @@ public:
 
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener = nullptr) override;
+	// Like OpenFile, but uses the size/mtime a listing already returned
+	// (OpenFileInfo::extended_info) instead of asking the NameNode again.
+	unique_ptr<FileHandle> OpenFileExtended(const OpenFileInfo &file, FileOpenFlags flags,
+	                                        optional_ptr<FileOpener> opener) override;
+	bool SupportsOpenFileExtended() const override {
+		return true;
+	}
 
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
@@ -139,6 +150,9 @@ public:
 
 	int64_t GetFileSize(FileHandle &handle) override;
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override;
+	// "<mtime>:<length>": lets DuckDB's external file cache validate cached
+	// reads without another RPC.
+	string GetVersionTag(FileHandle &handle) override;
 
 	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;

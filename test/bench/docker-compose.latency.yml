@@ -1,0 +1,15 @@
+# Benchmark latency mode (see run_bench.sh): NameNode and DataNode traffic from
+# the host goes through toxiproxy, which adds network latency. Used as an
+# override on top of test/docker/docker-compose.yml.
+services:
+  hdfs:
+    ports: !override
+      - "9600:9600"   # KMS
+      - "9870:9870"   # NameNode web UI
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: duckdb-hdfs-toxiproxy
+    ports:
+      - "8474:8474"   # toxiproxy API
+      - "9000:9000"   # NameNode RPC, proxied
+      - "9866:9866"   # DataNode data transfer, proxied

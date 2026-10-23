@@ -146,6 +146,12 @@ void hdfs_bridge_free_client(struct hdfs_client_t *client);
 int32_t hdfs_bridge_get_file_info(struct hdfs_client_t *client, const char *path, struct hdfs_file_info_t *out,
                                   struct hdfs_status_t *status);
 
+/**
+ * Open `path` for reading. While a reader for the same path is open on this
+ * client, opening it again returns that reader (shared and safe for
+ * concurrent reads); each open needs its own hdfs_bridge_close_reader. The
+ * client must outlive its readers.
+ */
 struct hdfs_reader_t *hdfs_bridge_open(struct hdfs_client_t *client, const char *path, struct hdfs_status_t *status);
 
 void hdfs_bridge_close_reader(struct hdfs_reader_t *reader);

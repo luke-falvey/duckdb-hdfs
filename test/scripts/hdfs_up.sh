@@ -7,6 +7,8 @@
 #   HDFS_TEST_RUNNING=1 HADOOP_CONF_DIR="$(pwd)/test/hdfs-conf" \
 #       build/release/test/unittest test/sql/hdfs.test
 set -euo pipefail
+# HDFS_COMPOSE_ARGS: extra `docker compose` arguments, e.g. "-f docker-compose.yml -f <override>"
+# (the benchmark's latency mode uses this).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPOSE_DIR="${REPO_ROOT}/test/docker"
@@ -18,8 +20,8 @@ cd "${COMPOSE_DIR}"
 echo "==> Building and starting HDFS container (clean slate)..."
 # Always recreate so we get a freshly formatted, freshly started cluster rather
 # than reusing a stale (possibly half-dead) container.
-docker compose down -v >/dev/null 2>&1 || true
-docker compose up -d --build --force-recreate
+docker compose ${HDFS_COMPOSE_ARGS:-} down -v >/dev/null 2>&1 || true
+docker compose ${HDFS_COMPOSE_ARGS:-} up -d --build --force-recreate
 
 echo "==> Waiting for HDFS to leave safe mode and register a live DataNode..."
 # Generous: the image is amd64 and may run emulated on arm64 hosts.
@@ -35,7 +37,7 @@ while true; do
     fi
     if [ "$(date +%s)" -ge "${deadline}" ]; then
         echo "ERROR: HDFS did not become ready in time. Recent logs:" >&2
-        docker compose logs --tail=50 hdfs >&2 || true
+        docker compose ${HDFS_COMPOSE_ARGS:-} logs --tail=50 hdfs >&2 || true
         exit 1
     fi
     sleep 3
@@ -91,7 +93,7 @@ deadline=$(( $(date +%s) + 300 ))
 until curl -fsS "http://localhost:9600/kms/v1/keys/names?user.name=hadoop" >/dev/null 2>&1; do
     if [ "$(date +%s)" -ge "${deadline}" ]; then
         echo "ERROR: the KMS did not become ready in time. Recent logs:" >&2
-        docker compose logs --tail=50 hdfs >&2 || true
+        docker compose ${HDFS_COMPOSE_ARGS:-} logs --tail=50 hdfs >&2 || true
         exit 1
     fi
     sleep 3

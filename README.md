@@ -138,6 +138,45 @@ export HADOOP_USER_NAME=analytics   # only on non-secure clusters
 In an embedded context (e.g. Python), set these before the first HDFS access —
 the client is created lazily.
 
+## Performance
+
+On a real cluster each NameNode or DataNode round trip costs 0.5–5 ms, so
+scans of many small files are dominated by round trips, not bandwidth. The
+extension keeps them down:
+
+- **Opening a file is one NameNode RPC** (its block locations, which also carry
+  the length and any encryption info). Sizes and modification times found by a
+  glob are reused instead of asking again. A file opened again while it is
+  still open (DuckDB's Parquet reader does this) shares the open file, and
+  extra streams for parallel reads of one file cost no RPC.
+- **DataNode connections are reused** across reads and files: up to
+  `dfs.client.socketcache.capacity` idle connections (default 64 here, 16 in
+  Hadoop; DuckDB reads on many threads at once) are kept for
+  `dfs.client.socketcache.expiryMsec` (default 3000).
+- **Listings run in parallel** (`hdfs_list_parallelism`). Anchor glob patterns
+  as deep as you can (`/data/2024/*/*.parquet` rather than `/data/**`): only
+  the directories a pattern can match are listed.
+
+A scan of 2,000 small Parquet files makes 2 NameNode RPCs per file (listing
+its directory, opening it) where it made 8 before these changes.
+
+Tuning:
+
+- **Repeated scans**: DuckDB's external file cache
+  (`SET enable_external_file_cache = true`, the default) keeps file contents
+  in memory across queries, validated by modification time and size.
+- **Short-circuit local reads**: when DuckDB runs on DataNode hosts, set
+  `dfs.client.read.shortcircuit=true` and `dfs.domain.socket.path` in
+  `hdfs-site.xml` (as for Hadoop clients) to read local block replicas
+  directly from disk.
+- **Large listings**: raise `hdfs_list_parallelism` for wide trees on a
+  NameNode that can take it.
+
+`test/bench/` has a benchmark that reports wall times and NameNode RPC counts,
+optionally with simulated network latency; see
+[test/bench/README.md](test/bench/README.md) for how to run it and recent
+numbers.
+
 ## Building
 
 Targets DuckDB v2.0.0 (the commit pinned by the `duckdb` submodule). Needs a

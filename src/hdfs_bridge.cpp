@@ -15,6 +15,7 @@
 #include "common/Logger.h"
 #include "common/SessionConfig.h"
 #include "common/XmlConfig.h"
+#include "server/LocatedBlocks.h"
 
 #include "hdfs_bridge.h"
 #include "hdfs_crypto.hpp"
@@ -32,6 +33,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -41,6 +43,9 @@ struct hdfs_client_t {
 	std::shared_ptr<Hdfs::FileSystem> fs;
 	int replication = 0;
 	int64_t block_size = 0;
+	// Bytes of block locations fetched when opening a file (as libhdfs3's own
+	// open does: dfs.prefetchsize blocks).
+	int64_t prefetch_size = 0;
 	// For encryption zones: the user sent to the KMS, and the KMS provider URI
 	// from hadoop.security.key.provider.path / dfs.encryption.key.provider.uri
 	// (empty if not configured).
@@ -48,6 +53,12 @@ struct hdfs_client_t {
 	std::string key_provider;
 	// Kerberos cluster: the KMS is called with SPNEGO instead of user.name.
 	bool kerberos = false;
+	// Files open for reading, by path. DuckDB often opens a file again while a
+	// handle on it is still open (Parquet: one handle for the metadata, one
+	// for the scan); the second open shares the reader instead of asking the
+	// NameNode again.
+	std::mutex readers_mu;
+	std::unordered_map<std::string, hdfs_reader_t *> open_readers;
 };
 
 namespace {
@@ -273,6 +284,11 @@ Hdfs::Config LoadConfig(const char *explicit_dir) {
 		}
 	}
 	SetDefault(conf, "dfs.client.read.shortcircuit", "false");
+	// Idle DataNode connections kept for reuse (in all, across DataNodes).
+	// Hadoop's default of 16 is too few for DuckDB, which reads many files on
+	// many threads at once: the extra connections are closed after each read and
+	// a new TCP (and, on secure clusters, SASL) handshake follows.
+	SetDefault(conf, "dfs.client.socketcache.capacity", "64");
 	SetDefault(conf, "dfs.client.log.severity", "FATAL");
 	return conf;
 }
@@ -561,8 +577,7 @@ struct hdfs_list_stream_t {
 // --- readers and writers -----------------------------------------------------------
 
 // The data encryption key of a file in an encryption zone, decrypted by the KMS.
-static string FileKey(const hdfs_client_t &client, const Hdfs::FileStatus &st, const string &path) {
-	const auto &info = st.getEncryptionInfo();
+static string FileKey(const hdfs_client_t &client, const Hdfs::FileEncryptionInfo &info, const string &path) {
 	if (info.suite != hdfs_crypto::SUITE_AES_CTR_NOPADDING) {
 		throw hdfs_crypto::CryptoError(path + " uses an unsupported encryption cipher suite (" +
 		                               std::to_string(info.suite) + "); only AES/CTR/NoPadding is supported");
@@ -582,6 +597,8 @@ static string FileKey(const hdfs_client_t &client, const Hdfs::FileStatus &st, c
 // An open file. libhdfs3 input streams aren't safe for concurrent use, so the
 // reader keeps a pool: each concurrent read borrows its own stream.
 struct hdfs_reader_t {
+	hdfs_client_t *client = nullptr;
+	int refs = 1; // open handles sharing this reader; guarded by client->readers_mu
 	std::shared_ptr<Hdfs::FileSystem> fs;
 	string path;
 	int64_t length = 0;
@@ -589,8 +606,23 @@ struct hdfs_reader_t {
 	bool encrypted = false;
 	string key;
 	string iv;
+	// Block locations fetched at open, shared out (as copies) to every pooled
+	// stream so opening another stream costs no NameNode RPC.
+	std::shared_ptr<Hdfs::Internal::LocatedBlocksImpl> blocks;
 	std::mutex mu;
 	std::vector<std::unique_ptr<Hdfs::InputStream>> idle;
+
+	std::unique_ptr<Hdfs::InputStream> NewStream() {
+		// Each stream extends its block list lazily, so it gets its own copy
+		// (including the last block, which libhdfs3 updates in place).
+		auto copy = std::make_shared<Hdfs::Internal::LocatedBlocksImpl>(*blocks);
+		if (auto last = blocks->getLastBlock()) {
+			copy->setLastBlock(std::make_shared<Hdfs::Internal::LocatedBlock>(*last));
+		}
+		auto stream = std::make_unique<Hdfs::InputStream>(copy);
+		stream->open(*fs, path.c_str(), true);
+		return stream;
+	}
 
 	std::unique_ptr<Hdfs::InputStream> Borrow() {
 		{
@@ -601,9 +633,7 @@ struct hdfs_reader_t {
 				return stream;
 			}
 		}
-		auto stream = std::make_unique<Hdfs::InputStream>();
-		stream->open(*fs, path.c_str(), true);
-		return stream;
+		return NewStream();
 	}
 
 	void Return(std::unique_ptr<Hdfs::InputStream> stream) {
@@ -673,6 +703,7 @@ hdfs_client_t *hdfs_bridge_connect(const char *url, const char *config_dir, cons
 		Hdfs::Internal::SessionConfig session(conf);
 		client->replication = session.getDefaultReplica();
 		client->block_size = session.getDefaultBlockSize();
+		client->prefetch_size = session.getDefaultBlockSize() * session.getPrefetchSize();
 		client->user = username;
 		client->kerberos = kerberos;
 		client->key_provider = conf.getString("hadoop.security.key.provider.path", "");
@@ -706,30 +737,58 @@ int32_t hdfs_bridge_get_file_info(hdfs_client_t *client, const char *path, hdfs_
 }
 
 hdfs_reader_t *hdfs_bridge_open(hdfs_client_t *client, const char *path, hdfs_status_t *status) {
+	{
+		std::lock_guard<std::mutex> lock(client->readers_mu);
+		auto it = client->open_readers.find(path);
+		if (it != client->open_readers.end()) {
+			it->second->refs++;
+			return it->second;
+		}
+	}
 	std::unique_ptr<hdfs_reader_t> reader;
 	bool ok = Guard(status, string("open '") + path + "' for reading failed", [&] {
-		auto st = client->fs->getFileStatus(path);
-		if (st.isDirectory()) {
-			throw Hdfs::InvalidPath(string(path) + " is a directory", __FILE__, __LINE__, "");
-		}
+		// One RPC: the block locations carry the length and any encryption info.
+		// (A directory fails here with "Path is not a file".)
+		auto blocks = std::make_shared<Hdfs::Internal::LocatedBlocksImpl>();
+		client->fs->getBlockLocations(path, 0, client->prefetch_size, *blocks);
 		reader = std::make_unique<hdfs_reader_t>();
+		reader->client = client;
 		reader->fs = client->fs;
 		reader->path = path;
-		reader->length = st.getLength();
-		if (st.isEncrypted()) {
+		reader->blocks = blocks;
+		reader->length = blocks->getFileLength();
+		if (blocks->isEncrypted()) {
 			reader->encrypted = true;
-			reader->key = FileKey(*client, st, path);
-			reader->iv = st.getEncryptionInfo().iv;
+			reader->key = FileKey(*client, blocks->getEncryptionInfo(), path);
+			reader->iv = blocks->getEncryptionInfo().iv;
 		}
 		// Open one stream up front so open errors surface here, not on first read.
-		reader->Return(reader->Borrow());
+		reader->Return(reader->NewStream());
 	});
-	return ok ? reader.release() : nullptr;
+	if (!ok) {
+		return nullptr;
+	}
+	std::lock_guard<std::mutex> lock(client->readers_mu);
+	auto inserted = client->open_readers.emplace(path, reader.get());
+	if (!inserted.second) {
+		// Another thread opened the same file meanwhile: share its reader.
+		// (Ours is dropped; its stream closes in the destructor.)
+		inserted.first->second->refs++;
+		return inserted.first->second;
+	}
+	return reader.release();
 }
 
 void hdfs_bridge_close_reader(hdfs_reader_t *reader) {
 	if (!reader) {
 		return;
+	}
+	{
+		std::lock_guard<std::mutex> lock(reader->client->readers_mu);
+		if (--reader->refs > 0) {
+			return;
+		}
+		reader->client->open_readers.erase(reader->path);
 	}
 	for (auto &stream : reader->idle) {
 		try {
@@ -788,7 +847,7 @@ hdfs_writer_t *hdfs_bridge_create(hdfs_client_t *client, const char *path, bool 
 		writer->path = path;
 		if (file.isEncrypted()) {
 			try {
-				writer->key = FileKey(*client, file, path);
+				writer->key = FileKey(*client, file.getEncryptionInfo(), path);
 			} catch (...) {
 				// Don't leave an empty file behind that we can't write.
 				try {

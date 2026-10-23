@@ -14,6 +14,8 @@ vcpkg_from_github(
         rename2.patch
         kerberos-no-stderr.patch
         wire-encryption.patch
+        fewer-round-trips.patch
+        peer-cache.patch
 )
 
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/cmake/CMakeLists.txt" DESTINATION "${SOURCE_PATH}/vcpkg-build")
