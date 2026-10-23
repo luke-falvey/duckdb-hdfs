@@ -11,7 +11,13 @@ vcpkg_download_distfile(ARCHIVE
     SHA512 62fb4a9383392e4816a036f3e8f408c5161a10723e59f0a8f6df5f72101e0b644787f3b07a71c772628fc4f4050960c842c7500736edacd24313ef654e703bc9
 )
 
-vcpkg_extract_source_archive(SOURCE_PATH ARCHIVE "${ARCHIVE}")
+vcpkg_extract_source_archive(SOURCE_PATH
+    ARCHIVE "${ARCHIVE}"
+    PATCHES
+        # Negotiate GSSAPI integrity/privacy (Hadoop's hadoop.rpc.protection)
+        # instead of always choosing authentication only.
+        gssapi-qop.patch
+)
 
 # GSSAPI (Kerberos) via the krb5 port, found through its krb5-config. krb5 is
 # static, so configure's link tests also need its private dependencies;

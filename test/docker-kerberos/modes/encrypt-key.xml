@@ -1,0 +1,4 @@
+    <!-- Mode "encrypt-key": dfs.encrypt.data.transfer, DataNode traffic encrypted with
+         keys handed out by the NameNode. -->
+    <property><name>dfs.encrypt.data.transfer</name><value>true</value></property>
+    <property><name>ignore.secure.ports.for.testing</name><value>true</value></property>

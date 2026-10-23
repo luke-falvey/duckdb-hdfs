@@ -12,6 +12,7 @@
     "gsasl",
     "krb5",
     "libxml2",
+    "openssl",
     "protobuf",
     {
       "name": "protobuf",

@@ -22,7 +22,10 @@ cluster used to exercise the `hdfs` extension end-to-end.
   Kerberos-secured cluster, with and without a ticket. Run by
   `scripts/run_kerberos_tests.sh`, which starts `docker-kerberos/` (an MIT KDC
   plus a secured NameNode/DataNode) and logs in as `hadoop@EXAMPLE.TEST`; the
-  host-side client config is `hdfs-conf-kerberos/`.
+  host-side client config is `hdfs-conf-kerberos/`. The suite runs once per
+  wire-protection mode (`docker-kerberos/modes/`: none, integrity, privacy,
+  aes, encrypt-key), and checks that the cluster refuses clients without the
+  required protection.
 - `docker/` — a single-node HDFS (NameNode + DataNode) image + compose file.
 - `hdfs-conf/` — host-side Hadoop client config (`core-site.xml` /
   `hdfs-site.xml`) for talking to that cluster. Pointed at via `HADOOP_CONF_DIR`.

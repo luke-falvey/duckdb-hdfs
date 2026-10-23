@@ -1,0 +1,2096 @@
+diff --git a/src/client/DataTransferSasl.cpp b/src/client/DataTransferSasl.cpp
+new file mode 100644
+index 0000000..a4d2665
+--- /dev/null
++++ b/src/client/DataTransferSasl.cpp
+@@ -0,0 +1,326 @@
++/********************************************************************
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "DataTransferSasl.h"
++
++#include "DigestMd5.h"
++#include "Exception.h"
++#include "ExceptionInternal.h"
++#include "SessionConfig.h"
++#include "Token.h"
++#include "datatransfer.pb.h"
++#include "network/WrappedSocket.h"
++#include "server/DatanodeInfo.h"
++
++#include <google/protobuf/io/coded_stream.h>
++#include <openssl/evp.h>
++
++#include <algorithm>
++#include <vector>
++
++using namespace ::google::protobuf::io;
++
++namespace Hdfs {
++namespace Internal {
++
++namespace {
++
++const int32_t SASL_TRANSFER_MAGIC_NUMBER = static_cast<int32_t>(0xDEADBEEF);
++const int AES_CTR_NOPADDING = 2;
++// Largest plaintext chunk per wrapped message (the DataNode's maxbuf is 64KiB).
++const size_t MAX_WRAP_CHUNK = 32 * 1024;
++
++std::string Base64(const std::string & data) {
++    std::vector<unsigned char> out(4 * ((data.size() + 2) / 3) + 1);
++    int len = EVP_EncodeBlock(out.data(), reinterpret_cast<const unsigned char *>(data.data()),
++                              static_cast<int>(data.size()));
++    return std::string(reinterpret_cast<char *>(out.data()), len);
++}
++
++// dfs.data.transfer.protection -> DIGEST-MD5 QOP bits.
++int AllowedQops(const std::string & protection) {
++    int qops = 0;
++    size_t start = 0;
++
++    while (start <= protection.size()) {
++        size_t comma = protection.find(',', start);
++        std::string item = protection.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
++        item.erase(0, item.find_first_not_of(" \t"));
++        item.erase(item.find_last_not_of(" \t") + 1);
++
++        if (item == "authentication") {
++            qops |= DigestMd5Client::QOP_AUTH;
++        } else if (item == "integrity") {
++            qops |= DigestMd5Client::QOP_AUTH_INT;
++        } else if (item == "privacy") {
++            qops |= DigestMd5Client::QOP_AUTH_CONF;
++        } else if (!item.empty()) {
++            THROW(HdfsConfigInvalid, "Invalid dfs.data.transfer.protection value \"%s\"", item.c_str());
++        }
++
++        if (comma == std::string::npos) {
++            break;
++        }
++
++        start = comma + 1;
++    }
++
++    return qops;
++}
++
++void WriteMessage(Socket & sock, const DataTransferEncryptorMessageProto & message, int timeout) {
++    std::string body;
++    message.SerializeToString(&body);
++    std::string out;
++    uint32_t size = static_cast<uint32_t>(body.size());
++
++    do {
++        unsigned char byte = size & 0x7F;
++        size >>= 7;
++
++        if (size) {
++            byte |= 0x80;
++        }
++
++        out += static_cast<char>(byte);
++    } while (size);
++
++    out += body;
++    sock.writeFully(out.data(), static_cast<int32_t>(out.size()), timeout);
++}
++
++DataTransferEncryptorMessageProto ReadMessage(Socket & sock, int timeout) {
++    uint32_t size = 0;
++
++    for (int shift = 0; shift < 35; shift += 7) {
++        char c;
++        sock.readFully(&c, 1, timeout);
++        size |= static_cast<uint32_t>(c & 0x7F) << shift;
++
++        if (!(c & 0x80)) {
++            break;
++        }
++    }
++
++    if (size > 1024 * 1024) {
++        THROW(HdfsIOException, "DataNode SASL: invalid message size %u", size);
++    }
++
++    std::vector<char> body(size);
++
++    if (size) {
++        sock.readFully(body.data(), static_cast<int32_t>(size), timeout);
++    }
++
++    DataTransferEncryptorMessageProto message;
++
++    if (!message.ParseFromArray(body.data(), static_cast<int>(size))) {
++        THROW(HdfsIOException, "DataNode SASL: cannot parse the DataNode's message");
++    }
++
++    if (message.status() != DataTransferEncryptorMessageProto_DataTransferEncryptorStatus_SUCCESS) {
++        if (message.status() == DataTransferEncryptorMessageProto_DataTransferEncryptorStatus_ERROR_UNKNOWN_KEY) {
++            THROW(HdfsIOException, "DataNode SASL: the DataNode doesn't know the data encryption key: %s",
++                  message.message().c_str());
++        }
++
++        THROW(AccessControlException, "DataNode SASL handshake failed: %s",
++              message.has_message() ? message.message().c_str() : "check the DataNode's log");
++    }
++
++    return message;
++}
++
++/**
++ * DataNode traffic protected by the DIGEST-MD5 security layer: each message
++ * is a 4-byte big-endian length followed by the wrapped bytes.
++ */
++class DigestSaslSocket: public WrappedSocket {
++public:
++    DigestSaslSocket(shared_ptr<Socket> inner, shared_ptr<DigestMd5Client> sasl) :
++        WrappedSocket(inner), sasl(sasl) {
++    }
++
++protected:
++    void fill(int timeout) {
++        char lengthBytes[4];
++        inner->readFully(lengthBytes, 4, timeout);
++        uint32_t length = (static_cast<uint32_t>(static_cast<unsigned char>(lengthBytes[0])) << 24)
++                          | (static_cast<uint32_t>(static_cast<unsigned char>(lengthBytes[1])) << 16)
++                          | (static_cast<uint32_t>(static_cast<unsigned char>(lengthBytes[2])) << 8)
++                          | static_cast<uint32_t>(static_cast<unsigned char>(lengthBytes[3]));
++
++        if (length == 0 || length > 16 * 1024 * 1024) {
++            THROW(HdfsIOException, "DataNode SASL: invalid wrapped message length %u", length);
++        }
++
++        std::string wrapped(length, '\0');
++        inner->readFully(&wrapped[0], static_cast<int32_t>(length), timeout);
++        plain.append(sasl->unwrap(wrapped));
++    }
++
++    void send(const char * buffer, int32_t size, int timeout) {
++        for (int32_t done = 0; done < size;) {
++            int32_t chunk = static_cast<int32_t>(std::min<size_t>(size - done, MAX_WRAP_CHUNK));
++            std::string wrapped = sasl->wrap(std::string(buffer + done, chunk));
++            uint32_t length = static_cast<uint32_t>(wrapped.size());
++            char lengthBytes[4] = {static_cast<char>(length >> 24), static_cast<char>(length >> 16),
++                                   static_cast<char>(length >> 8), static_cast<char>(length)};
++            inner->writeFully(lengthBytes, 4, timeout);
++            inner->writeFully(wrapped.data(), static_cast<int32_t>(wrapped.size()), timeout);
++            done += chunk;
++        }
++    }
++
++private:
++    shared_ptr<DigestMd5Client> sasl;
++};
++
++EVP_CIPHER_CTX * NewAesCtr(const std::string & key, const std::string & iv) {
++    const EVP_CIPHER * cipher = key.size() == 16 ? EVP_aes_128_ctr()
++                                : key.size() == 24 ? EVP_aes_192_ctr()
++                                : key.size() == 32 ? EVP_aes_256_ctr() : NULL;
++
++    if (!cipher || iv.size() != 16) {
++        THROW(HdfsIOException, "DataNode SASL: invalid AES key or IV length");
++    }
++
++    EVP_CIPHER_CTX * ctx = EVP_CIPHER_CTX_new();
++
++    if (!ctx || EVP_EncryptInit_ex(ctx, cipher, NULL, reinterpret_cast<const unsigned char *>(key.data()),
++                                   reinterpret_cast<const unsigned char *>(iv.data())) != 1) {
++        EVP_CIPHER_CTX_free(ctx);
++        THROW(HdfsIOException, "DataNode SASL: cannot initialize AES/CTR");
++    }
++
++    return ctx;
++}
++
++/**
++ * DataNode traffic encrypted with the negotiated AES/CTR stream cipher (one
++ * keystream per direction, continued across the whole connection).
++ */
++class AesCtrSocket: public WrappedSocket {
++public:
++    AesCtrSocket(shared_ptr<Socket> inner, const std::string & sendKey, const std::string & sendIv,
++                 const std::string & recvKey, const std::string & recvIv) :
++        WrappedSocket(inner), encryptor(NewAesCtr(sendKey, sendIv)), decryptor(NewAesCtr(recvKey, recvIv)) {
++    }
++
++    ~AesCtrSocket() {
++        EVP_CIPHER_CTX_free(encryptor);
++        EVP_CIPHER_CTX_free(decryptor);
++    }
++
++protected:
++    void fill(int timeout) {
++        if (!inner->poll(true, false, timeout)) {
++            THROW(HdfsTimeoutException, "Read timeout from DataNode");
++        }
++
++        char buffer[64 * 1024];
++        int32_t n = inner->read(buffer, sizeof(buffer));
++        plain.append(transform(decryptor, buffer, n));
++    }
++
++    void send(const char * buffer, int32_t size, int timeout) {
++        std::string encrypted = transform(encryptor, buffer, size);
++        inner->writeFully(encrypted.data(), static_cast<int32_t>(encrypted.size()), timeout);
++    }
++
++private:
++    static std::string transform(EVP_CIPHER_CTX * ctx, const char * data, int32_t size) {
++        std::string out(size, '\0');
++        int len = 0;
++
++        if (EVP_EncryptUpdate(ctx, reinterpret_cast<unsigned char *>(&out[0]), &len,
++                              reinterpret_cast<const unsigned char *>(data), size) != 1) {
++            THROW(HdfsIOException, "DataNode SASL: AES/CTR failed");
++        }
++
++        return out;
++    }
++
++    EVP_CIPHER_CTX * encryptor;
++    EVP_CIPHER_CTX * decryptor;
++};
++
++}
++
++shared_ptr<Socket> NegotiateDataTransferSasl(shared_ptr<Socket> sock, const DatanodeInfo & datanode,
++                                             const Token & token, const SessionConfig & conf,
++                                             const DataEncryptionKey * key, int timeout) {
++    shared_ptr<DigestMd5Client> sasl;
++    int allowedQops;
++
++    if (key) {
++        // dfs.encrypt.data.transfer: the NameNode's key, always encrypted.
++        std::string username = std::to_string(key->keyId) + " " + key->blockPoolId + " " + Base64(key->nonce);
++        sasl = shared_ptr<DigestMd5Client>(new DigestMd5Client(username, Base64(key->encryptionKey), "hdfs/0"));
++        allowedQops = DigestMd5Client::QOP_AUTH_CONF;
++    } else if (conf.getRpcAuthMethod() != "kerberos" || token.getIdentifier().empty()
++               || datanode.getXferPort() <= 1024 || conf.getDataTransferProtection().empty()) {
++        // Not secured, or trusted through a privileged port.
++        return sock;
++    } else {
++        sasl = shared_ptr<DigestMd5Client>(new DigestMd5Client(Base64(token.getIdentifier()),
++                                                               Base64(token.getPassword()), "hdfs/0"));
++        allowedQops = AllowedQops(conf.getDataTransferProtection());
++    }
++
++    char magic[4] = {static_cast<char>(SASL_TRANSFER_MAGIC_NUMBER >> 24),
++                     static_cast<char>(SASL_TRANSFER_MAGIC_NUMBER >> 16),
++                     static_cast<char>(SASL_TRANSFER_MAGIC_NUMBER >> 8),
++                     static_cast<char>(SASL_TRANSFER_MAGIC_NUMBER)};
++    sock->writeFully(magic, 4, timeout);
++
++    DataTransferEncryptorMessageProto hello;
++    hello.set_status(DataTransferEncryptorMessageProto_DataTransferEncryptorStatus_SUCCESS);
++    hello.set_payload("");
++    WriteMessage(*sock, hello, timeout);
++
++    DataTransferEncryptorMessageProto challenge = ReadMessage(*sock, timeout);
++    DataTransferEncryptorMessageProto response;
++    response.set_status(DataTransferEncryptorMessageProto_DataTransferEncryptorStatus_SUCCESS);
++    response.set_payload(sasl->respond(challenge.payload(), allowedQops));
++
++    if (sasl->getQop() == DigestMd5Client::QOP_AUTH_CONF) {
++        // Offer AES/CTR; the DataNode uses it if dfs.encrypt.data.transfer.cipher.suites allows.
++        response.add_cipheroption()->set_suite(AES_CTR_NOPADDING);
++    }
++
++    WriteMessage(*sock, response, timeout);
++    DataTransferEncryptorMessageProto last = ReadMessage(*sock, timeout);
++    sasl->complete(last.payload());
++
++    if (last.cipheroption_size() > 0 && last.cipheroption(0).suite() == AES_CTR_NOPADDING) {
++        const HdfsCipherOptionProto & cipher = last.cipheroption(0);
++        // The keys come wrapped by the SASL layer. For the client, "in" is the
++        // direction towards the DataNode.
++        return shared_ptr<Socket>(new AesCtrSocket(sock, sasl->unwrap(cipher.inkey()), cipher.iniv(),
++                                                   sasl->unwrap(cipher.outkey()), cipher.outiv()));
++    }
++
++    if (sasl->hasSecurityLayer()) {
++        return shared_ptr<Socket>(new DigestSaslSocket(sock, sasl));
++    }
++
++    return sock;
++}
++
++}
++}
+diff --git a/src/client/DataTransferSasl.h b/src/client/DataTransferSasl.h
+new file mode 100644
+index 0000000..b8d38f5
+--- /dev/null
++++ b/src/client/DataTransferSasl.h
+@@ -0,0 +1,67 @@
++/********************************************************************
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef _HDFS_LIBHDFS3_CLIENT_DATATRANSFERSASL_H_
++#define _HDFS_LIBHDFS3_CLIENT_DATATRANSFERSASL_H_
++
++#include "Memory.h"
++#include "network/Socket.h"
++
++#include <cstdint>
++#include <string>
++
++namespace Hdfs {
++namespace Internal {
++
++class DatanodeInfo;
++class SessionConfig;
++class Token;
++
++/**
++ * The NameNode's key for encrypting DataNode traffic (dfs.encrypt.data.transfer).
++ */
++struct DataEncryptionKey {
++    uint32_t keyId = 0;
++    std::string blockPoolId;
++    std::string nonce;
++    std::string encryptionKey;
++    int64_t expiryDate = 0;
++    std::string encryptionAlgorithm;
++};
++
++/**
++ * Run the DataNode SASL handshake (Hadoop's SaslDataTransferClient) on a
++ * freshly connected socket, before any data transfer operation:
++ *
++ * - with `key` (dfs.encrypt.data.transfer), authenticate with the NameNode's
++ *   encryption key and always protect the connection;
++ * - otherwise, on a Kerberos cluster with dfs.data.transfer.protection set and
++ *   an unprivileged DataNode port, authenticate with the block token;
++ * - otherwise the connection is used as is.
++ *
++ * Returns the socket to use: `sock` itself, or a wrapper applying the
++ * negotiated protection (DIGEST-MD5 integrity/privacy, or an AES/CTR stream
++ * cipher when one was negotiated).
++ */
++shared_ptr<Socket> NegotiateDataTransferSasl(shared_ptr<Socket> sock, const DatanodeInfo & datanode,
++                                             const Token & token, const SessionConfig & conf,
++                                             const DataEncryptionKey * key, int timeout);
++
++}
++}
++
++#endif /* _HDFS_LIBHDFS3_CLIENT_DATATRANSFERSASL_H_ */
+diff --git a/src/client/DigestMd5.cpp b/src/client/DigestMd5.cpp
+new file mode 100644
+index 0000000..c013172
+--- /dev/null
++++ b/src/client/DigestMd5.cpp
+@@ -0,0 +1,379 @@
++/********************************************************************
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "DigestMd5.h"
++
++#include "Exception.h"
++#include "ExceptionInternal.h"
++
++#include <openssl/hmac.h>
++#include <openssl/md5.h>
++#include <openssl/rand.h>
++
++#include <map>
++#include <vector>
++
++namespace Hdfs {
++namespace Internal {
++
++namespace {
++
++std::string Md5(const std::string & data) {
++    unsigned char out[EVP_MAX_MD_SIZE];
++    unsigned int len = 0;
++
++    if (EVP_Digest(data.data(), data.size(), out, &len, EVP_md5(), NULL) != 1) {
++        THROW(HdfsIOException, "DIGEST-MD5: MD5 failed");
++    }
++
++    return std::string(reinterpret_cast<char *>(out), len);
++}
++
++std::string Hex(const std::string & data) {
++    static const char * digits = "0123456789abcdef";
++    std::string out;
++
++    for (size_t i = 0; i < data.size(); ++i) {
++        unsigned char c = static_cast<unsigned char>(data[i]);
++        out += digits[c >> 4];
++        out += digits[c & 15];
++    }
++
++    return out;
++}
++
++std::string HmacMd5(const std::string & key, const std::string & data) {
++    unsigned char out[EVP_MAX_MD_SIZE];
++    unsigned int len = 0;
++
++    if (!HMAC(EVP_md5(), key.data(), static_cast<int>(key.size()),
++              reinterpret_cast<const unsigned char *>(data.data()), data.size(), out, &len)) {
++        THROW(HdfsIOException, "DIGEST-MD5: HMAC-MD5 failed");
++    }
++
++    return std::string(reinterpret_cast<char *>(out), len);
++}
++
++std::string Base64(const std::string & data) {
++    std::vector<unsigned char> out(4 * ((data.size() + 2) / 3) + 1);
++    int len = EVP_EncodeBlock(out.data(), reinterpret_cast<const unsigned char *>(data.data()),
++                              static_cast<int>(data.size()));
++    return std::string(reinterpret_cast<char *>(out.data()), len);
++}
++
++// Parse a DIGEST-MD5 challenge: comma-separated key=value pairs whose values
++// may be quoted (with \-escapes).
++std::map<std::string, std::string> ParseChallenge(const std::string & text) {
++    std::map<std::string, std::string> out;
++    size_t i = 0;
++
++    while (i < text.size()) {
++        while (i < text.size() && (text[i] == ',' || text[i] == ' ')) {
++            ++i;
++        }
++
++        size_t eq = text.find('=', i);
++
++        if (eq == std::string::npos) {
++            break;
++        }
++
++        std::string key = text.substr(i, eq - i);
++        std::string value;
++        i = eq + 1;
++
++        if (i < text.size() && text[i] == '"') {
++            ++i;
++
++            while (i < text.size() && text[i] != '"') {
++                if (text[i] == '\\' && i + 1 < text.size()) {
++                    ++i;
++                }
++
++                value += text[i++];
++            }
++
++            ++i; // closing quote
++        } else {
++            size_t comma = text.find(',', i);
++            value = text.substr(i, comma == std::string::npos ? std::string::npos : comma - i);
++            i = comma == std::string::npos ? text.size() : comma;
++        }
++
++        out[key] = value;
++    }
++
++    return out;
++}
++
++bool ListContains(const std::string & list, const std::string & item) {
++    size_t start = 0;
++
++    while (start <= list.size()) {
++        size_t comma = list.find(',', start);
++        std::string entry = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
++
++        if (entry == item) {
++            return true;
++        }
++
++        if (comma == std::string::npos) {
++            break;
++        }
++
++        start = comma + 1;
++    }
++
++    return false;
++}
++
++const char * QopName(int qop) {
++    return qop == DigestMd5Client::QOP_AUTH_CONF ? "auth-conf"
++           : qop == DigestMd5Client::QOP_AUTH_INT ? "auth-int" : "auth";
++}
++
++// Expand 14 bytes of key into two 8-byte DES keys with odd parity (RFC 2831).
++std::string DesKey(const std::string & key) {
++    std::string out;
++
++    for (size_t half = 0; half < 2; ++half) {
++        uint64_t bits = 0;
++
++        for (size_t j = 0; j < 7; ++j) {
++            bits = (bits << 8) | static_cast<unsigned char>(key[half * 7 + j]);
++        }
++
++        bits <<= 8;
++
++        for (int i = 0; i < 8; ++i) {
++            unsigned char byte = static_cast<unsigned char>(bits >> ((8 - i) * 7)) & 0xFE;
++            int ones = 0;
++
++            for (int b = 1; b < 8; ++b) {
++                ones += (byte >> b) & 1;
++            }
++
++            if (ones % 2 == 0) {
++                byte |= 0x01; // odd parity
++            }
++
++            out += static_cast<char>(byte);
++        }
++    }
++
++    return out;
++}
++
++EVP_CIPHER_CTX * NewTripleDes(const std::string & sealingKey, bool encrypt) {
++    std::string key = DesKey(sealingKey.substr(0, 14));
++    std::string iv = sealingKey.substr(8, 8);
++    EVP_CIPHER_CTX * ctx = EVP_CIPHER_CTX_new();
++
++    if (!ctx || EVP_CipherInit_ex(ctx, EVP_des_ede_cbc(), NULL,
++                                  reinterpret_cast<const unsigned char *>(key.data()),
++                                  reinterpret_cast<const unsigned char *>(iv.data()), encrypt ? 1 : 0) != 1) {
++        EVP_CIPHER_CTX_free(ctx);
++        THROW(HdfsIOException, "DIGEST-MD5: cannot initialize 3DES");
++    }
++
++    EVP_CIPHER_CTX_set_padding(ctx, 0);
++    return ctx;
++}
++
++std::string RunCipher(EVP_CIPHER_CTX * ctx, const std::string & in) {
++    std::string out(in.size() + 16, '\0');
++    int len = 0;
++
++    if (EVP_CipherUpdate(ctx, reinterpret_cast<unsigned char *>(&out[0]), &len,
++                         reinterpret_cast<const unsigned char *>(in.data()), static_cast<int>(in.size())) != 1) {
++        THROW(HdfsIOException, "DIGEST-MD5: 3DES failed");
++    }
++
++    out.resize(len);
++    return out;
++}
++
++std::string BigEndian32(uint32_t v) {
++    std::string out(4, '\0');
++    out[0] = static_cast<char>(v >> 24);
++    out[1] = static_cast<char>(v >> 16);
++    out[2] = static_cast<char>(v >> 8);
++    out[3] = static_cast<char>(v);
++    return out;
++}
++
++}
++
++DigestMd5Client::DigestMd5Client(const std::string & username, const std::string & password,
++                                 const std::string & digestUri) :
++    username(username), password(password), digestUri(digestUri), qop(QOP_AUTH), done(false),
++    encryptor(NULL), decryptor(NULL), sendSeq(0), recvSeq(0) {
++}
++
++DigestMd5Client::~DigestMd5Client() {
++    EVP_CIPHER_CTX_free(encryptor);
++    EVP_CIPHER_CTX_free(decryptor);
++}
++
++std::string DigestMd5Client::a1() const {
++    return Md5(username + ":" + realm + ":" + password) + ":" + nonce + ":" + cnonce;
++}
++
++std::string DigestMd5Client::computeResponse(bool initial) const {
++    std::string a2 = std::string(initial ? "AUTHENTICATE:" : ":") + digestUri;
++
++    if (qop != QOP_AUTH) {
++        a2 += ":00000000000000000000000000000000";
++    }
++
++    return Hex(Md5(Hex(Md5(a1())) + ":" + nonce + ":00000001:" + cnonce + ":" + QopName(qop) + ":" +
++                   Hex(Md5(a2))));
++}
++
++std::string DigestMd5Client::respond(const std::string & challenge, int allowedQops) {
++    std::map<std::string, std::string> fields = ParseChallenge(challenge);
++    realm = fields["realm"];
++    nonce = fields["nonce"];
++
++    if (nonce.empty()) {
++        THROW(HdfsIOException, "DIGEST-MD5: the DataNode's challenge has no nonce");
++    }
++
++    std::string offered = fields.count("qop") ? fields["qop"] : "auth";
++    int offeredQops = (ListContains(offered, "auth") ? QOP_AUTH : 0)
++                      | (ListContains(offered, "auth-int") ? QOP_AUTH_INT : 0)
++                      | (ListContains(offered, "auth-conf") ? QOP_AUTH_CONF : 0);
++    int usable = offeredQops & allowedQops;
++
++    if (usable & QOP_AUTH_CONF) {
++        qop = QOP_AUTH_CONF;
++    } else if (usable & QOP_AUTH_INT) {
++        qop = QOP_AUTH_INT;
++    } else if (usable & QOP_AUTH) {
++        qop = QOP_AUTH;
++    } else {
++        THROW(HdfsIOException, "DIGEST-MD5: the DataNode offers protection \"%s\", which dfs.data.transfer.protection "
++              "doesn't allow", offered.c_str());
++    }
++
++    if (qop == QOP_AUTH_CONF && !ListContains(fields["cipher"], "3des")) {
++        THROW(HdfsIOException, "DIGEST-MD5: the DataNode offers ciphers \"%s\"; only 3des is supported",
++              fields["cipher"].c_str());
++    }
++
++    unsigned char random[12];
++
++    if (RAND_bytes(random, sizeof(random)) != 1) {
++        THROW(HdfsIOException, "DIGEST-MD5: cannot generate a client nonce");
++    }
++
++    cnonce = Base64(std::string(reinterpret_cast<char *>(random), sizeof(random)));
++    std::string response = "username=\"" + username + "\",realm=\"" + realm + "\",nonce=\"" + nonce +
++                           "\",cnonce=\"" + cnonce + "\",nc=00000001,qop=" + QopName(qop) + ",digest-uri=\"" +
++                           digestUri + "\",response=" + computeResponse(true) + ",charset=utf-8";
++
++    if (qop == QOP_AUTH_CONF) {
++        response += ",cipher=\"3des\"";
++    }
++
++    return response;
++}
++
++void DigestMd5Client::complete(const std::string & serverFinal) {
++    std::map<std::string, std::string> fields = ParseChallenge(serverFinal);
++
++    if (fields["rspauth"] != computeResponse(false)) {
++        THROW(AccessControlException, "DIGEST-MD5: the DataNode's response did not authenticate it");
++    }
++
++    std::string ha1 = Md5(a1());
++    kic = Md5(ha1 + "Digest session key to client-to-server signing key magic constant");
++    kis = Md5(ha1 + "Digest session key to server-to-client signing key magic constant");
++
++    if (qop == QOP_AUTH_CONF) {
++        encryptor = NewTripleDes(Md5(ha1 + "Digest H(A1) to client-to-server sealing key magic constant"), true);
++        decryptor = NewTripleDes(Md5(ha1 + "Digest H(A1) to server-to-client sealing key magic constant"), false);
++    }
++
++    done = true;
++}
++
++std::string DigestMd5Client::wrap(const std::string & data) {
++    if (!hasSecurityLayer()) {
++        THROW(HdfsIOException, "DIGEST-MD5: no security layer to wrap with");
++    }
++
++    std::string seq = BigEndian32(sendSeq++);
++    std::string mac = HmacMd5(kic, seq + data).substr(0, 10);
++    std::string out;
++
++    if (encryptor) {
++        size_t padding = 8 - (data.size() + 10) % 8;
++        out = RunCipher(encryptor, data + std::string(padding, static_cast<char>(padding)) + mac);
++    } else {
++        out = data + mac;
++    }
++
++    out += std::string("\x00\x01", 2);
++    out += seq;
++    return out;
++}
++
++std::string DigestMd5Client::unwrap(const std::string & data) {
++    if (!hasSecurityLayer()) {
++        THROW(HdfsIOException, "DIGEST-MD5: no security layer to unwrap with");
++    }
++
++    if (data.size() < 16 || data[data.size() - 6] != 0 || data[data.size() - 5] != 1) {
++        THROW(HdfsIOException, "DIGEST-MD5: malformed wrapped message");
++    }
++
++    std::string seq = data.substr(data.size() - 4);
++    std::string body = data.substr(0, data.size() - 6);
++    std::string message;
++    std::string mac;
++
++    if (decryptor) {
++        if (body.size() % 8 != 0) {
++            THROW(HdfsIOException, "DIGEST-MD5: malformed encrypted message");
++        }
++
++        std::string plain = RunCipher(decryptor, body);
++        mac = plain.substr(plain.size() - 10);
++        plain.resize(plain.size() - 10);
++        size_t padding = plain.empty() ? 0 : static_cast<unsigned char>(plain[plain.size() - 1]);
++
++        if (padding < 1 || padding > 8 || padding > plain.size()) {
++            THROW(HdfsIOException, "DIGEST-MD5: bad padding in encrypted message");
++        }
++
++        message = plain.substr(0, plain.size() - padding);
++    } else {
++        mac = body.substr(body.size() - 10);
++        message = body.substr(0, body.size() - 10);
++    }
++
++    if (HmacMd5(kis, seq + message).substr(0, 10) != mac) {
++        THROW(HdfsIOException, "DIGEST-MD5: integrity check failed on a message from the DataNode");
++    }
++
++    recvSeq++;
++    return message;
++}
++
++}
++}
+diff --git a/src/client/DigestMd5.h b/src/client/DigestMd5.h
+new file mode 100644
+index 0000000..a49b835
+--- /dev/null
++++ b/src/client/DigestMd5.h
+@@ -0,0 +1,98 @@
++/********************************************************************
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef _HDFS_LIBHDFS3_CLIENT_DIGESTMD5_H_
++#define _HDFS_LIBHDFS3_CLIENT_DIGESTMD5_H_
++
++#include <openssl/evp.h>
++
++#include <cstdint>
++#include <string>
++
++namespace Hdfs {
++namespace Internal {
++
++/**
++ * Client side of SASL DIGEST-MD5 (RFC 2831) as used by the DataNode
++ * handshake: authentication with integrity (auth-int) and confidentiality
++ * (auth-conf, 3DES) security layers. GNU SASL's DIGEST-MD5 has no
++ * confidentiality layer, which privacy-protected DataNodes require.
++ */
++class DigestMd5Client {
++public:
++    // Security layer bits, as in SASL.
++    static const int QOP_AUTH = 1;
++    static const int QOP_AUTH_INT = 2;
++    static const int QOP_AUTH_CONF = 4;
++
++    /**
++     * @param username the SASL user name (e.g. the base64 block token identifier).
++     * @param password the SASL password (e.g. the base64 block token password).
++     * @param digestUri the digest-uri, "hdfs/0" for DataNodes.
++     */
++    DigestMd5Client(const std::string & username, const std::string & password,
++                    const std::string & digestUri);
++
++    ~DigestMd5Client();
++
++    /**
++     * Answer the server's challenge, choosing the strongest security layer
++     * the server offers within `allowedQops` (QOP_* bits).
++     */
++    std::string respond(const std::string & challenge, int allowedQops);
++
++    /**
++     * Check the server's final message (rspauth) and set up the security layer.
++     */
++    void complete(const std::string & serverFinal);
++
++    int getQop() const {
++        return qop;
++    }
++
++    bool hasSecurityLayer() const {
++        return done && qop != QOP_AUTH;
++    }
++
++    std::string wrap(const std::string & data);
++
++    std::string unwrap(const std::string & data);
++
++private:
++    std::string computeResponse(bool initial) const;
++    std::string a1() const;
++
++private:
++    std::string username;
++    std::string password;
++    std::string digestUri;
++    std::string realm;
++    std::string nonce;
++    std::string cnonce;
++    int qop;
++    bool done;
++    std::string kic, kis;
++    EVP_CIPHER_CTX * encryptor;
++    EVP_CIPHER_CTX * decryptor;
++    uint32_t sendSeq;
++    uint32_t recvSeq;
++};
++
++}
++}
++
++#endif /* _HDFS_LIBHDFS3_CLIENT_DIGESTMD5_H_ */
+diff --git a/src/client/FileSystemImpl.cpp b/src/client/FileSystemImpl.cpp
+index 20185e0..afcb769 100644
+--- a/src/client/FileSystemImpl.cpp
++++ b/src/client/FileSystemImpl.cpp
+@@ -26,6 +26,7 @@
+  * limitations under the License.
+  */
+ #include "Atomic.h"
++#include <chrono>
+ #include "BlockLocation.h"
+ #include "DirectoryIterator.h"
+ #include "Exception.h"
+@@ -575,6 +576,27 @@ bool FileSystemImpl::exist(const char * path) {
+  * To get the file system status.
+  * @return the file system status.
+  */
++bool FileSystemImpl::getDataEncryptionKey(DataEncryptionKey & key) {
++    if (!nn) {
++        THROW(HdfsIOException, "FileSystemImpl: not connected.");
++    }
++
++    lock_guard<mutex> lock(mutDataEncryptionKey);
++    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
++                      std::chrono::system_clock::now().time_since_epoch()).count();
++
++    // Refetch ten minutes before expiry, as the Hadoop client does.
++    if (!haveDataEncryptionKey || dataEncryptionKey.expiryDate - 10 * 60 * 1000 < now) {
++        haveDataEncryptionKey = nn->getDataEncryptionKey(dataEncryptionKey);
++    }
++
++    if (haveDataEncryptionKey) {
++        key = dataEncryptionKey;
++    }
++
++    return haveDataEncryptionKey;
++}
++
+ FileSystemStats FileSystemImpl::getFsStats() {
+     if (!nn) {
+         THROW(HdfsIOException, "FileSystemImpl: not connected.");
+diff --git a/src/client/FileSystemImpl.h b/src/client/FileSystemImpl.h
+index f1dcfb9..c3f90df 100644
+--- a/src/client/FileSystemImpl.h
++++ b/src/client/FileSystemImpl.h
+@@ -241,6 +241,8 @@ public:
+      */
+     FileSystemStats getFsStats();
+ 
++    bool getDataEncryptionKey(DataEncryptionKey & key);
++
+     /**
+      * Truncate the file in the indicated path to the indicated size.
+      * @param path The path to the file to be truncated
+@@ -499,6 +501,10 @@ private:
+     FileSystemKey key;
+     int openedOutputStream;
+     mutex mutWorkingDir;
++    // Cached key for dfs.encrypt.data.transfer.
++    mutex mutDataEncryptionKey;
++    bool haveDataEncryptionKey = false;
++    DataEncryptionKey dataEncryptionKey;
+     Namenode * nn;
+     SessionConfig sconf;
+     shared_ptr<PeerCache> peerCache;
+diff --git a/src/client/FileSystemInter.h b/src/client/FileSystemInter.h
+index 1640566..ff1f4de 100644
+--- a/src/client/FileSystemInter.h
++++ b/src/client/FileSystemInter.h
+@@ -32,6 +32,7 @@
+ #include <vector>
+ 
+ #include "BlockLocation.h"
++#include "DataTransferSasl.h"
+ #include "DirectoryIterator.h"
+ #include "FileStatus.h"
+ #include "FileSystemKey.h"
+@@ -251,6 +252,12 @@ public:
+      */
+     virtual FileSystemStats getFsStats() = 0;
+ 
++    /**
++     * The key for encrypting DataNode traffic (dfs.encrypt.data.transfer),
++     * cached until shortly before it expires. False if there is none.
++     */
++    virtual bool getDataEncryptionKey(DataEncryptionKey & key) = 0;
++
+     /**
+      * Truncate the file in the indicated path to the indicated size.
+      * @param src The path we will find the file to be truncated.
+diff --git a/src/client/InputStreamImpl.cpp b/src/client/InputStreamImpl.cpp
+index 1b2b326..0bfa6af 100644
+--- a/src/client/InputStreamImpl.cpp
++++ b/src/client/InputStreamImpl.cpp
+@@ -443,7 +443,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead) {
+                 lastReadFromLocal = false;
+                 blockReader = shared_ptr<BlockReader>(new RemoteBlockReader(
+                     *curBlock, curNode, *peerCache, offset, len,
+-                    curBlock->getToken(), clientName, verify, *conf));
++                    curBlock->getToken(), clientName, verify, *conf, filesystem.get()));
+             }
+ 
+             break;
+@@ -544,7 +544,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead, shared_pt
+                 lastReadFromLocal = false;
+                 blockReader = shared_ptr<BlockReader>(new RemoteBlockReader(
+                         *curBlock, curNode, *peerCache, offset, len,
+-                        curBlock->getToken(), clientName, verify, *conf));
++                        curBlock->getToken(), clientName, verify, *conf, filesystem.get()));
+             }
+ 
+             break;
+diff --git a/src/client/Pipeline.cpp b/src/client/Pipeline.cpp
+index 6ba85ba..9a83846 100644
+--- a/src/client/Pipeline.cpp
++++ b/src/client/Pipeline.cpp
+@@ -27,6 +27,7 @@
+  */
+ #include "DateTime.h"
+ #include "Pipeline.h"
++#include "DataTransferSasl.h"
+ #include "Logger.h"
+ #include "Exception.h"
+ #include "ExceptionInternal.h"
+@@ -54,6 +55,7 @@ PipelineImpl::PipelineImpl(const char * path, SessionConfig & conf,
+     readTimeout = conf.getOutputReadTimeout();
+     writeTimeout = conf.getOutputWriteTimeout();
+     clientName = filesystem->getClientName();
++    sessionConf = shared_ptr<SessionConfig>(new SessionConfig(conf));
+ }
+ 
+ PipelineImpl::PipelineImpl(bool append, const char * path, const SessionConfig & conf,
+@@ -69,6 +71,7 @@ PipelineImpl::PipelineImpl(bool append, const char * path, const SessionConfig &
+     readTimeout = conf.getOutputReadTimeout();
+     writeTimeout = conf.getOutputWriteTimeout();
+     clientName = filesystem->getClientName();
++    sessionConf = shared_ptr<SessionConfig>(new SessionConfig(conf));
+ 
+     if (append) {
+         LOG(DEBUG2, "create pipeline for file %s to append to %s at position %" PRId64,
+@@ -107,11 +110,19 @@ int PipelineImpl::findNewDatanode(const std::vector<DatanodeInfo> & original) {
+     THROW(HdfsIOException, "Cannot add new datanode for block %s.", lastBlock->toString().c_str());
+ }
+ 
++shared_ptr<Socket> PipelineImpl::negotiateSasl(shared_ptr<Socket> so, const DatanodeInfo & dn,
++                                               const Token & token) {
++    DataEncryptionKey key;
++    bool haveKey = sessionConf->isEncryptDataTransfer() && filesystem->getDataEncryptionKey(key);
++    return NegotiateDataTransferSasl(so, dn, token, *sessionConf, haveKey ? &key : NULL, readTimeout);
++}
++
+ void PipelineImpl::transfer(const ExtendedBlock & blk, const DatanodeInfo & src,
+                             const std::vector<DatanodeInfo> & targets, const Token & token) {
+     shared_ptr<Socket> so(new TcpSocketImpl);
+-    shared_ptr<BufferedSocketReader> in(new BufferedSocketReaderImpl(*so));
+     so->connect(src.getIpAddr().c_str(), src.getXferPort(), connectTimeout);
++    so = negotiateSasl(so, src, token);
++    shared_ptr<BufferedSocketReader> in(new BufferedSocketReaderImpl(*so));
+     DataTransferProtocolSender sender(*so, writeTimeout, src.formatAddress());
+     sender.transferBlock(blk, token, clientName.c_str(), targets);
+     int size;
+@@ -533,9 +544,10 @@ void PipelineImpl::createBlockOutputStream(const Token & token, int64_t gs, bool
+ 
+     try {
+         sock = shared_ptr < Socket > (new TcpSocketImpl);
+-        reader = shared_ptr<BufferedSocketReader>(new BufferedSocketReaderImpl(*sock));
+         sock->connect(nodes[0].getIpAddr().c_str(), nodes[0].getXferPort(),
+                       connectTimeout);
++        sock = negotiateSasl(sock, nodes[0], token);
++        reader = shared_ptr<BufferedSocketReader>(new BufferedSocketReaderImpl(*sock));
+         std::vector<DatanodeInfo> targets;
+ 
+         for (size_t i = 1; i < nodes.size(); ++i) {
+diff --git a/src/client/Pipeline.h b/src/client/Pipeline.h
+index 697e151..bcfa825 100644
+--- a/src/client/Pipeline.h
++++ b/src/client/Pipeline.h
+@@ -189,6 +189,7 @@ private:
+     void processAck(PipelineAck & ack);
+     void processResponse();
+     void resend();
++    shared_ptr<Socket> negotiateSasl(shared_ptr<Socket> so, const DatanodeInfo & dn, const Token & token);
+     void transfer(const ExtendedBlock & blk, const DatanodeInfo & src,
+                   const std::vector<DatanodeInfo> & targets,
+                   const Token & token);
+@@ -215,6 +216,8 @@ protected:
+     shared_ptr<FileSystemInter> filesystem;
+     shared_ptr<LocatedBlock> lastBlock;
+     shared_ptr<Socket> sock;
++    // For the DataNode SASL handshake on new connections.
++    shared_ptr<SessionConfig> sessionConf;
+     std::deque<shared_ptr<Packet> > packets;
+     std::string clientName;
+     std::string path;
+diff --git a/src/client/RemoteBlockReader.cpp b/src/client/RemoteBlockReader.cpp
+index d832001..abcd46f 100644
+--- a/src/client/RemoteBlockReader.cpp
++++ b/src/client/RemoteBlockReader.cpp
+@@ -32,6 +32,8 @@
+ #include "ExceptionInternal.h"
+ #include "HWCrc32c.h"
+ #include "RemoteBlockReader.h"
++#include "DataTransferSasl.h"
++#include "FileSystemInter.h"
+ #include "SWCrc32c.h"
+ #include "IntelAsmCrc32c.h"
+ #include "WriteBuffer.h"
+@@ -54,7 +56,7 @@ RemoteBlockReader::RemoteBlockReader(const ExtendedBlock& eb,
+                                      PeerCache& peerCache, int64_t start,
+                                      int64_t len, const Token& token,
+                                      const char* clientName, bool verify,
+-                                     SessionConfig& conf)
++                                     SessionConfig& conf, FileSystemInter* filesystem)
+     : sentStatus(false),
+       verify(verify),
+       binfo(eb),
+@@ -72,7 +74,7 @@ RemoteBlockReader::RemoteBlockReader(const ExtendedBlock& eb,
+     readTimeout = conf.getInputReadTimeout();
+     writeTimeout = conf.getInputWriteTimeout();
+     connTimeout = conf.getInputConnTimeout();
+-    sock = getNextPeer(datanode, conf.connectViaHostname());
++    sock = getNextPeer(datanode, conf, token, filesystem);
+     in = shared_ptr<BufferedSocketReader>(new BufferedSocketReaderImpl(*sock));
+     sender = shared_ptr<DataTransferProtocol>(new DataTransferProtocolSender(
+         *sock, writeTimeout, datanode.formatAddress()));
+@@ -88,7 +90,9 @@ RemoteBlockReader::~RemoteBlockReader() {
+     }
+ }
+ 
+-shared_ptr<Socket> RemoteBlockReader::getNextPeer(const DatanodeInfo& dn, const bool connectToDnViaHostname) {
++shared_ptr<Socket> RemoteBlockReader::getNextPeer(const DatanodeInfo& dn, const SessionConfig& conf,
++                                                  const Token& token, FileSystemInter* filesystem) {
++    const bool connectToDnViaHostname = conf.connectViaHostname();
+     shared_ptr<Socket> sock;
+     try {
+         sock = peerCache.getConnection(dn);
+@@ -105,6 +109,11 @@ shared_ptr<Socket> RemoteBlockReader::getNextPeer(const DatanodeInfo& dn, const
+             sock->connect(host.c_str(), dn.getXferPort(),
+                           connTimeout);
+             sock->setNoDelay(true);
++            // A new connection: run the DataNode SASL handshake if needed
++            // (cached connections already did).
++            DataEncryptionKey key;
++            bool haveKey = conf.isEncryptDataTransfer() && filesystem && filesystem->getDataEncryptionKey(key);
++            sock = NegotiateDataTransferSasl(sock, dn, token, conf, haveKey ? &key : NULL, readTimeout);
+         }
+     } catch (const HdfsTimeoutException & e) {
+         NESTED_THROW(HdfsIOException,
+diff --git a/src/client/RemoteBlockReader.h b/src/client/RemoteBlockReader.h
+index 9d91ad2..170e89d 100644
+--- a/src/client/RemoteBlockReader.h
++++ b/src/client/RemoteBlockReader.h
+@@ -43,12 +43,14 @@
+ namespace Hdfs {
+ namespace Internal {
+ 
++class FileSystemInter;
++
+ class RemoteBlockReader: public BlockReader {
+ public:
+     RemoteBlockReader(const ExtendedBlock& eb, DatanodeInfo datanode,
+                       PeerCache& peerCache, int64_t start, int64_t len,
+                       const Token& token, const char* clientName, bool verify,
+-                      SessionConfig& conf);
++                      SessionConfig& conf, FileSystemInter* filesystem = NULL);
+ 
+     ~RemoteBlockReader();
+ 
+@@ -76,7 +78,8 @@ public:
+ private:
+     bool readTrailingEmptyPacket();
+     shared_ptr<PacketHeader> readPacketHeader();
+-    shared_ptr<Socket> getNextPeer(const DatanodeInfo& dn, const bool connectToDnViaHostname);
++    shared_ptr<Socket> getNextPeer(const DatanodeInfo& dn, const SessionConfig& conf, const Token& token,
++                                   FileSystemInter* filesystem);
+     void checkResponse();
+     void readNextPacket();
+     void sendStatus();
+diff --git a/src/client/StripedInputStreamImpl.cpp b/src/client/StripedInputStreamImpl.cpp
+index 0825dd5..993fb92 100644
+--- a/src/client/StripedInputStreamImpl.cpp
++++ b/src/client/StripedInputStreamImpl.cpp
+@@ -212,7 +212,7 @@ bool StripedInputStreamImpl::createBlockReader(LocatedBlock & block,
+                 }
+                 reader = shared_ptr<BlockReader>(new RemoteBlockReader(
+                     block, *node, *peerCache, offsetInBlock, block.getNumBytes() - offsetInBlock,
+-                    block.getToken(), clientName, verify, *conf));
++                    block.getToken(), clientName, verify, *conf, filesystem.get()));
+             }
+ 
+         } catch (const HdfsTimeoutException & e) {
+diff --git a/src/common/SessionConfig.cpp b/src/common/SessionConfig.cpp
+index 24238d4..ef484ac 100644
+--- a/src/common/SessionConfig.cpp
++++ b/src/common/SessionConfig.cpp
+@@ -61,6 +61,8 @@ SessionConfig::SessionConfig(const Config & conf) {
+             &rpcTcpNoDelay, "rpc.client.connect.tcpnodelay", true
+         }, {
+             &readFromLocal, "dfs.client.read.shortcircuit", true
++        }, {
++            &encryptDataTransfer, "dfs.encrypt.data.transfer", false
+         }, {
+             &addDatanode, "output.replace-datanode-on-failure", true
+         }, {
+@@ -164,6 +166,8 @@ SessionConfig::SessionConfig(const Config & conf) {
+     ConfigDefault<std::string> strValues [] = {
+         {&defaultUri, "dfs.default.uri", "hdfs://localhost:9000" },
+         {&rpcAuthMethod, "hadoop.security.authentication", "simple" },
++        {&rpcProtection, "hadoop.rpc.protection", "" },
++        {&dataTransferProtection, "dfs.data.transfer.protection", "" },
+         {&kerberosCachePath, "hadoop.security.kerberos.ticket.cache.path", "" },
+         {&logSeverity, "dfs.client.log.severity", "INFO" },
+         {&domainSocketPath, "dfs.domain.socket.path", ""}
+diff --git a/src/common/SessionConfig.h b/src/common/SessionConfig.h
+index 53527e4..d257e8f 100644
+--- a/src/common/SessionConfig.h
++++ b/src/common/SessionConfig.h
+@@ -196,6 +196,24 @@ public:
+         return rpcAuthMethod;
+     }
+ 
++    // hadoop.rpc.protection: the SASL security layers the client accepts for
++    // NameNode RPC (authentication,integrity,privacy). Empty: accept any.
++    const std::string & getRpcProtection() const {
++        return rpcProtection;
++    }
++
++    // dfs.data.transfer.protection: SASL protection for DataNode connections
++    // (authentication,integrity,privacy). Empty: no DataNode SASL.
++    const std::string & getDataTransferProtection() const {
++        return dataTransferProtection;
++    }
++
++    // dfs.encrypt.data.transfer: encrypt DataNode traffic with keys from the
++    // NameNode (getDataEncryptionKey).
++    bool isEncryptDataTransfer() const {
++        return encryptDataTransfer;
++    }
++
+     void setRpcAuthMethod(const std::string & rpcAuthMethod) {
+         this->rpcAuthMethod = rpcAuthMethod;
+     }
+@@ -358,6 +376,9 @@ public:
+     int32_t rpcTimeout;
+     bool rpcTcpNoDelay;
+     std::string rpcAuthMethod;
++    std::string rpcProtection;
++    std::string dataTransferProtection;
++    bool encryptDataTransfer;
+ 
+     /*
+      * FileSystem configure
+diff --git a/src/network/WrappedSocket.cpp b/src/network/WrappedSocket.cpp
+new file mode 100644
+index 0000000..ed63649
+--- /dev/null
++++ b/src/network/WrappedSocket.cpp
+@@ -0,0 +1,126 @@
++/********************************************************************
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "WrappedSocket.h"
++
++#include "DateTime.h"
++#include "Exception.h"
++#include "ExceptionInternal.h"
++
++#include <algorithm>
++#include <cstring>
++
++namespace Hdfs {
++namespace Internal {
++
++WrappedSocket::WrappedSocket(shared_ptr<Socket> inner) :
++    inner(inner), offset(0) {
++}
++
++int32_t WrappedSocket::read(char * buffer, int32_t size) {
++    if (offset >= plain.size()) {
++        plain.clear();
++        offset = 0;
++        fill(-1);
++    }
++
++    int32_t n = static_cast<int32_t>(std::min<size_t>(size, plain.size() - offset));
++    memcpy(buffer, plain.data() + offset, n);
++    offset += n;
++    return n;
++}
++
++void WrappedSocket::readFully(char * buffer, int32_t size, int timeout) {
++    int32_t done = 0;
++    int deadline = timeout;
++
++    while (done < size) {
++        if (offset >= plain.size()) {
++            steady_clock::time_point s = steady_clock::now();
++            plain.clear();
++            offset = 0;
++            fill(deadline);
++
++            if (timeout > 0) {
++                deadline -= ToMilliSeconds(s, steady_clock::now());
++
++                if (deadline <= 0 && offset >= plain.size()) {
++                    THROW(HdfsTimeoutException, "Read %d bytes timeout", size);
++                }
++            }
++        }
++
++        int32_t n = static_cast<int32_t>(std::min<size_t>(size - done, plain.size() - offset));
++        memcpy(buffer + done, plain.data() + offset, n);
++        offset += n;
++        done += n;
++    }
++}
++
++int32_t WrappedSocket::write(const char * buffer, int32_t size) {
++    send(buffer, size, -1);
++    return size;
++}
++
++void WrappedSocket::writeFully(const char * buffer, int32_t size, int timeout) {
++    send(buffer, size, timeout);
++}
++
++void WrappedSocket::connect(const char * host, int port, int timeout) {
++    THROW(HdfsIOException, "WrappedSocket: cannot reconnect a protected connection");
++}
++
++void WrappedSocket::connect(const char * host, const char * port, int timeout) {
++    THROW(HdfsIOException, "WrappedSocket: cannot reconnect a protected connection");
++}
++
++void WrappedSocket::connect(struct addrinfo * paddr, const char * host, const char * port, int timeout) {
++    THROW(HdfsIOException, "WrappedSocket: cannot reconnect a protected connection");
++}
++
++bool WrappedSocket::poll(bool read, bool write, int timeout) {
++    if (read && offset < plain.size()) {
++        return true;
++    }
++
++    return inner->poll(read, write, timeout);
++}
++
++void WrappedSocket::setBlockMode(bool enable) {
++    inner->setBlockMode(enable);
++}
++
++void WrappedSocket::setNoDelay(bool enable) {
++    inner->setNoDelay(enable);
++}
++
++void WrappedSocket::setLingerTimeout(int timeout) {
++    inner->setLingerTimeout(timeout);
++}
++
++void WrappedSocket::disableSigPipe() {
++    inner->disableSigPipe();
++}
++
++void WrappedSocket::close() {
++    plain.clear();
++    offset = 0;
++    inner->close();
++}
++
++}
++}
+diff --git a/src/network/WrappedSocket.h b/src/network/WrappedSocket.h
+new file mode 100644
+index 0000000..e41f87b
+--- /dev/null
++++ b/src/network/WrappedSocket.h
+@@ -0,0 +1,87 @@
++/********************************************************************
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef _HDFS_LIBHDFS3_NETWORK_WRAPPEDSOCKET_H_
++#define _HDFS_LIBHDFS3_NETWORK_WRAPPEDSOCKET_H_
++
++#include "Memory.h"
++#include "Socket.h"
++
++#include <string>
++
++namespace Hdfs {
++namespace Internal {
++
++/**
++ * A connected socket whose traffic passes through a security layer (SASL
++ * wrap/unwrap or a stream cipher). Writes are transformed and sent on the
++ * inner socket; reads are served from a buffer of decoded bytes that is
++ * refilled from the inner socket. The wrapper is installed after the
++ * handshake, so the code above it reads and writes plaintext as before.
++ */
++class WrappedSocket: public Socket {
++public:
++    explicit WrappedSocket(shared_ptr<Socket> inner);
++
++    int32_t read(char * buffer, int32_t size);
++
++    void readFully(char * buffer, int32_t size, int timeout);
++
++    int32_t write(const char * buffer, int32_t size);
++
++    void writeFully(const char * buffer, int32_t size, int timeout);
++
++    void connect(const char * host, int port, int timeout);
++
++    void connect(const char * host, const char * port, int timeout);
++
++    void connect(struct addrinfo * paddr, const char * host, const char * port, int timeout);
++
++    bool poll(bool read, bool write, int timeout);
++
++    void setBlockMode(bool enable);
++
++    void setNoDelay(bool enable);
++
++    void setLingerTimeout(int timeout);
++
++    void disableSigPipe();
++
++    void close();
++
++protected:
++    /**
++     * Read the next unit of protected data from the inner socket and append
++     * its decoded bytes to `plain` (at least one byte, or throw).
++     * @param timeout the read timeout in milliseconds, -1 for none.
++     */
++    virtual void fill(int timeout) = 0;
++
++    /**
++     * Protect `size` bytes and send them on the inner socket.
++     */
++    virtual void send(const char * buffer, int32_t size, int timeout) = 0;
++
++    shared_ptr<Socket> inner;
++    std::string plain;
++    size_t offset;
++};
++
++}
++}
++
++#endif /* _HDFS_LIBHDFS3_NETWORK_WRAPPEDSOCKET_H_ */
+diff --git a/src/proto/datatransfer.proto b/src/proto/datatransfer.proto
+index 3de6c4b..abe38e8 100644
+--- a/src/proto/datatransfer.proto
++++ b/src/proto/datatransfer.proto
+@@ -34,6 +34,19 @@ package Hdfs.Internal;
+ import "Security.proto";
+ import "hdfs.proto";
+ 
++/**
++ * Hadoop's CipherOptionProto: a stream cipher negotiated during the
++ * DataNode SASL handshake. suite 2 = AES/CTR/NoPadding (a plain number to
++ * avoid clashing with other enums; same wire format).
++ */
++message HdfsCipherOptionProto {
++  optional uint32 suite = 1;
++  optional bytes inKey = 2;
++  optional bytes inIv = 3;
++  optional bytes outKey = 4;
++  optional bytes outIv = 5;
++}
++
+ message DataTransferEncryptorMessageProto {
+   enum DataTransferEncryptorStatus {
+     SUCCESS = 0;
+@@ -43,6 +56,7 @@ message DataTransferEncryptorMessageProto {
+   required DataTransferEncryptorStatus status = 1;
+   optional bytes payload = 2;
+   optional string message = 3;
++  repeated HdfsCipherOptionProto cipherOption = 4;
+ }
+ 
+ message BaseHeaderProto {
+diff --git a/src/rpc/RpcChannel.cpp b/src/rpc/RpcChannel.cpp
+index ba9dd89..78bd577 100644
+--- a/src/rpc/RpcChannel.cpp
++++ b/src/rpc/RpcChannel.cpp
+@@ -32,6 +32,7 @@
+ #include "RpcChannel.h"
+ #include "RpcClient.h"
+ #include "RpcContentWrapper.h"
++#include "RpcSaslSocket.h"
+ #include "RpcHeader.pb.h"
+ #include "RpcHeader.pb.h"
+ #include "server/RpcHelper.h"
+@@ -58,6 +59,8 @@ RpcChannelImpl::RpcChannelImpl(const RpcChannelKey & k, RpcClient & c) :
+     in = shared_ptr<BufferedSocketReader>(
+              new BufferedSocketReaderImpl(
+                  *static_cast<TcpSocketImpl *>(sock.get())));
++    rawSock = sock;
++    rawIn = in;
+ }
+ 
+ RpcChannelImpl::RpcChannelImpl(const RpcChannelKey & k, Socket * s,
+@@ -65,6 +68,8 @@ RpcChannelImpl::RpcChannelImpl(const RpcChannelKey & k, Socket * s,
+     refs(0), available(false), key(k), client(c), lastActivity(steady_clock::now()), lastIdle(lastActivity.load(std::memory_order_relaxed)) {
+     sock = shared_ptr<Socket>(s);
+     this->in = shared_ptr<BufferedSocketReader>(in);
++    rawSock = sock;
++    rawIn = this->in;
+ }
+ 
+ RpcChannelImpl::~RpcChannelImpl() {
+@@ -146,7 +151,8 @@ const RpcSaslProto_SaslAuth * RpcChannelImpl::createSaslClient(
+     }
+ 
+     saslClient = shared_ptr<SaslClient>(
+-                     new SaslClient(*auth, token, key.getAuth().getUser().getPrincipal()));
++                     new SaslClient(*auth, token, key.getAuth().getUser().getPrincipal(),
++                                    key.getConf().getRpcProtection()));
+     return auth;
+ }
+ 
+@@ -259,6 +265,9 @@ void RpcChannelImpl::connect() {
+ 
+     for (int i = 0; i < conf.getMaxRetryOnConnect(); ++i) {
+         RpcAuth auth = key.getAuth();
++        sock = rawSock;
++        in = rawIn;
++        saslClient.reset();
+ 
+         if (key.hasToken()) {
+             auth.setMethod(AuthMethod::TOKEN);
+@@ -289,6 +298,13 @@ void RpcChannelImpl::connect() {
+                 }
+             }
+ 
++            if (saslClient && saslClient->hasSecurityLayer()) {
++                // Integrity or privacy: everything from here on is wrapped,
++                // starting with the connection context.
++                sock = shared_ptr<Socket>(new RpcSaslSocket(rawSock, saslClient, client.getClientId()));
++                in = shared_ptr<BufferedSocketReader>(new BufferedSocketReaderImpl(*sock));
++            }
++
+             auth.setUser(key.getAuth().getUser());
+             sendConnectionContent(auth);
+             available = true;
+diff --git a/src/rpc/RpcChannel.h b/src/rpc/RpcChannel.h
+index 4312c6f..36b2431 100644
+--- a/src/rpc/RpcChannel.h
++++ b/src/rpc/RpcChannel.h
+@@ -263,6 +263,10 @@ private:
+     RpcChannelKey key;
+     RpcClient & client;
+     shared_ptr<BufferedSocketReader> in;
++    // The plain TCP connection. `sock`/`in` are replaced by a wrapper when the
++    // SASL handshake negotiates integrity or privacy, and restored on reconnect.
++    shared_ptr<BufferedSocketReader> rawIn;
++    shared_ptr<Socket> rawSock;
+     shared_ptr<SaslClient> saslClient;
+     shared_ptr<Socket> sock;
+     std::atomic<steady_clock::time_point> lastActivity; // ping is a kind of activity, lastActivity will be updated after ping
+diff --git a/src/rpc/RpcConfig.cpp b/src/rpc/RpcConfig.cpp
+index baa96e4..9c95010 100644
+--- a/src/rpc/RpcConfig.cpp
++++ b/src/rpc/RpcConfig.cpp
+@@ -36,7 +36,8 @@ size_t RpcConfig::hash_value() const {
+     size_t values[] = { Int32Hasher(maxIdleTime), Int32Hasher(pingTimeout),
+                         Int32Hasher(connectTimeout), Int32Hasher(readTimeout), Int32Hasher(
+                             writeTimeout), Int32Hasher(maxRetryOnConnect), Int32Hasher(
+-                            lingerTimeout), Int32Hasher(rpcTimeout), BoolHasher(tcpNoDelay)
++                            lingerTimeout), Int32Hasher(rpcTimeout), BoolHasher(tcpNoDelay),
++                        StringHasher(rpcProtection)
+                       };
+     return CombineHasher(values, sizeof(values) / sizeof(values[0]));
+ }
+diff --git a/src/rpc/RpcConfig.h b/src/rpc/RpcConfig.h
+index be71019..946d4b3 100644
+--- a/src/rpc/RpcConfig.h
++++ b/src/rpc/RpcConfig.h
+@@ -47,6 +47,11 @@ public:
+         tcpNoDelay = conf.isRpcTcpNoDelay();
+         lingerTimeout = conf.getRpcSocketLingerTimeout();
+         rpcTimeout = conf.getRpcTimeout();
++        rpcProtection = conf.getRpcProtection();
++    }
++
++    const std::string & getRpcProtection() const {
++        return rpcProtection;
+     }
+ 
+     size_t hash_value() const;
+@@ -132,7 +137,8 @@ public:
+                && this->maxRetryOnConnect == other.maxRetryOnConnect
+                && this->tcpNoDelay == other.tcpNoDelay
+                && this->lingerTimeout == other.lingerTimeout
+-               && this->rpcTimeout == other.rpcTimeout;
++               && this->rpcTimeout == other.rpcTimeout
++               && this->rpcProtection == other.rpcProtection;
+     }
+ 
+ private:
+@@ -145,6 +151,7 @@ private:
+     int lingerTimeout;
+     int rpcTimeout;
+     bool tcpNoDelay;
++    std::string rpcProtection;
+ };
+ 
+ }
+diff --git a/src/rpc/RpcSaslSocket.cpp b/src/rpc/RpcSaslSocket.cpp
+new file mode 100644
+index 0000000..7c26867
+--- /dev/null
++++ b/src/rpc/RpcSaslSocket.cpp
+@@ -0,0 +1,121 @@
++/********************************************************************
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "RpcSaslSocket.h"
++
++#include "Exception.h"
++#include "ExceptionInternal.h"
++#include "RpcAuth.h"
++#include "RpcContentWrapper.h"
++#include "RpcHeader.pb.h"
++#include "RpcRemoteCall.h"
++#include "WriteBuffer.h"
++
++#include <google/protobuf/io/coded_stream.h>
++
++#include <vector>
++
++using namespace ::google::protobuf::io;
++
++namespace Hdfs {
++namespace Internal {
++
++RpcSaslSocket::RpcSaslSocket(shared_ptr<Socket> inner, shared_ptr<SaslClient> sasl,
++                             const std::string & clientId) :
++    WrappedSocket(inner), sasl(sasl), clientId(clientId) {
++}
++
++void RpcSaslSocket::fill(int timeout) {
++    char lengthBytes[4];
++    inner->readFully(lengthBytes, sizeof(lengthBytes), timeout);
++    uint32_t length = (static_cast<uint32_t>(static_cast<unsigned char>(lengthBytes[0])) << 24)
++                      | (static_cast<uint32_t>(static_cast<unsigned char>(lengthBytes[1])) << 16)
++                      | (static_cast<uint32_t>(static_cast<unsigned char>(lengthBytes[2])) << 8)
++                      | static_cast<uint32_t>(static_cast<unsigned char>(lengthBytes[3]));
++
++    if (length == 0 || length > 256 * 1024 * 1024) {
++        THROW(HdfsRpcException, "RpcSaslSocket: invalid wrapped RPC message length %u", length);
++    }
++
++    std::vector<char> frame(length);
++    inner->readFully(frame.data(), static_cast<int32_t>(length), timeout);
++    CodedInputStream stream(reinterpret_cast<const uint8_t *>(frame.data()), static_cast<int>(length));
++    RpcResponseHeaderProto header;
++    uint32_t size = 0;
++
++    if (!stream.ReadVarint32(&size)) {
++        THROW(HdfsRpcException, "RpcSaslSocket: cannot read the RPC response header");
++    }
++
++    CodedInputStream::Limit limit = stream.PushLimit(static_cast<int>(size));
++
++    if (!header.ParseFromCodedStream(&stream)) {
++        THROW(HdfsRpcException, "RpcSaslSocket: cannot parse the RPC response header");
++    }
++
++    stream.PopLimit(limit);
++
++    if (header.status() != RpcResponseHeaderProto_RpcStatusProto_SUCCESS) {
++        THROW(HdfsRpcServerException, "%s: %s", header.exceptionclassname().c_str(),
++              header.errormsg().c_str());
++    }
++
++    RpcSaslProto message;
++
++    if (!stream.ReadVarint32(&size)) {
++        THROW(HdfsRpcException, "RpcSaslSocket: cannot read the wrapped RPC message");
++    }
++
++    limit = stream.PushLimit(static_cast<int>(size));
++
++    if (!message.ParseFromCodedStream(&stream)) {
++        THROW(HdfsRpcException, "RpcSaslSocket: cannot parse the wrapped RPC message");
++    }
++
++    stream.PopLimit(limit);
++
++    if (message.state() != RpcSaslProto_SaslState_WRAP) {
++        THROW(HdfsRpcException, "RpcSaslSocket: expected a wrapped RPC message, got SASL state %d",
++              static_cast<int>(message.state()));
++    }
++
++    std::lock_guard<std::mutex> lock(saslMutex);
++    plain.append(sasl->decode(message.token()));
++}
++
++void RpcSaslSocket::send(const char * buffer, int32_t size, int timeout) {
++    RpcSaslProto message;
++    message.set_state(RpcSaslProto_SaslState_WRAP);
++    {
++        std::lock_guard<std::mutex> lock(saslMutex);
++        message.set_token(sasl->encode(std::string(buffer, size)));
++    }
++    RpcRequestHeaderProto header;
++    header.set_callid(AuthProtocol::SASL);
++    header.set_clientid(clientId);
++    header.set_retrycount(INVALID_RETRY_COUNT);
++    header.set_rpckind(RPC_PROTOCOL_BUFFER);
++    header.set_rpcop(RpcRequestHeaderProto_OperationProto_RPC_FINAL_PACKET);
++    RpcContentWrapper wrapper(&header, &message);
++    WriteBuffer out;
++    out.writeBigEndian(static_cast<int32_t>(wrapper.getLength()));
++    wrapper.writeTo(out);
++    inner->writeFully(out.getBuffer(0), static_cast<int32_t>(out.getDataSize(0)), timeout);
++}
++
++}
++}
+diff --git a/src/rpc/RpcSaslSocket.h b/src/rpc/RpcSaslSocket.h
+new file mode 100644
+index 0000000..18aea26
+--- /dev/null
++++ b/src/rpc/RpcSaslSocket.h
+@@ -0,0 +1,57 @@
++/********************************************************************
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef _HDFS_LIBHDFS3_RPC_RPCSASLSOCKET_H_
++#define _HDFS_LIBHDFS3_RPC_RPCSASLSOCKET_H_
++
++#include "Memory.h"
++#include "network/WrappedSocket.h"
++#include "SaslClient.h"
++
++#include <mutex>
++#include <string>
++
++namespace Hdfs {
++namespace Internal {
++
++/**
++ * The NameNode RPC connection after a SASL handshake that negotiated
++ * integrity or privacy (hadoop.rpc.protection): every outgoing chunk of the
++ * byte stream is sent as an RpcSaslProto WRAP message (call id -33) whose
++ * token is the SASL-wrapped bytes, and incoming WRAP messages are unwrapped
++ * back into the byte stream the RPC layer parses.
++ */
++class RpcSaslSocket: public WrappedSocket {
++public:
++    RpcSaslSocket(shared_ptr<Socket> inner, shared_ptr<SaslClient> sasl, const std::string & clientId);
++
++protected:
++    void fill(int timeout);
++
++    void send(const char * buffer, int32_t size, int timeout);
++
++private:
++    shared_ptr<SaslClient> sasl;
++    std::string clientId;
++    // The GSS context is shared by the reader and writer threads.
++    std::mutex saslMutex;
++};
++
++}
++}
++
++#endif /* _HDFS_LIBHDFS3_RPC_RPCSASLSOCKET_H_ */
+diff --git a/src/rpc/SaslClient.cpp b/src/rpc/SaslClient.cpp
+index 9aa9d7b..4b195c3 100644
+--- a/src/rpc/SaslClient.cpp
++++ b/src/rpc/SaslClient.cpp
+@@ -27,6 +27,7 @@
+  */
+ #include <algorithm>
+ #include <cctype>
++#include <cstring>
+ 
+ #include "Exception.h"
+ #include "ExceptionInternal.h"
+@@ -38,7 +39,7 @@ namespace Hdfs {
+ namespace Internal {
+ 
+ SaslClient::SaslClient(const RpcSaslProto_SaslAuth & auth, const Token & token,
+-                       const std::string & principal) :
++                       const std::string & principal, const std::string & rpcProtection) :
+     complete(false) {
+     int rc;
+     ctx = NULL;
+@@ -51,7 +52,7 @@ SaslClient::SaslClient(const RpcSaslProto_SaslAuth & auth, const Token & token,
+ 
+     switch (method.getMethod()) {
+     case AuthMethod::KERBEROS:
+-        initKerberos(auth, principal);
++        initKerberos(auth, principal, rpcProtection);
+         break;
+ 
+     case AuthMethod::TOKEN:
+@@ -74,8 +75,44 @@ SaslClient::~SaslClient() {
+     }
+ }
+ 
++// Map Hadoop's protection names to GNU SASL's QOP names.
++static std::string ToGsaslQops(const std::string & protection) {
++    std::string qops;
++    std::string::size_type start = 0;
++
++    while (start <= protection.size()) {
++        std::string::size_type comma = protection.find(',', start);
++        std::string item = protection.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
++        item.erase(0, item.find_first_not_of(" \t"));
++        item.erase(item.find_last_not_of(" \t") + 1);
++        const char * qop = NULL;
++
++        if (item == "authentication") {
++            qop = "qop-auth";
++        } else if (item == "integrity") {
++            qop = "qop-int";
++        } else if (item == "privacy") {
++            qop = "qop-conf";
++        } else if (!item.empty()) {
++            THROW(HdfsConfigInvalid, "Invalid hadoop.rpc.protection value \"%s\"", item.c_str());
++        }
++
++        if (qop) {
++            qops += qops.empty() ? qop : std::string(",") + qop;
++        }
++
++        if (comma == std::string::npos) {
++            break;
++        }
++
++        start = comma + 1;
++    }
++
++    return qops;
++}
++
+ void SaslClient::initKerberos(const RpcSaslProto_SaslAuth & auth,
+-                              const std::string & principal) {
++                              const std::string & principal, const std::string & rpcProtection) {
+     int rc;
+ 
+     /* Create new authentication session. */
+@@ -87,6 +124,12 @@ void SaslClient::initKerberos(const RpcSaslProto_SaslAuth & auth,
+     gsasl_property_set(session, GSASL_SERVICE, auth.protocol().c_str());
+     gsasl_property_set(session, GSASL_AUTHID, principal.c_str());
+     gsasl_property_set(session, GSASL_HOSTNAME, auth.serverid().c_str());
++
++    std::string qops = ToGsaslQops(rpcProtection);
++
++    if (!qops.empty()) {
++        gsasl_property_set(session, GSASL_QOPS, qops.c_str());
++    }
+ }
+ 
+ std::string Base64Encode(const std::string & in) {
+@@ -161,6 +204,39 @@ bool SaslClient::isComplete() {
+     return complete;
+ }
+ 
++bool SaslClient::hasSecurityLayer() {
++    const char * qop = gsasl_property_fast(session, GSASL_QOP);
++    return complete && qop && (strcmp(qop, "qop-int") == 0 || strcmp(qop, "qop-conf") == 0);
++}
++
++std::string SaslClient::encode(const std::string & data) {
++    char * output = NULL;
++    size_t outputSize = 0;
++    int rc = gsasl_encode(session, data.data(), data.size(), &output, &outputSize);
++
++    if (rc != GSASL_OK) {
++        THROW(SaslException, "Failed to wrap a SASL message: %s", gsasl_strerror(rc));
++    }
++
++    std::string retval(output, outputSize);
++    gsasl_free(output);
++    return retval;
++}
++
++std::string SaslClient::decode(const std::string & data) {
++    char * output = NULL;
++    size_t outputSize = 0;
++    int rc = gsasl_decode(session, data.data(), data.size(), &output, &outputSize);
++
++    if (rc != GSASL_OK) {
++        THROW(SaslException, "Failed to unwrap a SASL message: %s", gsasl_strerror(rc));
++    }
++
++    std::string retval(output, outputSize);
++    gsasl_free(output);
++    return retval;
++}
++
+ }
+ }
+ 
+diff --git a/src/rpc/SaslClient.h b/src/rpc/SaslClient.h
+index 6e6ed17..5657593 100644
+--- a/src/rpc/SaslClient.h
++++ b/src/rpc/SaslClient.h
+@@ -42,8 +42,12 @@ namespace Internal {
+ 
+ class SaslClient {
+ public:
++    /**
++     * @param rpcProtection hadoop.rpc.protection: the security layers
++     *        (authentication,integrity,privacy) to accept; empty accepts any.
++     */
+     SaslClient(const RpcSaslProto_SaslAuth & auth, const Token & token,
+-               const std::string & principal);
++               const std::string & principal, const std::string & rpcProtection = "");
+ 
+     ~SaslClient();
+ 
+@@ -51,9 +55,21 @@ public:
+ 
+     bool isComplete();
+ 
++    /**
++     * Whether the negotiated layer protects the traffic after the handshake
++     * (integrity or privacy), so every message must be encoded/decoded.
++     */
++    bool hasSecurityLayer();
++
++    /**
++     * Wrap / unwrap one message with the negotiated security layer.
++     */
++    std::string encode(const std::string & data);
++    std::string decode(const std::string & data);
++
+ private:
+     void initKerberos(const RpcSaslProto_SaslAuth & auth,
+-                      const std::string & principal);
++                      const std::string & principal, const std::string & rpcProtection);
+     void initDigestMd5(const RpcSaslProto_SaslAuth & auth, const Token & token);
+ 
+ private:
+diff --git a/src/server/Namenode.h b/src/server/Namenode.h
+index b51e817..f697828 100644
+--- a/src/server/Namenode.h
++++ b/src/server/Namenode.h
+@@ -30,6 +30,7 @@
+ 
+ #include "client/FileStatus.h"
+ #include "client/Permission.h"
++#include "client/DataTransferSasl.h"
+ #include "DatanodeInfo.h"
+ #include "Exception.h"
+ #include "ExtendedBlock.h"
+@@ -593,6 +594,12 @@ public:
+     //Idempotent
+     virtual std::vector<int64_t> getFsStats() /* throw (HdfsIOException) */ = 0;
+ 
++    /**
++     * The key for encrypting DataNode traffic (dfs.encrypt.data.transfer).
++     * Returns false if the NameNode doesn't have one.
++     */
++    virtual bool getDataEncryptionKey(DataEncryptionKey & key) = 0;
++
+     /**
+      * Dumps namenode data structures into specified file. If the file
+      * already exists, then append.
+diff --git a/src/server/NamenodeImpl.cpp b/src/server/NamenodeImpl.cpp
+index 824b58e..17c8feb 100644
+--- a/src/server/NamenodeImpl.cpp
++++ b/src/server/NamenodeImpl.cpp
+@@ -546,6 +546,32 @@ void NamenodeImpl::renewLease(const std::string & clientName)
+ }*/
+ 
+ //Idempotent
++bool NamenodeImpl::getDataEncryptionKey(DataEncryptionKey & key) {
++    try {
++        GetDataEncryptionKeyRequestProto request;
++        GetDataEncryptionKeyResponseProto response;
++        invoke(RpcCall(true, "getDataEncryptionKey", &request, &response));
++
++        if (!response.has_dataencryptionkey()) {
++            return false;
++        }
++
++        const DataEncryptionKeyProto & proto = response.dataencryptionkey();
++        key.keyId = proto.keyid();
++        key.blockPoolId = proto.blockpoolid();
++        key.nonce = proto.nonce();
++        key.encryptionKey = proto.encryptionkey();
++        key.expiryDate = static_cast<int64_t>(proto.expirydate());
++        key.encryptionAlgorithm = proto.encryptionalgorithm();
++        return true;
++    } catch (const HdfsRpcServerException & e) {
++        UnWrapper < HdfsIOException > unwrapper(e);
++        unwrapper.unwrap(__FILE__, __LINE__);
++    }
++
++    return false;
++}
++
+ std::vector<int64_t> NamenodeImpl::getFsStats() { /* throw (HdfsIOException) */
+     try {
+         GetFsStatusRequestProto request;
+diff --git a/src/server/NamenodeImpl.h b/src/server/NamenodeImpl.h
+index 91b57c7..fafbfed 100644
+--- a/src/server/NamenodeImpl.h
++++ b/src/server/NamenodeImpl.h
+@@ -162,6 +162,8 @@ public:
+     //Idempotent
+     std::vector<int64_t> getFsStats() /* throw (HdfsIOException) */;
+ 
++    bool getDataEncryptionKey(DataEncryptionKey & key);
++
+     void metaSave(const std::string & filename) /* throw (HdfsIOException) */;
+ 
+     //Idempotent
+diff --git a/src/server/NamenodeProxy.cpp b/src/server/NamenodeProxy.cpp
+index 1c01246..947e022 100644
+--- a/src/server/NamenodeProxy.cpp
++++ b/src/server/NamenodeProxy.cpp
+@@ -418,6 +418,14 @@ void NamenodeProxy::renewLease(const std::string & clientName) {
+     return false;
+ }*/
+ 
++bool NamenodeProxy::getDataEncryptionKey(DataEncryptionKey & key) {
++    NAMENODE_HA_RETRY_BEGIN();
++    return namenode->getDataEncryptionKey(key);
++    NAMENODE_HA_RETRY_END();
++    assert(!"should not reach here");
++    return false;
++}
++
+ std::vector<int64_t> NamenodeProxy::getFsStats() {
+     NAMENODE_HA_RETRY_BEGIN();
+     return namenode->getFsStats();
+diff --git a/src/server/NamenodeProxy.h b/src/server/NamenodeProxy.h
+index 0d7ba0e..a411d57 100644
+--- a/src/server/NamenodeProxy.h
++++ b/src/server/NamenodeProxy.h
+@@ -114,6 +114,8 @@ public:
+ 
+     std::vector<int64_t> getFsStats();
+ 
++    bool getDataEncryptionKey(DataEncryptionKey & key);
++
+     void metaSave(const std::string & filename);
+ 
+     FileStatus getFileInfo(const std::string & src);

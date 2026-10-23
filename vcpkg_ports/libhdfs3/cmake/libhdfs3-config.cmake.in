@@ -3,6 +3,7 @@
 include(CMakeFindDependencyMacro)
 find_dependency(Protobuf CONFIG)
 find_dependency(LibXml2 CONFIG)
+find_dependency(OpenSSL)
 find_dependency(PkgConfig)
 pkg_check_modules(GSASL REQUIRED IMPORTED_TARGET libgsasl)
 pkg_check_modules(LIBHDFS3_KRB5 REQUIRED mit-krb5-gssapi)

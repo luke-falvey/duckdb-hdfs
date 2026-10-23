@@ -1,0 +1,59 @@
+--- a/lib/gssapi/client.c	2026-10-24 08:06:17
++++ b/lib/gssapi/client.c	2026-10-24 08:06:17
+@@ -187,15 +187,47 @@
+       if (GSS_ERROR (maj_stat))
+ 	return GSASL_GSSAPI_RELEASE_BUFFER_ERROR;
+ 
+-#if 0
+-      /* FIXME: Fix qop. */
+-      if (cb_qop)
+-	state->qop = cb_qop (sctx, serverqop);
+-
+-      if ((state->qop & serverqop) == 0)
+-	/*  Server does not support what user wanted. */
+-	return GSASL_GSSAPI_UNSUPPORTED_PROTECTION_ERROR;
+-#endif
++      /* Pick the strongest security layer the server offers (the first
++         octet is its bit-mask) that the client allows: GSASL_QOPS, e.g.
++         "qop-auth,qop-int,qop-conf", or all layers if unset.  Record the
++         choice in GSASL_QOP so the application knows whether to wrap. */
++      {
++	int offered = (unsigned char) clientwrap[0];
++	int allowed = GSASL_QOP_AUTH | GSASL_QOP_AUTH_INT | GSASL_QOP_AUTH_CONF;
++	const char *qops = gsasl_property_fast (sctx, GSASL_QOPS);
++	if (qops)
++	  {
++	    const char *p = qops;
++	    allowed = 0;
++	    while (*p)
++	      {
++		size_t len = strcspn (p, ",");
++		if (len == 8 && strncmp (p, "qop-auth", 8) == 0)
++		  allowed |= GSASL_QOP_AUTH;
++		else if (len == 7 && strncmp (p, "qop-int", 7) == 0)
++		  allowed |= GSASL_QOP_AUTH_INT;
++		else if (len == 8 && strncmp (p, "qop-conf", 8) == 0)
++		  allowed |= GSASL_QOP_AUTH_CONF;
++		p += len;
++		if (*p == ',')
++		  p++;
++	      }
++	  }
++	offered &= allowed;
++	if (offered & GSASL_QOP_AUTH_CONF)
++	  state->qop = GSASL_QOP_AUTH_CONF;
++	else if (offered & GSASL_QOP_AUTH_INT)
++	  state->qop = GSASL_QOP_AUTH_INT;
++	else if (offered & GSASL_QOP_AUTH)
++	  state->qop = GSASL_QOP_AUTH;
++	else
++	  /*  Server does not support what user wanted. */
++	  return GSASL_GSSAPI_UNSUPPORTED_PROTECTION_ERROR;
++	gsasl_property_set (sctx, GSASL_QOP,
++			    state->qop == GSASL_QOP_AUTH_CONF ? "qop-conf"
++			    : state->qop == GSASL_QOP_AUTH_INT ? "qop-int"
++			    : "qop-auth");
++      }
+ 
+       /* FIXME: Fix maxbuf. */
+ 

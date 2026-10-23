@@ -18,6 +18,10 @@ services:
     ports:
       - "19000:19000"  # NameNode RPC
       - "19866:19866"  # DataNode data transfer
+    environment:
+      - HDFS_WIRE_MODE=${HDFS_WIRE_MODE:-none}
+      # Optional JVM options for the DataNode, e.g. to enable debug logging.
+      - HDFS_DATANODE_OPTS=${HDFS_DATANODE_OPTS:-}
     volumes:
       - keytabs:/keytabs:ro
 volumes:

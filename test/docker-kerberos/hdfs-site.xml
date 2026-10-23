@@ -2,8 +2,8 @@
 <!--
   Server-side config for the Kerberos-secured test cluster. Principals are
   spelled out (no _HOST) since everything is reached as "localhost".
-  ignore.secure.ports.for.testing lets the secure DataNode use unprivileged
-  ports without data-transfer SASL; production clusters use one or the other.
+  Wire protection varies by test mode: the entrypoint appends
+  modes/$HDFS_WIRE_MODE.xml (see run_kerberos_tests.sh).
 -->
 <configuration>
     <property><name>dfs.replication</name><value>1</value></property>
@@ -27,5 +27,4 @@
     <property><name>dfs.web.authentication.kerberos.principal</name><value>HTTP/localhost@EXAMPLE.TEST</value></property>
     <property><name>dfs.web.authentication.kerberos.keytab</name><value>/keytabs/hdfs.keytab</value></property>
     <property><name>dfs.namenode.kerberos.internal.spnego.principal</name><value>HTTP/localhost@EXAMPLE.TEST</value></property>
-    <property><name>ignore.secure.ports.for.testing</name><value>true</value></property>
 </configuration>

@@ -17,6 +17,7 @@ set(SRC "${HDFS3_SOURCE_ROOT}/src")
 
 find_package(Protobuf CONFIG REQUIRED)
 find_package(LibXml2 CONFIG REQUIRED)
+find_package(OpenSSL REQUIRED)
 find_package(boost_uuid CONFIG REQUIRED)
 find_package(boost_crc CONFIG REQUIRED)
 find_package(boost_core CONFIG REQUIRED)
@@ -85,7 +86,7 @@ target_include_directories(
             $<INSTALL_INTERFACE:include/libhdfs3/common>)
 target_link_libraries(
   hdfs3
-  PUBLIC protobuf::libprotobuf LibXml2::LibXml2 PkgConfig::GSASL
+  PUBLIC protobuf::libprotobuf LibXml2::LibXml2 PkgConfig::GSASL OpenSSL::Crypto
   # Header-only, so only needed while building this library.
   PRIVATE $<BUILD_INTERFACE:Boost::uuid> $<BUILD_INTERFACE:Boost::crc> $<BUILD_INTERFACE:Boost::core>
           $<BUILD_INTERFACE:PkgConfig::KRB5>)

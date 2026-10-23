@@ -29,6 +29,14 @@ COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORM
   `KRB5CCNAME` or `hadoop.security.kerberos.ticket.cache.path` pick a cache),
   using the system `krb5.conf` or `KRB5_CONFIG`. Block access tokens are
   handled for DataNode reads and writes.
+- Wire encryption on Kerberos clusters: NameNode RPC protection
+  (`hadoop.rpc.protection` = integrity / privacy, via GSSAPI) and DataNode
+  transfer protection (`dfs.data.transfer.protection` = integrity / privacy,
+  via DIGEST-MD5 with 3DES or a negotiated AES/CTR cipher), as well as
+  `dfs.encrypt.data.transfer`. RPC protection is negotiated automatically
+  (restrict it with `hadoop.rpc.protection`); for DataNode protection set
+  `dfs.data.transfer.protection` (or `dfs.encrypt.data.transfer`) in the client
+  config, as for Hadoop.
 - HDFS encryption zones (Transparent Data Encryption): files are decrypted and
   encrypted client-side with AES-CTR, after the Hadoop KMS unwraps each file's
   key. Configure the key provider as for Hadoop
@@ -40,8 +48,6 @@ COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORM
 
 ## Not supported yet
 
-- **Wire encryption** on Kerberos clusters (`hadoop.rpc.protection` =
-  integrity/privacy, `dfs.data.transfer.protection`, `dfs.encrypt.data.transfer`).
 - **Keytab login and impersonation**: get a ticket with `kinit` (or `kinit -kt`);
   `HADOOP_PROXY_USER` on a Kerberos cluster is an error.
 - The SM4 encryption cipher suite (such files fail with an error).
