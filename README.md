@@ -24,14 +24,21 @@ COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORM
 - Concurrent positional reads (DuckDB's parallel Parquet reader).
 - NameNode HA (`dfs.nameservices`, e.g. `hdfs://mycluster/path`) and
   erasure-coded files.
+- HDFS encryption zones (Transparent Data Encryption): files are decrypted and
+  encrypted client-side with AES-CTR, after the Hadoop KMS unwraps each file's
+  key. Configure the key provider as for Hadoop
+  (`hadoop.security.key.provider.path`, or `dfs.encryption.key.provider.uri`,
+  e.g. `kms://https@kms1;kms2:9600/kms`). The KMS is called with simple
+  authentication as the effective user. For an `https` KMS, the CA bundle comes
+  from `CURL_CA_BUNDLE` / `SSL_CERT_FILE` or the usual system locations.
 
 ## Not supported yet
 
 - **Kerberos** (`hadoop.security.authentication=kerberos`): connecting fails
   with a clear error. Only simple authentication works.
-- **Encryption zones** (Transparent Data Encryption): reading or writing a
-  file in an encryption zone fails with an error rather than returning
-  encrypted bytes.
+- **Encryption zones on Kerberos clusters**: the KMS is only called with simple
+  authentication (no SPNEGO yet). The SM4 cipher suite isn't supported either;
+  such files fail with an error.
 - **Wire encryption** (`hadoop.rpc.protection` = integrity/privacy,
   `dfs.data.transfer.protection`).
 
@@ -155,7 +162,7 @@ Tests that don't need a cluster run with:
 
 ```sh
 make test         # SQL tests (cluster tests are skipped)
-make test_glob    # unit tests for the glob engine
+make test_unit    # unit tests: glob engine and encryption helpers
 ```
 
 The HDFS integration tests (`test/sql/hdfs.test`) run against a real
@@ -201,7 +208,9 @@ The extension statically links:
 [libhdfs3](https://github.com/ClickHouse/libhdfs3) (Apache-2.0),
 [protobuf](https://github.com/protocolbuffers/protobuf) and
 [Abseil](https://github.com/abseil/abseil-cpp) (BSD-3-Clause / Apache-2.0),
-[libxml2](https://gitlab.gnome.org/GNOME/libxml2) (MIT), zlib (zlib), and
+[libxml2](https://gitlab.gnome.org/GNOME/libxml2) (MIT), zlib (zlib),
+[OpenSSL](https://www.openssl.org) (Apache-2.0),
+[libcurl](https://curl.se) (curl license), and
 [GNU SASL](https://www.gnu.org/software/gsasl/) (LGPL-2.1-or-later). Static
 linking of an LGPL library carries obligations (e.g. allowing relinking);
 review them before redistributing binaries.

@@ -9,3 +9,4 @@ services:
       - "9000:9000"   # NameNode RPC
       - "9866:9866"   # DataNode data transfer
       - "9870:9870"   # NameNode web UI (debugging)
+      - "9600:9600"   # KMS (encryption zones)

@@ -17,6 +17,7 @@
 #include "common/XmlConfig.h"
 
 #include "hdfs_bridge.h"
+#include "hdfs_crypto.hpp"
 #include "hdfs_glob.hpp"
 
 #include <sys/stat.h>
@@ -40,6 +41,11 @@ struct hdfs_client_t {
 	std::shared_ptr<Hdfs::FileSystem> fs;
 	int replication = 0;
 	int64_t block_size = 0;
+	// For encryption zones: the user sent to the KMS, and the KMS provider URI
+	// from hadoop.security.key.provider.path / dfs.encryption.key.provider.uri
+	// (empty if not configured).
+	std::string user;
+	std::string key_provider;
 };
 
 namespace {
@@ -89,6 +95,8 @@ int32_t ClassifyOne(const std::exception_ptr &ep) {
 		std::rethrow_exception(ep);
 	} catch (const hdfs_glob::GlobError &) {
 		return HDFS_ERR_INVALID_ARGUMENT;
+	} catch (const hdfs_crypto::CryptoError &) {
+		return HDFS_ERR_IO;
 	} catch (const Hdfs::AccessControlException &) {
 		return HDFS_ERR_PERMISSION;
 	} catch (const Hdfs::FileNotFoundException &) {
@@ -550,12 +558,35 @@ struct hdfs_list_stream_t {
 
 // --- readers and writers -----------------------------------------------------------
 
+// The data encryption key of a file in an encryption zone, decrypted by the KMS.
+static string FileKey(const hdfs_client_t &client, const Hdfs::FileStatus &st, const string &path) {
+	const auto &info = st.getEncryptionInfo();
+	if (info.suite != hdfs_crypto::SUITE_AES_CTR_NOPADDING) {
+		throw hdfs_crypto::CryptoError(path + " uses an unsupported encryption cipher suite (" +
+		                               std::to_string(info.suite) + "); only AES/CTR/NoPadding is supported");
+	}
+	if (info.protocolVersion != hdfs_crypto::PROTOCOL_ENCRYPTION_ZONES) {
+		throw hdfs_crypto::CryptoError(path + " uses an unsupported encryption protocol version (" +
+		                               std::to_string(info.protocolVersion) + ")");
+	}
+	if (client.key_provider.empty()) {
+		throw hdfs_crypto::CryptoError(path + " is in an HDFS encryption zone, but no key provider is configured "
+		                                      "(set hadoop.security.key.provider.path in core-site.xml)");
+	}
+	return hdfs_crypto::DecryptEncryptedKey(hdfs_crypto::ParseKmsUri(client.key_provider), client.user, info.keyName,
+	                                        info.ezKeyVersionName, info.iv, info.key);
+}
+
 // An open file. libhdfs3 input streams aren't safe for concurrent use, so the
 // reader keeps a pool: each concurrent read borrows its own stream.
 struct hdfs_reader_t {
 	std::shared_ptr<Hdfs::FileSystem> fs;
 	string path;
 	int64_t length = 0;
+	// Files in an encryption zone: the decrypted data key and the file IV.
+	bool encrypted = false;
+	string key;
+	string iv;
 	std::mutex mu;
 	std::vector<std::unique_ptr<Hdfs::InputStream>> idle;
 
@@ -583,6 +614,13 @@ struct hdfs_writer_t {
 	std::shared_ptr<Hdfs::FileSystem> fs;
 	string path;
 	std::unique_ptr<Hdfs::OutputStream> out;
+	// Files in an encryption zone: the data key, the file IV, and how many
+	// bytes have been written (the AES-CTR position).
+	bool encrypted = false;
+	string key;
+	string iv;
+	uint64_t position = 0;
+	std::vector<uint8_t> scratch;
 };
 
 // --- C interface ---------------------------------------------------------------------
@@ -621,6 +659,11 @@ hdfs_client_t *hdfs_bridge_connect(const char *url, const char *config_dir, cons
 		Hdfs::Internal::SessionConfig session(conf);
 		client->replication = session.getDefaultReplica();
 		client->block_size = session.getDefaultBlockSize();
+		client->user = username;
+		client->key_provider = conf.getString("hadoop.security.key.provider.path", "");
+		if (client->key_provider.empty()) {
+			client->key_provider = conf.getString("dfs.encryption.key.provider.uri", "");
+		}
 	});
 	return ok ? client.release() : nullptr;
 }
@@ -654,14 +697,15 @@ hdfs_reader_t *hdfs_bridge_open(hdfs_client_t *client, const char *path, hdfs_st
 		if (st.isDirectory()) {
 			throw Hdfs::InvalidPath(string(path) + " is a directory", __FILE__, __LINE__, "");
 		}
-		if (st.isEncrypted()) {
-			throw Hdfs::UnsupportedOperationException(
-			    string(path) + " is in an HDFS encryption zone, which is not supported yet", __FILE__, __LINE__, "");
-		}
 		reader = std::make_unique<hdfs_reader_t>();
 		reader->fs = client->fs;
 		reader->path = path;
 		reader->length = st.getLength();
+		if (st.isEncrypted()) {
+			reader->encrypted = true;
+			reader->key = FileKey(*client, st, path);
+			reader->iv = st.getEncryptionInfo().iv;
+		}
 		// Open one stream up front so open errors surface here, not on first read.
 		reader->Return(reader->Borrow());
 	});
@@ -703,6 +747,9 @@ int64_t hdfs_bridge_read_range(hdfs_reader_t *reader, uint8_t *buf, int64_t len,
 			}
 			done += n;
 		}
+		if (reader->encrypted) {
+			hdfs_crypto::AesCtrTransform(reader->key, reader->iv, offset, buf, static_cast<size_t>(len));
+		}
 	});
 	if (ok) {
 		reader->Return(std::move(stream));
@@ -721,17 +768,23 @@ hdfs_writer_t *hdfs_bridge_create(hdfs_client_t *client, const char *path, bool 
 		auto created = client->fs->createOrAppend(path, flags, permission, /*createParent=*/true, client->replication,
 		                                          client->block_size);
 		auto &file = *created.second;
-		if (file.isEncrypted()) {
-			try {
-				client->fs->deletePath(path, false);
-			} catch (...) { // NOLINT: the error below matters more
-			}
-			throw Hdfs::UnsupportedOperationException(
-			    string(path) + " is in an HDFS encryption zone, which is not supported yet", __FILE__, __LINE__, "");
-		}
 		writer = std::make_unique<hdfs_writer_t>();
 		writer->fs = client->fs;
 		writer->path = path;
+		if (file.isEncrypted()) {
+			try {
+				writer->key = FileKey(*client, file, path);
+			} catch (...) {
+				// Don't leave an empty file behind that we can't write.
+				try {
+					client->fs->deletePath(path, false);
+				} catch (...) { // NOLINT: the original error matters more
+				}
+				throw;
+			}
+			writer->encrypted = true;
+			writer->iv = file.getEncryptionInfo().iv;
+		}
 		auto ec = file.getEcPolicy();
 		writer->out = ec ? std::make_unique<Hdfs::OutputStream>(ec) : std::make_unique<Hdfs::OutputStream>();
 		writer->out->open(*client->fs, path, created, flags, permission, true, client->replication, client->block_size,
@@ -745,7 +798,17 @@ int64_t hdfs_bridge_write(hdfs_writer_t *writer, const uint8_t *buf, int64_t len
 		SetStatus(status, HDFS_ERR_INVALID_ARGUMENT, "negative write length");
 		return -1;
 	}
-	bool ok = Guard(status, "write failed", [&] { writer->out->append(reinterpret_cast<const char *>(buf), len); });
+	bool ok = Guard(status, "write failed", [&] {
+		if (!writer->encrypted) {
+			writer->out->append(reinterpret_cast<const char *>(buf), len);
+			return;
+		}
+		writer->scratch.assign(buf, buf + len);
+		hdfs_crypto::AesCtrTransform(writer->key, writer->iv, writer->position, writer->scratch.data(),
+		                             writer->scratch.size());
+		writer->out->append(reinterpret_cast<const char *>(writer->scratch.data()), len);
+		writer->position += static_cast<uint64_t>(len);
+	});
 	return ok ? len : -1;
 }
 

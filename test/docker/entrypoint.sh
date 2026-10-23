@@ -12,6 +12,12 @@ if [ ! -d "${NAME_DIR}/current" ]; then
     hdfs namenode -format -force -nonInteractive
 fi
 
+# The KMS serves encryption-zone keys; the NameNode asks it for new file keys.
+echo "Starting KMS..."
+mkdir -p /tmp/kms
+hadoop kms &
+KMS_PID=$!
+
 echo "Starting NameNode..."
 hdfs namenode &
 NN_PID=$!
@@ -21,7 +27,7 @@ hdfs datanode &
 DN_PID=$!
 
 # Forward termination to the daemons so `docker compose down` is clean.
-trap 'kill "${NN_PID}" "${DN_PID}" 2>/dev/null || true' TERM INT
+trap 'kill "${NN_PID}" "${DN_PID}" "${KMS_PID}" 2>/dev/null || true' TERM INT
 
 # Stay in the foreground until one of the daemons exits. (The image's bash
 # predates `wait -n`, so poll liveness instead.)

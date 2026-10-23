@@ -40,3 +40,30 @@ HDFS_TEST_RUNNING=1 \
 HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
 HADOOP_USER_NAME=guest \
     "${UNITTEST}" test/sql/hdfs_permissions.test
+
+echo "==> Checking the Java client reads what DuckDB encrypted..."
+# hdfs.test writes /ez/tmp.csv inside the encryption zone.
+expected="$(docker exec duckdb-hdfs-test bash -c "printf 'v\\n2\\n' | md5sum" | cut -d' ' -f1)"
+actual="$(docker exec duckdb-hdfs-test bash -lc 'rm -f /tmp/ez_check.csv && hdfs dfs -get /ez/tmp.csv /tmp/ez_check.csv >/dev/null 2>&1 && md5sum /tmp/ez_check.csv' | cut -d' ' -f1)"
+if [ "${actual}" != "${expected}" ]; then
+    echo "ERROR: the Java client decrypted /ez/tmp.csv differently (md5 ${actual}, expected ${expected})" >&2
+    exit 1
+fi
+echo "OK"
+
+echo "==> Running encryption-zone tests without a key provider..."
+NO_KMS_CONF="$(mktemp -d)"
+cp "${REPO_ROOT}"/test/hdfs-conf/*.xml "${NO_KMS_CONF}/"
+python3 -I - "${NO_KMS_CONF}/core-site.xml" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+text = re.sub(r"\s*<property>\s*<name>hadoop\.security\.key\.provider\.path</name>.*?</property>", "", text, flags=re.S)
+open(path, "w").write(text)
+PY
+HDFS_TEST_RUNNING=1 HDFS_TEST_NO_KMS=1 \
+HADOOP_CONF_DIR="${NO_KMS_CONF}" \
+HADOOP_USER_NAME=hadoop \
+    "${UNITTEST}" test/sql/hdfs_ez_no_provider.test
+rm -rf "${NO_KMS_CONF}"
+

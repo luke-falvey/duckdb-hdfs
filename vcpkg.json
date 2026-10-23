@@ -1,6 +1,14 @@
 {
         "dependencies": [
-                "libhdfs3"
+                "libhdfs3",
+                "openssl",
+                {
+                        "name": "curl",
+                        "default-features": false,
+                        "features": [
+                                "openssl"
+                        ]
+                }
         ],
         "vcpkg-configuration": {
                 "overlay-ports": [

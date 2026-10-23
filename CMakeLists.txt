@@ -18,18 +18,22 @@ include_directories(src/include)
 # The native HDFS client (ClickHouse's libhdfs3), built by the overlay port in
 # vcpkg_ports/libhdfs3. Only src/hdfs_bridge.cpp includes its headers.
 find_package(libhdfs3 CONFIG REQUIRED)
+# Encryption zones: AES-CTR (OpenSSL) and the KMS REST client (libcurl).
+find_package(OpenSSL REQUIRED)
+find_package(CURL CONFIG REQUIRED)
 
 set(EXTENSION_SOURCES
     src/hdfs_extension.cpp src/hdfs_filesystem.cpp src/hdfs_functions.cpp
-    src/hdfs_bridge.cpp src/hdfs_glob.cpp)
+    src/hdfs_bridge.cpp src/hdfs_crypto.cpp src/hdfs_glob.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 # The build_*_extension helpers use the plain target_link_libraries signature on
 # these targets, so we must match it (no PUBLIC/PRIVATE keyword).
-target_link_libraries(${EXTENSION_NAME} libhdfs3::hdfs3)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} libhdfs3::hdfs3)
+set(HDFS_LIBS libhdfs3::hdfs3 CURL::libcurl OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(${EXTENSION_NAME} ${HDFS_LIBS})
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ${HDFS_LIBS})
 
 # Install the static extension archive. We intentionally omit EXPORT
 # "${DUCKDB_EXPORT_SET}" (used by core extensions for find_package(DuckDB)

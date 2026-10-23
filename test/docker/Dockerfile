@@ -5,7 +5,9 @@ USER root
 
 ENV HADOOP_CONF_DIR=/etc/hadoop-conf
 
-COPY core-site.xml hdfs-site.xml /etc/hadoop-conf/
+COPY core-site.xml hdfs-site.xml kms-site.xml /etc/hadoop-conf/
+# The KMS also needs its ACL and logging config; the image's defaults allow all.
+RUN cp /opt/hadoop/etc/hadoop/kms-acls.xml /opt/hadoop/etc/hadoop/kms-log4j.properties /etc/hadoop-conf/
 COPY entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh

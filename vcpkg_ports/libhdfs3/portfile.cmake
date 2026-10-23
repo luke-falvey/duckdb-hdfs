@@ -9,7 +9,7 @@ vcpkg_from_github(
     HEAD_REF master
     PATCHES
         protobuf-uint8.patch
-        detect-encryption-zones.patch
+        encryption-info.patch
         config-update-merges.patch
         rename2.patch
 )
