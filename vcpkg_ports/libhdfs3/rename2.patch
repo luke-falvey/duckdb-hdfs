@@ -1,0 +1,183 @@
+diff --git a/src/client/FileSystem.cpp b/src/client/FileSystem.cpp
+index 5995f6d..a787818 100644
+--- a/src/client/FileSystem.cpp
++++ b/src/client/FileSystem.cpp
+@@ -495,6 +495,14 @@ bool FileSystem::setReplication(const char * path, short replication) {
+  * @param dst new path.
+  * @return return true if success.
+  */
++void FileSystem::rename2(const char * src, const char * dst, bool overwrite) {
++    if (!impl) {
++        THROW(HdfsIOException, "FileSystem: not connected.");
++    }
++
++    impl->filesystem->rename2(src, dst, overwrite);
++}
++
+ bool FileSystem::rename(const char * src, const char * dst) {
+     if (!impl) {
+         THROW(HdfsIOException, "FileSystem: not connected.");
+diff --git a/src/client/FileSystem.h b/src/client/FileSystem.h
+index d885276..256cb6e 100644
+--- a/src/client/FileSystem.h
++++ b/src/client/FileSystem.h
+@@ -246,6 +246,12 @@ public:
+      */
+     bool rename(const char * src, const char * dst);
+ 
++    /**
++     * To rename a path atomically, replacing an existing dst (a file or an
++     * empty directory) when overwrite is true. Throws on failure.
++     */
++    void rename2(const char * src, const char * dst, bool overwrite);
++
+     /**
+      * To set working directory.
+      * @param path new working directory.
+diff --git a/src/client/FileSystemImpl.cpp b/src/client/FileSystemImpl.cpp
+index cfb2b47..20185e0 100644
+--- a/src/client/FileSystemImpl.cpp
++++ b/src/client/FileSystemImpl.cpp
+@@ -489,6 +489,22 @@ bool FileSystemImpl::setReplication(const char * path, short replication) {
+  * @return return true if success.
+  */
+ 
++void FileSystemImpl::rename2(const char * src, const char * dst, bool overwrite) {
++    if (!nn) {
++        THROW(HdfsIOException, "FileSystemImpl: not connected.");
++    }
++
++    if (NULL == src || !strlen(src)) {
++        THROW(InvalidParameter, "Invalid input: src should not be empty");
++    }
++
++    if (NULL == dst || !strlen(dst)) {
++        THROW(InvalidParameter, "Invalid input: dst should not be empty");
++    }
++
++    nn->rename2(getStandardPath(src), getStandardPath(dst), overwrite);
++}
++
+ bool FileSystemImpl::rename(const char * src, const char * dst) {
+     if (!nn) {
+         THROW(HdfsIOException, "FileSystemImpl: not connected.");
+diff --git a/src/client/FileSystemImpl.h b/src/client/FileSystemImpl.h
+index f2ac8a9..f1dcfb9 100644
+--- a/src/client/FileSystemImpl.h
++++ b/src/client/FileSystemImpl.h
+@@ -214,6 +214,8 @@ public:
+      */
+     bool rename(const char * src, const char * dst);
+ 
++    void rename2(const char * src, const char * dst, bool overwrite);
++
+     /**
+      * To set working directory.
+      * @param path new working directory.
+diff --git a/src/client/FileSystemInter.h b/src/client/FileSystemInter.h
+index dc43737..1640566 100644
+--- a/src/client/FileSystemInter.h
++++ b/src/client/FileSystemInter.h
+@@ -220,6 +220,12 @@ public:
+      */
+     virtual bool rename(const char * src, const char * dst) = 0;
+ 
++    /**
++     * Rename atomically, replacing an existing dst when overwrite is true.
++     * Throws on failure.
++     */
++    virtual void rename2(const char * src, const char * dst, bool overwrite) = 0;
++
+     /**
+      * To set working directory.
+      * @param path new working directory.
+diff --git a/src/server/Namenode.h b/src/server/Namenode.h
+index d40a8c2..b51e817 100644
+--- a/src/server/Namenode.h
++++ b/src/server/Namenode.h
+@@ -361,6 +361,12 @@ public:
+     virtual bool rename(const std::string & src, const std::string & dst)
+     /* throw (UnresolvedLinkException, HdfsIOException) */ = 0;
+ 
++    /**
++     * Rename src to dst atomically, replacing an existing dst (a file or an
++     * empty directory) when overwrite is true. Throws on failure.
++     */
++    virtual void rename2(const std::string & src, const std::string & dst, bool overwrite) = 0;
++
+     /**
+      * Moves blocks from srcs to trg and delete srcs
+      *
+diff --git a/src/server/NamenodeImpl.cpp b/src/server/NamenodeImpl.cpp
+index 90c8974..85159c3 100644
+--- a/src/server/NamenodeImpl.cpp
++++ b/src/server/NamenodeImpl.cpp
+@@ -338,6 +338,24 @@ bool NamenodeImpl::complete(const std::string & src,
+     }
+ }*/
+ 
++void NamenodeImpl::rename2(const std::string & src, const std::string & dst, bool overwrite) {
++    try {
++        Rename2RequestProto request;
++        Rename2ResponseProto response;
++        request.set_src(src);
++        request.set_dst(dst);
++        request.set_overwritedest(overwrite);
++        invoke(RpcCall(false, "rename2", &request, &response));
++    } catch (const HdfsRpcServerException & e) {
++        UnWrapper < AccessControlException, DSQuotaExceededException,
++                  FileAlreadyExistsException, FileNotFoundException,
++                  NSQuotaExceededException, ParentNotDirectoryException,
++                  SafeModeException, UnresolvedLinkException,
++                  HdfsIOException > unwrapper(e);
++        unwrapper.unwrap(__FILE__, __LINE__);
++    }
++}
++
+ bool NamenodeImpl::rename(const std::string & src, const std::string & dst)
+ /* throw (UnresolvedLinkException, HdfsIOException) */{
+     try {
+diff --git a/src/server/NamenodeImpl.h b/src/server/NamenodeImpl.h
+index 3a27c73..91b57c7 100644
+--- a/src/server/NamenodeImpl.h
++++ b/src/server/NamenodeImpl.h
+@@ -113,6 +113,8 @@ public:
+     bool rename(const std::string & src, const std::string & dst)
+     /* throw (UnresolvedLinkException, HdfsIOException) */;
+ 
++    void rename2(const std::string & src, const std::string & dst, bool overwrite);
++
+     void concat(const std::string & trg, const std::vector<std::string> & srcs)
+     /* throw (HdfsIOException, UnresolvedLinkException) */;
+ 
+diff --git a/src/server/NamenodeProxy.cpp b/src/server/NamenodeProxy.cpp
+index 16b442b..1c01246 100644
+--- a/src/server/NamenodeProxy.cpp
++++ b/src/server/NamenodeProxy.cpp
+@@ -331,6 +331,13 @@ bool NamenodeProxy::complete(const std::string & src,
+     NAMENODE_HA_RETRY_END();
+ }*/
+ 
++void NamenodeProxy::rename2(const std::string & src, const std::string & dst, bool overwrite) {
++    NAMENODE_HA_RETRY_BEGIN();
++    namenode->rename2(src, dst, overwrite);
++    return;
++    NAMENODE_HA_RETRY_END();
++}
++
+ bool NamenodeProxy::rename(const std::string & src, const std::string & dst) {
+     NAMENODE_HA_RETRY_BEGIN();
+     return namenode->rename(src, dst);
+diff --git a/src/server/NamenodeProxy.h b/src/server/NamenodeProxy.h
+index 19a7345..0d7ba0e 100644
+--- a/src/server/NamenodeProxy.h
++++ b/src/server/NamenodeProxy.h
+@@ -83,6 +83,8 @@ public:
+ 
+     bool rename(const std::string & src, const std::string & dst);
+ 
++    void rename2(const std::string & src, const std::string & dst, bool overwrite);
++
+     void concat(const std::string & trg, const std::vector<std::string> & srcs);
+ 
+     bool truncate(const std::string & src, int64_t size,

@@ -874,24 +874,11 @@ int32_t hdfs_bridge_delete(hdfs_client_t *client, const char *path, bool recursi
 
 int32_t hdfs_bridge_rename(hdfs_client_t *client, const char *src, const char *dst, bool overwrite,
                            hdfs_status_t *status) {
-	string context = string("rename '") + src + "' -> '" + dst + "' failed";
-	bool renamed = false;
-	bool ok = Guard(status, context, [&] {
-		// libhdfs3 has no rename-with-overwrite (rename2), so replace an existing
-		// file target first. Not atomic: a crash in between leaves no target.
-		if (overwrite && client->fs->exist(dst) && !client->fs->getFileStatus(dst).isDirectory()) {
-			client->fs->deletePath(dst, false);
-		}
-		renamed = client->fs->rename(src, dst);
-	});
-	if (!ok) {
-		return -1;
-	}
-	if (!renamed) {
-		SetStatus(status, HDFS_ERR_IO, context + ": the NameNode refused the rename");
-		return -1;
-	}
-	return 0;
+	// rename2 is atomic, and with `overwrite` replaces an existing file (or empty
+	// directory) target; without it an existing target is an error.
+	bool ok = Guard(status, string("rename '") + src + "' -> '" + dst + "' failed",
+	                [&] { client->fs->rename2(src, dst, overwrite); });
+	return ok ? 0 : -1;
 }
 
 } // extern "C"

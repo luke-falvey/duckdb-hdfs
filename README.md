@@ -34,7 +34,6 @@ COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORM
   encrypted bytes.
 - **Wire encryption** (`hadoop.rpc.protection` = integrity/privacy,
   `dfs.data.transfer.protection`).
-- Renaming over an existing file is not atomic: the target is deleted first.
 
 ## Listing and metadata
 
