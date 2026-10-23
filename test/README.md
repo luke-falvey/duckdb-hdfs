@@ -5,6 +5,9 @@ cluster used to exercise the `hdfs` extension end-to-end.
 
 ## Layout
 
+- `sql/hdfs_no_cluster.test` — checks that need no cluster: settings,
+  `hdfs_ls`/`hdfs_stat` schemas, named-parameter binding, and `hdfs_exists`
+  error reporting. Runs as part of `make test`.
 - `sql/hdfs.test` — integration tests run against a real HDFS. Gated behind
   `require-env HDFS_TEST_RUNNING`, so `make test` skips them unless a cluster is
   up.

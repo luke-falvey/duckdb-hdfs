@@ -8,7 +8,9 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
-set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
+set(CMAKE_CXX_STANDARD
+    "17"
+    CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
@@ -16,7 +18,8 @@ include_directories(src/include)
 # (outside src/ so the clang-format checks don't fight generated code).
 include_directories(hdfs-bridge/include)
 
-set(EXTENSION_SOURCES src/hdfs_extension.cpp src/hdfs_filesystem.cpp src/hdfs_functions.cpp)
+set(EXTENSION_SOURCES src/hdfs_extension.cpp src/hdfs_filesystem.cpp
+                      src/hdfs_functions.cpp)
 
 # Build the Rust FFI bridge (hdfs-bridge) via Corrosion. Corrosion integrates
 # cargo into the cmake build and, crucially for CI, honours -DRust_CARGO_TARGET
@@ -27,13 +30,13 @@ set(EXTENSION_SOURCES src/hdfs_extension.cpp src/hdfs_filesystem.cpp src/hdfs_fu
 # linked automatically rather than enumerated by hand.
 include(FetchContent)
 FetchContent_Declare(
-    Corrosion
-    GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-    GIT_TAG v0.5.2
-)
+  Corrosion
+  GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+  GIT_TAG v0.5.2)
 FetchContent_MakeAvailable(Corrosion)
 
-corrosion_import_crate(MANIFEST_PATH ${CMAKE_CURRENT_LIST_DIR}/hdfs-bridge/Cargo.toml)
+corrosion_import_crate(MANIFEST_PATH
+                       ${CMAKE_CURRENT_LIST_DIR}/hdfs-bridge/Cargo.toml)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -51,21 +54,28 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} hdfs_bridge)
 # `cargo rustc -- --print native-static-libs`); Linux's needs (pthread/dl/m) are
 # already covered by Corrosion's std libs.
 if(APPLE)
-    set(HDFS_NATIVE_LIBS "-framework Security" "-framework SystemConfiguration"
-                         "-framework CoreFoundation" iconv)
+  set(HDFS_NATIVE_LIBS "-framework Security" "-framework SystemConfiguration"
+                       "-framework CoreFoundation" iconv)
 elseif(WIN32)
-    set(HDFS_NATIVE_LIBS ws2_32 bcrypt ncrypt secur32 crypt32 userenv ntdll)
+  set(HDFS_NATIVE_LIBS
+      ws2_32
+      bcrypt
+      ncrypt
+      secur32
+      crypt32
+      userenv
+      ntdll)
 else()
-    set(HDFS_NATIVE_LIBS)
+  set(HDFS_NATIVE_LIBS)
 endif()
 
 if(HDFS_NATIVE_LIBS)
-    target_link_libraries(${EXTENSION_NAME} ${HDFS_NATIVE_LIBS})
-    target_link_libraries(${LOADABLE_EXTENSION_NAME} ${HDFS_NATIVE_LIBS})
+  target_link_libraries(${EXTENSION_NAME} ${HDFS_NATIVE_LIBS})
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} ${HDFS_NATIVE_LIBS})
 endif()
 
-# Install the static extension archive. We intentionally omit
-# EXPORT "${DUCKDB_EXPORT_SET}" (used by core extensions for find_package(DuckDB)
+# Install the static extension archive. We intentionally omit EXPORT
+# "${DUCKDB_EXPORT_SET}" (used by core extensions for find_package(DuckDB)
 # consumers): exporting it would require the imported Corrosion target
 # `hdfs_bridge` to also be installable, which it is not. A community extension
 # distributes the loadable `.duckdb_extension`, so the export set is unneeded.

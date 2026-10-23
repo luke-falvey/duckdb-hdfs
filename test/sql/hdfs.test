@@ -35,6 +35,13 @@ SELECT id, name FROM read_csv('hdfs://localhost:9000/test/data.csv') ORDER BY id
 2	bob
 3	carol
 
+# The scheme-only form resolves the NameNode from fs.defaultFS
+# (test/hdfs-conf/core-site.xml points it at localhost:9000).
+query I
+SELECT count(*) FROM read_csv('hdfs:///test/data.csv');
+----
+3
+
 # --- reading Parquet over hdfs:// --------------------------------------------
 
 query I
@@ -401,6 +408,48 @@ not empty
 statement ok
 COPY (SELECT range % 2 AS p, range AS v FROM range(10))
 TO 'hdfs://localhost:9000/test/nested/part' (FORMAT parquet, PARTITION_BY (p), OVERWRITE_OR_IGNORE);
+
+# COPY to a temporary file then renames it over the target (FileSystem::MoveFile
+# with overwrite). Run it twice so the second rename replaces an existing file.
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/nested/tmpfile.csv' (FORMAT csv, HEADER, USE_TMP_FILE true);
+
+statement ok
+COPY (SELECT 2 AS v) TO 'hdfs://localhost:9000/test/nested/tmpfile.csv' (FORMAT csv, HEADER, USE_TMP_FILE true);
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:9000/test/nested/tmpfile.csv');
+----
+2
+
+# A partitioned COPY that fails partway cleans up the output directory it
+# created (CreateDirectoryExtended / RemoveDirectoryExtended).
+statement error
+COPY (SELECT range % 2 AS p, CASE WHEN range = 50000 THEN error('boom') ELSE range END AS v FROM range(100000))
+TO 'hdfs://localhost:9000/test/nested/failed_part' (FORMAT parquet, PARTITION_BY (p));
+----
+boom
+
+query I
+SELECT hdfs_exists('hdfs://localhost:9000/test/nested/failed_part');
+----
+false
+
+# Concurrent positional reads: a multi-row-group Parquet file read by many
+# threads at once.
+statement ok
+COPY (SELECT range AS n FROM range(100000)) TO 'hdfs://localhost:9000/test/nested/rowgroups.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000);
+
+statement ok
+SET threads = 8;
+
+query II
+SELECT count(*), sum(n) FROM read_parquet('hdfs://localhost:9000/test/nested/rowgroups.parquet');
+----
+100000	4999950000
+
+statement ok
+RESET threads;
 
 # --- error handling ----------------------------------------------------------
 
