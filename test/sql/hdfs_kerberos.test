@@ -1,0 +1,65 @@
+# name: test/sql/hdfs_kerberos.test
+# description: Reading and writing a Kerberos-secured HDFS.
+# group: [sql]
+
+# Run via test/scripts/run_kerberos_tests.sh, which starts a KDC and a secured
+# cluster (test/docker-kerberos) and logs in as hadoop@EXAMPLE.TEST.
+
+require hdfs
+
+require parquet
+
+require-env HDFS_KERBEROS_TEST_RUNNING
+
+statement ok
+COPY (SELECT range AS n, md5(range::VARCHAR) AS h FROM range(100000))
+TO 'hdfs://localhost:19000/krb/data.parquet' (FORMAT parquet, ROW_GROUP_SIZE 10000);
+
+statement ok
+SET threads = 8;
+
+query III
+SELECT count(*), sum(n), count(DISTINCT h) FROM read_parquet('hdfs://localhost:19000/krb/data.parquet');
+----
+100000	4999950000	100000
+
+statement ok
+RESET threads;
+
+# The NameNode saw the Kerberos identity (hadoop@EXAMPLE.TEST -> "hadoop").
+query T
+SELECT owner FROM hdfs_stat('hdfs://localhost:19000/krb/data.parquet');
+----
+hadoop
+
+query TT
+SELECT name, type FROM hdfs_ls('hdfs://localhost:19000/krb') ORDER BY name;
+----
+data.parquet	file
+
+query I
+SELECT count(*) FROM glob('hdfs://localhost:19000/krb/*.parquet');
+----
+1
+
+# The default filesystem (fs.defaultFS) works the same way.
+query I
+SELECT count(*) FROM read_parquet('hdfs:///krb/data.parquet');
+----
+100000
+
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:19000/krb/tmp.csv' (FORMAT csv, HEADER, USE_TMP_FILE true);
+
+statement ok
+COPY (SELECT 2 AS v) TO 'hdfs://localhost:19000/krb/tmp.csv' (FORMAT csv, HEADER, USE_TMP_FILE true);
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:19000/krb/tmp.csv');
+----
+2
+
+query I
+SELECT hdfs_exists('hdfs://localhost:19000/krb/tmp.csv');
+----
+true

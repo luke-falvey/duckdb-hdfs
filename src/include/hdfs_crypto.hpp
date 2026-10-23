@@ -29,10 +29,11 @@ constexpr int PROTOCOL_ENCRYPTION_ZONES = 2;
 std::vector<std::string> ParseKmsUri(const std::string &uri);
 
 // Ask the KMS to decrypt an encrypted data encryption key. `kms_urls` are tried
-// in order. `user` is sent for simple authentication (empty: the OS user).
-// Returns the raw key. Decrypted keys are cached, so reopening a file doesn't
-// call the KMS again.
-std::string DecryptEncryptedKey(const std::vector<std::string> &kms_urls, const std::string &user,
+// in order. With `kerberos`, the request authenticates with SPNEGO using the
+// Kerberos ticket cache; otherwise `user` is sent for simple authentication
+// (empty: the OS user). Returns the raw key. Decrypted keys are cached, so
+// reopening a file doesn't call the KMS again.
+std::string DecryptEncryptedKey(const std::vector<std::string> &kms_urls, bool kerberos, const std::string &user,
                                 const std::string &key_name, const std::string &key_version_name, const std::string &iv,
                                 const std::string &encrypted_key);
 

@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<!--
+  Server-side config for the Kerberos-secured test cluster. Principals are
+  spelled out (no _HOST) since everything is reached as "localhost".
+  ignore.secure.ports.for.testing lets the secure DataNode use unprivileged
+  ports without data-transfer SASL; production clusters use one or the other.
+-->
+<configuration>
+    <property><name>dfs.replication</name><value>1</value></property>
+    <property><name>dfs.namenode.name.dir</name><value>file:///tmp/hdfs/name</value></property>
+    <property><name>dfs.datanode.data.dir</name><value>file:///tmp/hdfs/data</value></property>
+    <property><name>dfs.namenode.rpc-address</name><value>localhost:19000</value></property>
+    <property><name>dfs.namenode.rpc-bind-host</name><value>0.0.0.0</value></property>
+    <property><name>dfs.namenode.http-address</name><value>0.0.0.0:19870</value></property>
+    <property><name>dfs.datanode.hostname</name><value>localhost</value></property>
+    <property><name>dfs.datanode.address</name><value>0.0.0.0:19866</value></property>
+    <property><name>dfs.datanode.http.address</name><value>0.0.0.0:19864</value></property>
+    <property><name>dfs.datanode.ipc.address</name><value>0.0.0.0:19867</value></property>
+    <property><name>dfs.client.use.datanode.hostname</name><value>true</value></property>
+    <property><name>dfs.namenode.datanode.registration.ip-hostname-check</name><value>false</value></property>
+
+    <property><name>dfs.block.access.token.enable</name><value>true</value></property>
+    <property><name>dfs.namenode.kerberos.principal</name><value>nn/localhost@EXAMPLE.TEST</value></property>
+    <property><name>dfs.namenode.keytab.file</name><value>/keytabs/hdfs.keytab</value></property>
+    <property><name>dfs.datanode.kerberos.principal</name><value>dn/localhost@EXAMPLE.TEST</value></property>
+    <property><name>dfs.datanode.keytab.file</name><value>/keytabs/hdfs.keytab</value></property>
+    <property><name>dfs.web.authentication.kerberos.principal</name><value>HTTP/localhost@EXAMPLE.TEST</value></property>
+    <property><name>dfs.web.authentication.kerberos.keytab</name><value>/keytabs/hdfs.keytab</value></property>
+    <property><name>dfs.namenode.kerberos.internal.spnego.principal</name><value>HTTP/localhost@EXAMPLE.TEST</value></property>
+    <property><name>ignore.secure.ports.for.testing</name><value>true</value></property>
+</configuration>

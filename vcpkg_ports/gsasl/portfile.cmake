@@ -1,5 +1,6 @@
 # Same as vcpkg's gsasl port, minus the configure.ac patch (which only adds an
-# option to skip the gsasl command-line tool) and the autoreconf step it needs.
+# option to skip the gsasl command-line tool) and the autoreconf step it needs,
+# and with the GSSAPI mechanism (Kerberos) enabled, using MIT krb5.
 # The release tarball ships a generated configure script, so this builds on CI
 # images without autoconf-archive.
 vcpkg_download_distfile(ARCHIVE
@@ -12,12 +13,25 @@ vcpkg_download_distfile(ARCHIVE
 
 vcpkg_extract_source_archive(SOURCE_PATH ARCHIVE "${ARCHIVE}")
 
+# GSSAPI (Kerberos) via the krb5 port, found through its krb5-config. krb5 is
+# static, so configure's link tests also need its private dependencies;
+# otherwise they fail, configure decides functions like gss_oid_equal are
+# missing, and gsasl's replacements then clash with krb5's declarations.
+set(ENV{KRB5_CONFIG} "${CURRENT_INSTALLED_DIR}/tools/krb5/bin/krb5-config")
+vcpkg_find_acquire_program(PKGCONFIG)
+set(ENV{PKG_CONFIG_PATH} "${CURRENT_INSTALLED_DIR}/lib/pkgconfig")
+execute_process(
+    COMMAND "${PKGCONFIG}" --static --libs mit-krb5-gssapi
+    OUTPUT_VARIABLE KRB5_STATIC_LIBS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
 vcpkg_make_configure(
     SOURCE_PATH "${SOURCE_PATH}"
     OPTIONS
         --disable-nls
-        --disable-gssapi
+        --with-gssapi-impl=mit
         --disable-valgrind-tests
+        "LIBS=${KRB5_STATIC_LIBS} \$LIBS"
 )
 
 vcpkg_make_install()

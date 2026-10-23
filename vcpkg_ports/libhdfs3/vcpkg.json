@@ -1,7 +1,7 @@
 {
   "name": "libhdfs3",
   "version-date": "2026-10-18",
-  "description": "Native C++ HDFS client (ClickHouse fork of libhdfs3), built as a static library without Kerberos",
+  "description": "Native C++ HDFS client (ClickHouse fork of libhdfs3), built as a static library with Kerberos (MIT krb5)",
   "homepage": "https://github.com/ClickHouse/libhdfs3",
   "license": "Apache-2.0",
   "supports": "!windows",
@@ -10,6 +10,7 @@
     "boost-crc",
     "boost-uuid",
     "gsasl",
+    "krb5",
     "libxml2",
     "protobuf",
     {

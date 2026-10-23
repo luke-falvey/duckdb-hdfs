@@ -46,6 +46,8 @@ struct hdfs_client_t {
 	// (empty if not configured).
 	std::string user;
 	std::string key_provider;
+	// Kerberos cluster: the KMS is called with SPNEGO instead of user.name.
+	bool kerberos = false;
 };
 
 namespace {
@@ -573,8 +575,8 @@ static string FileKey(const hdfs_client_t &client, const Hdfs::FileStatus &st, c
 		throw hdfs_crypto::CryptoError(path + " is in an HDFS encryption zone, but no key provider is configured "
 		                                      "(set hadoop.security.key.provider.path in core-site.xml)");
 	}
-	return hdfs_crypto::DecryptEncryptedKey(hdfs_crypto::ParseKmsUri(client.key_provider), client.user, info.keyName,
-	                                        info.ezKeyVersionName, info.iv, info.key);
+	return hdfs_crypto::DecryptEncryptedKey(hdfs_crypto::ParseKmsUri(client.key_provider), client.kerberos, client.user,
+	                                        info.keyName, info.ezKeyVersionName, info.iv, info.key);
 }
 
 // An open file. libhdfs3 input streams aren't safe for concurrent use, so the
@@ -638,20 +640,32 @@ hdfs_client_t *hdfs_bridge_connect(const char *url, const char *config_dir, cons
 		auto conf = LoadConfig(config_dir);
 		string auth = conf.getString("hadoop.security.authentication", "simple");
 		std::transform(auth.begin(), auth.end(), auth.begin(), ::tolower);
-		if (auth != "simple") {
+		if (auth != "simple" && auth != "kerberos") {
 			throw Hdfs::InvalidParameter("hadoop.security.authentication=" + auth +
-			                                 " is not supported yet (only simple authentication)",
+			                                 " is not supported (use simple or kerberos)",
 			                             __FILE__, __LINE__, "");
 		}
+		bool kerberos = auth == "kerberos";
 		string uri = url && *url ? string(url) : conf.getString("fs.defaultFS", "");
 		if (uri.empty() || uri.rfind("hdfs://", 0) != 0) {
 			throw Hdfs::InvalidParameter("no NameNode given: use hdfs://host:port/... or set fs.defaultFS "
 			                             "to an hdfs:// URI in core-site.xml",
 			                             __FILE__, __LINE__, "");
 		}
-		string username = user && *user ? string(user) : GetEnv("HADOOP_USER_NAME");
-		if (username.empty()) {
-			username = GetEnv("HADOOP_PROXY_USER");
+		string username;
+		if (kerberos) {
+			// The identity is the principal in the Kerberos ticket cache
+			// (KRB5CCNAME, or hadoop.security.kerberos.ticket.cache.path), as in
+			// Hadoop: HADOOP_USER_NAME doesn't apply.
+			if (!GetEnv("HADOOP_PROXY_USER").empty()) {
+				throw Hdfs::InvalidParameter("HADOOP_PROXY_USER (impersonation) is not supported on Kerberos clusters",
+				                             __FILE__, __LINE__, "");
+			}
+		} else {
+			username = user && *user ? string(user) : GetEnv("HADOOP_USER_NAME");
+			if (username.empty()) {
+				username = GetEnv("HADOOP_PROXY_USER");
+			}
 		}
 		client = std::make_unique<hdfs_client_t>();
 		client->fs = std::make_shared<Hdfs::FileSystem>(conf);
@@ -660,6 +674,7 @@ hdfs_client_t *hdfs_bridge_connect(const char *url, const char *config_dir, cons
 		client->replication = session.getDefaultReplica();
 		client->block_size = session.getDefaultBlockSize();
 		client->user = username;
+		client->kerberos = kerberos;
 		client->key_provider = conf.getString("hadoop.security.key.provider.path", "");
 		if (client->key_provider.empty()) {
 			client->key_provider = conf.getString("dfs.encryption.key.provider.uri", "");

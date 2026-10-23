@@ -1,5 +1,6 @@
 # Builds ClickHouse/libhdfs3 as a static library for the duckdb-hdfs extension.
-# Modelled on ClickHouse's contrib/libhdfs3-cmake: Kerberos and ISA-L are off,
+# Modelled on ClickHouse's contrib/libhdfs3-cmake: Kerberos (MIT krb5, via
+# gsasl's GSSAPI mechanism) is on, ISA-L is off,
 # and the SSE4.2 assembly CRC is not used (no yasm needed), so the same build
 # works on x86-64 and arm64.
 cmake_minimum_required(VERSION 3.16)
@@ -21,6 +22,7 @@ find_package(boost_crc CONFIG REQUIRED)
 find_package(boost_core CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GSASL REQUIRED IMPORTED_TARGET libgsasl)
+pkg_check_modules(KRB5 REQUIRED IMPORTED_TARGET mit-krb5-gssapi)
 
 # platform.h
 if(APPLE)
@@ -33,7 +35,7 @@ set(HAVE_STEADY_CLOCK 1)
 set(HAVE_NESTED_EXCEPTION 1)
 set(HAVE_STD_CHRONO 1)
 set(HAVE_STD_ATOMIC 1)
-set(WITH_KERBEROS 0)
+set(WITH_KERBEROS 1)
 include(CheckCXXSourceCompiles)
 check_cxx_source_compiles(
   "#include <string.h>
@@ -85,7 +87,8 @@ target_link_libraries(
   hdfs3
   PUBLIC protobuf::libprotobuf LibXml2::LibXml2 PkgConfig::GSASL
   # Header-only, so only needed while building this library.
-  PRIVATE $<BUILD_INTERFACE:Boost::uuid> $<BUILD_INTERFACE:Boost::crc> $<BUILD_INTERFACE:Boost::core>)
+  PRIVATE $<BUILD_INTERFACE:Boost::uuid> $<BUILD_INTERFACE:Boost::crc> $<BUILD_INTERFACE:Boost::core>
+          $<BUILD_INTERFACE:PkgConfig::KRB5>)
 if(NOT APPLE)
   target_link_libraries(hdfs3 PUBLIC pthread)
 endif()

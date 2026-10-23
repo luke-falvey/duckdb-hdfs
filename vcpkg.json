@@ -6,7 +6,8 @@
                         "name": "curl",
                         "default-features": false,
                         "features": [
-                                "openssl"
+                                "openssl",
+                                "gssapi"
                         ]
                 }
         ],

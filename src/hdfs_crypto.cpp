@@ -141,7 +141,7 @@ struct HttpResponse {
 	std::string body;
 };
 
-HttpResponse HttpPostJson(const std::string &url, const std::string &payload) {
+HttpResponse HttpPostJson(const std::string &url, const std::string &payload, bool spnego) {
 	static std::once_flag init;
 	std::call_once(init, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
 	std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), curl_easy_cleanup);
@@ -162,6 +162,11 @@ HttpResponse HttpPostJson(const std::string &url, const std::string &payload) {
 	curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 20L);
 	curl_easy_setopt(h, CURLOPT_TIMEOUT, 60L);
 	curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+	if (spnego) {
+		// SPNEGO with the Kerberos ticket cache: no user name or password.
+		curl_easy_setopt(h, CURLOPT_HTTPAUTH, CURLAUTH_NEGOTIATE);
+		curl_easy_setopt(h, CURLOPT_USERPWD, ":");
+	}
 	if (const char *ca = CaBundle()) {
 		curl_easy_setopt(h, CURLOPT_CAINFO, ca);
 	}
@@ -277,7 +282,7 @@ std::vector<std::string> ParseKmsUri(const std::string &uri) {
 	return urls;
 }
 
-std::string DecryptEncryptedKey(const std::vector<std::string> &kms_urls, const std::string &user,
+std::string DecryptEncryptedKey(const std::vector<std::string> &kms_urls, bool kerberos, const std::string &user,
                                 const std::string &key_name, const std::string &key_version_name, const std::string &iv,
                                 const std::string &encrypted_key) {
 	std::string cache_key = key_version_name + '\0' + iv + '\0' + encrypted_key;
@@ -289,7 +294,7 @@ std::string DecryptEncryptedKey(const std::vector<std::string> &kms_urls, const 
 			return it->second;
 		}
 	}
-	std::string effective_user = user.empty() ? OsUser() : user;
+	std::string effective_user = kerberos ? std::string() : user.empty() ? OsUser() : user;
 	std::string payload = "{\"name\":\"" + JsonEscape(key_name) + "\",\"iv\":\"" + Base64Encode(iv) +
 	                      "\",\"material\":\"" + Base64Encode(encrypted_key) + "\"}";
 	std::string last_error = "no KMS URL configured";
@@ -300,7 +305,7 @@ std::string DecryptEncryptedKey(const std::vector<std::string> &kms_urls, const 
 		}
 		HttpResponse response;
 		try {
-			response = HttpPostJson(url, payload);
+			response = HttpPostJson(url, payload, kerberos);
 		} catch (const CryptoError &e) {
 			last_error = e.what();
 			continue; // try the next KMS instance

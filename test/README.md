@@ -18,6 +18,11 @@ cluster used to exercise the `hdfs` extension end-to-end.
   configured (run by `run_hdfs_tests.sh` with a stripped client config).
 - `cpp/hdfs_glob_test.cpp`, `cpp/hdfs_crypto_test.cpp` — unit tests for the
   glob engine and the encryption helpers (`make test_unit`).
+- `sql/hdfs_kerberos.test`, `sql/hdfs_kerberos_no_ticket.test` — a
+  Kerberos-secured cluster, with and without a ticket. Run by
+  `scripts/run_kerberos_tests.sh`, which starts `docker-kerberos/` (an MIT KDC
+  plus a secured NameNode/DataNode) and logs in as `hadoop@EXAMPLE.TEST`; the
+  host-side client config is `hdfs-conf-kerberos/`.
 - `docker/` — a single-node HDFS (NameNode + DataNode) image + compose file.
 - `hdfs-conf/` — host-side Hadoop client config (`core-site.xml` /
   `hdfs-site.xml`) for talking to that cluster. Pointed at via `HADOOP_CONF_DIR`.

@@ -24,23 +24,27 @@ COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORM
 - Concurrent positional reads (DuckDB's parallel Parquet reader).
 - NameNode HA (`dfs.nameservices`, e.g. `hdfs://mycluster/path`) and
   erasure-coded files.
+- Kerberos-secured clusters (`hadoop.security.authentication=kerberos`): the
+  identity is the principal in your Kerberos ticket cache (`kinit` first;
+  `KRB5CCNAME` or `hadoop.security.kerberos.ticket.cache.path` pick a cache),
+  using the system `krb5.conf` or `KRB5_CONFIG`. Block access tokens are
+  handled for DataNode reads and writes.
 - HDFS encryption zones (Transparent Data Encryption): files are decrypted and
   encrypted client-side with AES-CTR, after the Hadoop KMS unwraps each file's
   key. Configure the key provider as for Hadoop
   (`hadoop.security.key.provider.path`, or `dfs.encryption.key.provider.uri`,
-  e.g. `kms://https@kms1;kms2:9600/kms`). The KMS is called with simple
-  authentication as the effective user. For an `https` KMS, the CA bundle comes
-  from `CURL_CA_BUNDLE` / `SSL_CERT_FILE` or the usual system locations.
+  e.g. `kms://https@kms1;kms2:9600/kms`). The KMS is called with SPNEGO on
+  Kerberos clusters, else with simple authentication as the effective user.
+  For an `https` KMS, the CA bundle comes from `CURL_CA_BUNDLE` /
+  `SSL_CERT_FILE` or the usual system locations.
 
 ## Not supported yet
 
-- **Kerberos** (`hadoop.security.authentication=kerberos`): connecting fails
-  with a clear error. Only simple authentication works.
-- **Encryption zones on Kerberos clusters**: the KMS is only called with simple
-  authentication (no SPNEGO yet). The SM4 cipher suite isn't supported either;
-  such files fail with an error.
-- **Wire encryption** (`hadoop.rpc.protection` = integrity/privacy,
-  `dfs.data.transfer.protection`).
+- **Wire encryption** on Kerberos clusters (`hadoop.rpc.protection` =
+  integrity/privacy, `dfs.data.transfer.protection`, `dfs.encrypt.data.transfer`).
+- **Keytab login and impersonation**: get a ticket with `kinit` (or `kinit -kt`);
+  `HADOOP_PROXY_USER` on a Kerberos cluster is an error.
+- The SM4 encryption cipher suite (such files fail with an error).
 
 ## Listing and metadata
 
@@ -114,7 +118,11 @@ Hadoop CLI tools:
 - **Cluster config** (`core-site.xml` / `hdfs-site.xml`): `HADOOP_CONF_DIR`,
   or failing that `HADOOP_HOME/etc/hadoop`.
 - **Effective user**: `HADOOP_USER_NAME` (or `HADOOP_PROXY_USER`), else the
-  current OS account.
+  current OS account. On a Kerberos cluster it is the ticket cache's principal.
+- **Kerberos**: MIT krb5 settings from `/etc/krb5.conf` or `KRB5_CONFIG`. If a
+  NameNode is addressed by a short host name (no dots), set
+  `qualify_shortname = ""` in `[libdefaults]`, or krb5 asks for a service
+  principal with your DNS search domain appended.
 
 ```sh
 export HADOOP_CONF_DIR=/etc/hadoop/conf

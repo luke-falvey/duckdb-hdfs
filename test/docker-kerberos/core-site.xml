@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<!-- Server-side config for the Kerberos-secured test cluster. -->
+<configuration>
+    <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://localhost:19000</value>
+    </property>
+    <property>
+        <name>hadoop.security.authentication</name>
+        <value>kerberos</value>
+    </property>
+    <property>
+        <name>hadoop.security.authorization</name>
+        <value>true</value>
+    </property>
+    <!-- The service principals and the test user all map to "hadoop", the
+         HDFS superuser (the NameNode's login user). -->
+    <property>
+        <name>hadoop.security.auth_to_local</name>
+        <value>
+            RULE:[2:$1@$0](nn@EXAMPLE.TEST)s/.*/hadoop/
+            RULE:[2:$1@$0](dn@EXAMPLE.TEST)s/.*/hadoop/
+            RULE:[2:$1@$0](HTTP@EXAMPLE.TEST)s/.*/hadoop/
+            DEFAULT
+        </value>
+    </property>
+</configuration>

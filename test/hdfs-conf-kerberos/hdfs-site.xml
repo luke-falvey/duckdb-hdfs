@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!-- Host-side client config for the Kerberos test cluster. -->
+<configuration>
+    <property>
+        <name>dfs.client.use.datanode.hostname</name>
+        <value>true</value>
+    </property>
+    <property>
+        <name>dfs.namenode.kerberos.principal</name>
+        <value>nn/localhost@EXAMPLE.TEST</value>
+    </property>
+</configuration>
