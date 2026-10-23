@@ -570,18 +570,18 @@ bool HdfsFileSystem::ListFilesExtended(const string &directory, const std::funct
 vector<OpenFileInfo> HdfsFileSystem::Glob(const string &path, FileOpener *opener) {
 	int32_t max_parallelism = static_cast<int32_t>(DEFAULT_HDFS_LIST_PARALLELISM);
 	Value setting;
-	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_list_parallelism", setting)) {
+	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_list_parallelism", setting) && !setting.IsNull()) {
 		max_parallelism =
-		    static_cast<int32_t>(MinValue<uint64_t>(setting.GetValue<uint64_t>(), NumericLimits<int32_t>::Maximum()));
+		    static_cast<int32_t>(MinValue<uint64_t>(UBigIntValue::Get(setting), NumericLimits<int32_t>::Maximum()));
 	}
 	// Glob discovery is a per-query surface, so the walk behavior settings
 	// apply here (hdfs_ls can additionally override them per call).
 	HdfsWalkOptions options;
-	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_skip_permission_errors", setting)) {
-		options.skip_permission_errors = setting.GetValue<bool>();
+	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_skip_permission_errors", setting) && !setting.IsNull()) {
+		options.skip_permission_errors = BooleanValue::Get(setting);
 	}
-	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_include_hidden", setting)) {
-		options.include_hidden = setting.GetValue<bool>();
+	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_include_hidden", setting) && !setting.IsNull()) {
+		options.include_hidden = BooleanValue::Get(setting);
 	}
 	auto stream = OpenGlobStream(path, max_parallelism, options);
 	vector<OpenFileInfo> result;

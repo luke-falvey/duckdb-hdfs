@@ -35,6 +35,18 @@ set(HDFS_LIBS libhdfs3::hdfs3 CURL::libcurl OpenSSL::SSL OpenSSL::Crypto)
 target_link_libraries(${EXTENSION_NAME} ${HDFS_LIBS})
 target_link_libraries(${LOADABLE_EXTENSION_NAME} ${HDFS_LIBS})
 
+# Drop the local symbol table from the loadable extension (about a quarter of
+# its size: the statically linked DuckDB and libraries carry ~60,000 local
+# symbols). Only the entry point is exported, so nothing needs them at run time;
+# Debug builds keep them for debuggers.
+if(APPLE)
+  target_link_options(${LOADABLE_EXTENSION_NAME} PRIVATE
+                      $<$<NOT:$<CONFIG:Debug>>:-Wl,-x>)
+elseif(NOT WIN32)
+  target_link_options(${LOADABLE_EXTENSION_NAME} PRIVATE
+                      $<$<NOT:$<CONFIG:Debug>>:-Wl,--strip-all>)
+endif()
+
 # Install the static extension archive. We intentionally omit EXPORT
 # "${DUCKDB_EXPORT_SET}" (used by core extensions for find_package(DuckDB)
 # consumers): a community extension distributes the loadable

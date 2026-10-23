@@ -2,12 +2,14 @@
 
 #include "hdfs_filesystem.hpp"
 
+#include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
 namespace duckdb {
@@ -109,14 +111,21 @@ struct HdfsMetaGlobalState : public GlobalTableFunctionState {
 	idx_t offset = 0;
 };
 
+// An extension setting's current value. Read through the client's FileOpener
+// rather than ClientContext::TryGetCurrentSetting: the latter references the
+// table of all built-in settings, which pulls the SQL parser and more into the
+// binary (about 1.5 MB).
+bool TryGetSetting(ClientContext &context, const char *name, Value &value) {
+	return FileOpener::TryGetCurrentSetting(ClientData::Get(context).file_opener.get(), name, value) && !value.IsNull();
+}
+
 // hdfs_list_parallelism (registered at extension load) bounds the number of
 // concurrent listing RPCs of a walk that touches more than one directory.
 // Capped at INT32_MAX for the FFI signature.
 int32_t ListParallelism(ClientContext &context) {
 	Value setting;
-	if (context.TryGetCurrentSetting("hdfs_list_parallelism", setting)) {
-		return static_cast<int32_t>(
-		    MinValue<uint64_t>(setting.GetValue<uint64_t>(), NumericLimits<int32_t>::Maximum()));
+	if (TryGetSetting(context, "hdfs_list_parallelism", setting)) {
+		return static_cast<int32_t>(MinValue<uint64_t>(UBigIntValue::Get(setting), NumericLimits<int32_t>::Maximum()));
 	}
 	return static_cast<int32_t>(DEFAULT_HDFS_LIST_PARALLELISM);
 }
@@ -128,8 +137,8 @@ bool WalkFlag(ClientContext &context, const Value &override_value, const char *s
 		return BooleanValue::Get(override_value);
 	}
 	Value setting;
-	if (context.TryGetCurrentSetting(setting_name, setting)) {
-		return setting.GetValue<bool>();
+	if (TryGetSetting(context, setting_name, setting)) {
+		return BooleanValue::Get(setting);
 	}
 	return false;
 }
