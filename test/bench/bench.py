@@ -23,23 +23,36 @@ NN = "hdfs://localhost:9000"
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
 QUERIES = [
-    ("glob scan, 2000 small Parquet files",
-     "SELECT count(*), sum(v) FROM read_parquet('{nn}/bench/small/*/*.parquet')"),
-    ("large Parquet scan, 8 threads",
-     "SET threads=8; SELECT sum(v), count(DISTINCT s) FROM read_parquet('{nn}/bench/big.parquet')"),
-    ("large Parquet scan, 32 threads",
-     "SET threads=32; SELECT sum(v), count(DISTINCT s) FROM read_parquet('{nn}/bench/big.parquet')"),
-    ("sequential CSV scan",
-     "SELECT count(*), sum(v) FROM read_csv('{nn}/bench/big.csv')"),
-    ("hdfs_ls wide tree, parallelism 1",
-     "SET hdfs_list_parallelism=1; SELECT count(*) FROM hdfs_ls('{nn}/bench/tree/**')"),
-    ("hdfs_ls wide tree, parallelism 16",
-     "SET hdfs_list_parallelism=16; SELECT count(*) FROM hdfs_ls('{nn}/bench/tree/**')"),
-    ("hdfs_ls wide tree, parallelism 64",
-     "SET hdfs_list_parallelism=64; SELECT count(*) FROM hdfs_ls('{nn}/bench/tree/**')"),
-    ("same small-file scan twice (external file cache)",
-     "SELECT count(*) FROM read_parquet('{nn}/bench/small/*/*.parquet'); "
-     "SELECT count(*), sum(v) FROM read_parquet('{nn}/bench/small/*/*.parquet')"),
+    (
+        "glob scan, 2000 small Parquet files",
+        "SELECT count(*), sum(v) FROM read_parquet('{nn}/bench/small/*/*.parquet')",
+    ),
+    (
+        "large Parquet scan, 8 threads",
+        "SET threads=8; SELECT sum(v), count(DISTINCT s) FROM read_parquet('{nn}/bench/big.parquet')",
+    ),
+    (
+        "large Parquet scan, 32 threads",
+        "SET threads=32; SELECT sum(v), count(DISTINCT s) FROM read_parquet('{nn}/bench/big.parquet')",
+    ),
+    ("sequential CSV scan", "SELECT count(*), sum(v) FROM read_csv('{nn}/bench/big.csv')"),
+    (
+        "hdfs_ls wide tree, parallelism 1",
+        "SET hdfs_list_parallelism=1; SELECT count(*) FROM hdfs_ls('{nn}/bench/tree/**')",
+    ),
+    (
+        "hdfs_ls wide tree, parallelism 16",
+        "SET hdfs_list_parallelism=16; SELECT count(*) FROM hdfs_ls('{nn}/bench/tree/**')",
+    ),
+    (
+        "hdfs_ls wide tree, parallelism 64",
+        "SET hdfs_list_parallelism=64; SELECT count(*) FROM hdfs_ls('{nn}/bench/tree/**')",
+    ),
+    (
+        "same small-file scan twice (external file cache)",
+        "SELECT count(*) FROM read_parquet('{nn}/bench/small/*/*.parquet'); "
+        "SELECT count(*), sum(v) FROM read_parquet('{nn}/bench/small/*/*.parquet')",
+    ),
 ]
 
 
@@ -78,7 +91,7 @@ def count_rpcs(duckdb, sql):
     else:
         return {}
     counts = {}
-    for line in lines[starts[-1] + 1:ends[0]]:
+    for line in lines[starts[-1] + 1 : ends[0]]:
         cmd = next((f[4:] for f in line.split("\t") if f.startswith("cmd=")), "?")
         counts[cmd] = counts.get(cmd, 0) + 1
     return counts
@@ -108,12 +121,20 @@ def main():
             _, output = run_duckdb(args.duckdb, sql)  # warm-up, and the result to check
             times = [run_duckdb(args.duckdb, sql)[0] for _ in range(args.runs)]
             rpcs = count_rpcs(args.duckdb, sql)
-            results.append({"query": name, "median_s": statistics.median(times), "rpcs": rpcs,
-                            "rpc_total": sum(rpcs.values()), "output": output})
+            results.append(
+                {
+                    "query": name,
+                    "median_s": statistics.median(times),
+                    "rpcs": rpcs,
+                    "rpc_total": sum(rpcs.values()),
+                    "output": output,
+                }
+            )
         except QueryFailed as e:
             print("\n%s: FAILED: %s" % (name, e), file=sys.stderr)
-            results.append({"query": name, "median_s": None, "rpcs": {}, "rpc_total": 0,
-                            "output": None, "error": str(e)})
+            results.append(
+                {"query": name, "median_s": None, "rpcs": {}, "rpc_total": 0, "output": None, "error": str(e)}
+            )
         print(".", end="", flush=True, file=sys.stderr)
     print(file=sys.stderr)
 
@@ -122,6 +143,7 @@ def main():
         header += " baseline | baseline RPCs |"
     print("\n" + (args.label + "\n\n" if args.label else "") + header)
     print("|" + "---|" * (header.count("|") - 1))
+
     def fmt_time(t):
         return "failed" if t is None else "%.2fs" % t
 
