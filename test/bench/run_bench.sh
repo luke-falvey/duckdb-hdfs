@@ -8,7 +8,8 @@
 #
 # Environment: BENCH_REUSE=1 reuses a running cluster (and its seeded data);
 # BENCH_KEEP=1 leaves the cluster running afterwards; BENCH_QUICK=1 seeds a
-# much smaller data set. Needs Docker and a prior `make`.
+# much smaller data set; BENCH_HADOOP_CONF_DIR replaces the client config
+# (test/hdfs-conf). Needs Docker and a prior `make`.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -21,7 +22,7 @@ fi
 
 [ -x "${DUCKDB}" ] || { echo "ERROR: ${DUCKDB} not found. Run 'make' first." >&2; exit 1; }
 
-export HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf"
+export HADOOP_CONF_DIR="${BENCH_HADOOP_CONF_DIR:-${REPO_ROOT}/test/hdfs-conf}"
 export HADOOP_USER_NAME=hadoop
 if [ "${LATENCY_MS}" != 0 ]; then
     export HDFS_COMPOSE_ARGS="-f docker-compose.yml -f ${REPO_ROOT}/test/bench/docker-compose.latency.yml"

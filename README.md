@@ -92,10 +92,12 @@ Behavior notes:
 - **Permission errors** fail the query; `skip_permission_errors := true` (or
   the `SET` variant) prunes unreadable subtrees instead. The root path itself
   still fails.
-- **Performance**: globs expand client-side, one listing RPC per candidate
-  directory (up to `hdfs_list_parallelism` in parallel), so anchor patterns
+- **Performance**: globs expand client-side (HDFS has no server-side glob):
+  only directories the pattern can match are listed, so anchor patterns
   deep — `/data/2024/*` starts listing at `/data/2024`, while `**` walks the
-  whole subtree.
+  whole subtree. On Hadoop 3.3+ NameNodes, up to 100 directories are listed
+  per NameNode call (batched listing); older NameNodes and Routers get one
+  call per directory. Up to `hdfs_list_parallelism` calls run in parallel.
 
 ## URLs
 
@@ -129,6 +131,10 @@ Hadoop CLI tools:
   NameNode is addressed by a short host name (no dots), set
   `qualify_shortname = ""` in `[libdefaults]`, or krb5 asks for a service
   principal with your DNS search domain appended.
+- **Batched listing**: on by default; set
+  `duckdb.hdfs.batched-listing.enabled` to `false` in `hdfs-site.xml` to list
+  one directory per NameNode call. It's normally detected automatically;
+  turn it off only if a proxy in front of the NameNode mishandles the call.
 
 ```sh
 export HADOOP_CONF_DIR=/etc/hadoop/conf
@@ -153,12 +159,17 @@ extension keeps them down:
   `dfs.client.socketcache.capacity` idle connections (default 64 here, 16 in
   Hadoop; DuckDB reads on many threads at once) are kept for
   `dfs.client.socketcache.expiryMsec` (default 3000).
-- **Listings run in parallel** (`hdfs_list_parallelism`). Anchor glob patterns
-  as deep as you can (`/data/2024/*/*.parquet` rather than `/data/**`): only
-  the directories a pattern can match are listed.
+- **Listings are batched and run in parallel**: on Hadoop 3.3+ one NameNode
+  call lists up to 100 directories (`getBatchedListing`, capped by the
+  NameNode's `dfs.batched.ls.limit`), and up to `hdfs_list_parallelism` calls
+  run at once. NameNodes without batched listing (older than 3.3, or a
+  Router) are detected on the first call and listed one directory per call.
+  Anchor glob patterns as deep as you can (`/data/2024/*/*.parquet` rather
+  than `/data/**`): only the directories a pattern can match are listed.
 
-A scan of 2,000 small Parquet files makes 2 NameNode RPCs per file (listing
-its directory, opening it) where it made 8 before these changes.
+A scan of 2,000 small Parquet files, one per partition directory, makes about
+one NameNode RPC per file (opening it; the 2,000 directories are listed in 22
+calls) where it made 8.
 
 Tuning:
 
@@ -215,7 +226,7 @@ Tests that don't need a cluster run with:
 
 ```sh
 make test         # SQL tests (cluster tests are skipped)
-make test_unit    # unit tests: glob engine and encryption helpers
+make test_unit    # unit tests: glob engine, encryption helpers, batched listing
 ```
 
 The HDFS integration tests (`test/sql/hdfs.test`) run against a real

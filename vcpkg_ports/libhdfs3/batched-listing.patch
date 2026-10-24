@@ -1,0 +1,331 @@
+diff -ru a/src/client/FileStatus.h b/src/client/FileStatus.h
+--- a/src/client/FileStatus.h
++++ b/src/client/FileStatus.h
+@@ -32,7 +32,9 @@
+ #include "ECPolicy.h"
+ #include "Memory.h"
+ 
++#include <exception>
+ #include <string>
++#include <vector>
+ 
+ namespace Hdfs {
+ 
+@@ -211,6 +213,19 @@
+     int64_t fileId;
+     bool encrypted = false;
+     FileEncryptionInfo encryptionInfo;
++};
++
++/**
++ * One directory's part of a batched listing (FileSystem::getBatchedListing):
++ * entries of paths[index], or the error listing it failed with. A directory
++ * too large for one call continues in the next call's first listing.
++ */
++struct BatchedListing {
++    size_t index = 0;
++    std::vector<FileStatus> entries;
++    // Set if listing this path failed (e.g. not found, permission denied):
++    // an HdfsRpcServerException carrying the server's exception class.
++    std::exception_ptr error;
+ };
+ 
+ }
+diff -ru a/src/client/FileSystem.cpp b/src/client/FileSystem.cpp
+--- a/src/client/FileSystem.cpp
++++ b/src/client/FileSystem.cpp
+@@ -660,6 +660,16 @@
+     return impl->filesystem->getBlockLocations(src, offset, length, lbs);
+ }
+ 
++bool FileSystem::getBatchedListing(const std::vector<std::string> & paths,
++                                   std::string & startAfter,
++                                   std::vector<BatchedListing> & out) {
++    if (!impl) {
++        THROW(HdfsIOException, "FileSystem: not connected.");
++    }
++
++    return impl->filesystem->getBatchedListing(paths, startAfter, false, out);
++}
++
+ /**
+  * Append to the end of the file.
+  *
+diff -ru a/src/client/FileSystem.h b/src/client/FileSystem.h
+--- a/src/client/FileSystem.h
++++ b/src/client/FileSystem.h
+@@ -346,6 +346,20 @@
+                            int64_t length, Hdfs::Internal::LocatedBlocks & lbs);
+ 
+     /**
++     * List several directories in one NameNode call (Hadoop 3.3+).
++     * Listings are appended to `out`; `startAfter` is the opaque resume key,
++     * empty on the first call. Returns true while there is more to list.
++     *
++     * @param paths the directories, at most dfs.batched.ls.limit (default 100)
++     * @throw HdfsRpcServerException if the NameNode rejects the call (older
++     *  NameNodes, Routers, too many paths); per-path errors are reported in
++     *  the listings instead
++     */
++    bool getBatchedListing(const std::vector<std::string> & paths,
++                           std::string & startAfter,
++                           std::vector<BatchedListing> & out);
++
++    /**
+      * Append to the end of the file.
+      *
+      * @param src path of the file being appended.
+diff -ru a/src/client/FileSystemImpl.cpp b/src/client/FileSystemImpl.cpp
+--- a/src/client/FileSystemImpl.cpp
++++ b/src/client/FileSystemImpl.cpp
+@@ -785,6 +785,23 @@
+     return nn->getListing(src, startAfter, needLocation, dl);
+ }
+ 
++bool FileSystemImpl::getBatchedListing(const std::vector<std::string> & srcs,
++                                       std::string & startAfter, bool needLocation,
++                                       std::vector<BatchedListing> & out) {
++    if (!nn) {
++        THROW(HdfsIOException, "FileSystemImpl: not connected.");
++    }
++
++    std::vector<std::string> paths;
++    paths.reserve(srcs.size());
++
++    for (size_t i = 0; i < srcs.size(); ++i) {
++        paths.push_back(getStandardPath(srcs[i].c_str()));
++    }
++
++    return nn->getBatchedListing(paths, startAfter, needLocation, out);
++}
++
+ bool FileSystemImpl::renewLease() {
+     if (!nn) {
+         THROW(HdfsIOException, "FileSystemImpl: not connected.");
+diff -ru a/src/client/FileSystemImpl.h b/src/client/FileSystemImpl.h
+--- a/src/client/FileSystemImpl.h
++++ b/src/client/FileSystemImpl.h
+@@ -476,6 +476,10 @@
+     bool getListing(const std::string & src, const std::string & startAfter,
+                     bool needLocation, std::vector<FileStatus> & dl);
+ 
++    bool getBatchedListing(const std::vector<std::string> & srcs,
++                           std::string & startAfter, bool needLocation,
++                           std::vector<BatchedListing> & out);
++
+     /**
+      * To renew the lease.
+      *
+diff -ru a/src/client/FileSystemInter.h b/src/client/FileSystemInter.h
+--- a/src/client/FileSystemInter.h
++++ b/src/client/FileSystemInter.h
+@@ -494,6 +494,14 @@
+                             bool needLocation, std::vector<FileStatus> & dl) = 0;
+ 
+     /**
++     * List several directories in one NameNode call; see
++     * Namenode::getBatchedListing.
++     */
++    virtual bool getBatchedListing(const std::vector<std::string> & srcs,
++                                   std::string & startAfter, bool needLocation,
++                                   std::vector<BatchedListing> & out) = 0;
++
++    /**
+      * To renew the lease.
+      *
+      * @return return false if the filesystem no long needs to renew lease.
+diff -ru a/src/proto/ClientNamenodeProtocol.proto b/src/proto/ClientNamenodeProtocol.proto
+--- a/src/proto/ClientNamenodeProtocol.proto
++++ b/src/proto/ClientNamenodeProtocol.proto
+@@ -256,6 +256,18 @@
+   optional DirectoryListingProto dirList = 1;
+ }
+ 
++message GetBatchedListingRequestProto {
++  repeated string paths = 1;
++  required bytes startAfter = 2;
++  required bool needLocation = 3;
++}
++
++message GetBatchedListingResponseProto {
++  repeated BatchedDirectoryListingProto listings = 1;
++  required bool hasMore = 2;
++  required bytes startAfter = 3;
++}
++
+ message GetSnapshottableDirListingRequestProto { // no input parameters
+ }
+ message GetSnapshottableDirListingResponseProto {
+@@ -678,6 +690,7 @@
+   rpc deleteFile(DeleteRequestProto) returns(DeleteResponseProto);
+   rpc mkdirs(MkdirsRequestProto) returns(MkdirsResponseProto);
+   rpc getListing(GetListingRequestProto) returns(GetListingResponseProto);
++  rpc getBatchedListing(GetBatchedListingRequestProto) returns(GetBatchedListingResponseProto);
+   rpc renewLease(RenewLeaseRequestProto) returns(RenewLeaseResponseProto);
+   rpc recoverLease(RecoverLeaseRequestProto)
+       returns(RecoverLeaseResponseProto);
+diff -ru a/src/proto/hdfs.proto b/src/proto/hdfs.proto
+--- a/src/proto/hdfs.proto
++++ b/src/proto/hdfs.proto
+@@ -306,6 +306,18 @@
+   required uint32 remainingEntries  = 2;
+ }
+ 
++message RemoteExceptionProto {
++  required string className = 1;
++  optional string message = 2;
++}
++
++// Directory listing result for a batched listing call.
++message BatchedDirectoryListingProto {
++  repeated HdfsFileStatusProto partialListing = 1;
++  required uint32 parentIdx = 2;
++  optional RemoteExceptionProto exception = 3;
++}
++
+ /**
+  * Status of a snapshottable directory: besides the normal information for
+  * a directory status, also include snapshot quota, number of snapshots, and
+diff -ru a/src/server/Namenode.h b/src/server/Namenode.h
+--- a/src/server/Namenode.h
++++ b/src/server/Namenode.h
+@@ -540,6 +540,22 @@
+              HdfsIOException) */ = 0;
+ 
+     /**
++     * List several directories in one call (Hadoop 3.3+; dfs.batched.ls.limit
++     * paths at most, 100 by default). Listings are appended to `out`; an
++     * error listing one path is reported in its BatchedListing, not thrown.
++     * `startAfter` is the opaque resume key: empty on the first call, then
++     * the value this call set while it returns true (more to list).
++     *
++     * @throw HdfsRpcServerException the call itself failed, e.g.
++     *  RpcNoSuchMethodException (an older NameNode), UnsupportedOperationException
++     *  (a Router), IllegalArgumentException (too many paths)
++     */
++    //Idempotent
++    virtual bool getBatchedListing(const std::vector<std::string> & srcs,
++                                   std::string & startAfter, bool needLocation,
++                                   std::vector<BatchedListing> & out) = 0;
++
++    /**
+      * Client programs can cause stateful changes in the NameNode
+      * that affect other clients.  A client may obtain a file and
+      * neither abandon nor complete it.  A client might hold a series
+diff -ru a/src/server/NamenodeImpl.cpp b/src/server/NamenodeImpl.cpp
+--- a/src/server/NamenodeImpl.cpp
++++ b/src/server/NamenodeImpl.cpp
+@@ -514,6 +514,59 @@
+ }
+ 
+ //Idempotent
++bool NamenodeImpl::getBatchedListing(const std::vector<std::string> & srcs,
++                                     std::string & startAfter, bool needLocation,
++                                     std::vector<BatchedListing> & out) {
++    // Errors of the call itself propagate as HdfsRpcServerException, so the
++    // caller can tell "not supported here" from a failure listing one path.
++    GetBatchedListingRequestProto request;
++    GetBatchedListingResponseProto response;
++
++    for (size_t i = 0; i < srcs.size(); ++i) {
++        request.add_paths(srcs[i]);
++    }
++
++    request.set_startafter(startAfter);
++    request.set_needlocation(needLocation);
++    invoke(RpcCall(true, "getBatchedListing", &request, &response));
++
++    for (int i = 0; i < response.listings_size(); ++i) {
++        const BatchedDirectoryListingProto & proto = response.listings(i);
++
++        if (proto.parentidx() >= srcs.size()) {
++            THROW(HdfsIOException, "getBatchedListing: invalid path index %u in the response",
++                  proto.parentidx());
++        }
++
++        BatchedListing listing;
++        listing.index = proto.parentidx();
++        const std::string & src = srcs[listing.index];
++
++        if (proto.has_exception()) {
++            try {
++                HdfsRpcServerException e(proto.exception().message(), __FILE__, __LINE__, "");
++                e.setErrClass(proto.exception().classname());
++                e.setErrMsg(proto.exception().message());
++                throw e;
++            } catch (...) {
++                listing.error = std::current_exception();
++            }
++        } else {
++            for (int j = 0; j < proto.partiallisting_size(); ++j) {
++                FileStatus status;
++                Convert(src, status, proto.partiallisting(j));
++                listing.entries.push_back(status);
++            }
++        }
++
++        out.push_back(std::move(listing));
++    }
++
++    startAfter = response.startafter();
++    return response.hasmore();
++}
++
++//Idempotent
+ void NamenodeImpl::renewLease(const std::string & clientName)
+ /* throw (HdfsIOException) */{
+     try {
+diff -ru a/src/server/NamenodeImpl.h b/src/server/NamenodeImpl.h
+--- a/src/server/NamenodeImpl.h
++++ b/src/server/NamenodeImpl.h
+@@ -152,6 +152,11 @@
+      UnresolvedLinkException, HdfsIOException) */;
+ 
+     //Idempotent
++    bool getBatchedListing(const std::vector<std::string> & srcs,
++                           std::string & startAfter, bool needLocation,
++                           std::vector<BatchedListing> & out);
++
++    //Idempotent
+     void renewLease(const std::string & clientName)
+     /* throw (AccessControlException, HdfsIOException) */;
+ 
+diff -ru a/src/server/NamenodeProxy.cpp b/src/server/NamenodeProxy.cpp
+--- a/src/server/NamenodeProxy.cpp
++++ b/src/server/NamenodeProxy.cpp
+@@ -403,6 +403,21 @@
+     return false;
+ }
+ 
++bool NamenodeProxy::getBatchedListing(const std::vector<std::string> & srcs,
++                                      std::string & startAfter, bool needLocation,
++                                      std::vector<BatchedListing> & out) {
++    // A retry after failover repeats the whole call: drop partial output.
++    size_t mark = out.size();
++    std::string key = startAfter;
++    NAMENODE_HA_RETRY_BEGIN();
++    out.resize(mark);
++    startAfter = key;
++    return namenode->getBatchedListing(srcs, startAfter, needLocation, out);
++    NAMENODE_HA_RETRY_END();
++    assert(!"should not reach here");
++    return false;
++}
++
+ void NamenodeProxy::renewLease(const std::string & clientName) {
+     NAMENODE_HA_RETRY_BEGIN();
+     namenode->renewLease(clientName);
+diff -ru a/src/server/NamenodeProxy.h b/src/server/NamenodeProxy.h
+--- a/src/server/NamenodeProxy.h
++++ b/src/server/NamenodeProxy.h
+@@ -108,6 +108,10 @@
+     bool getListing(const std::string & src, const std::string & startAfter,
+                     bool needLocation, std::vector<FileStatus> & dl);
+ 
++    bool getBatchedListing(const std::vector<std::string> & srcs,
++                           std::string & startAfter, bool needLocation,
++                           std::vector<BatchedListing> & out);
++
+     void renewLease(const std::string & clientName);
+ 
+     bool recoverLease(const std::string & src, const std::string & clientName);

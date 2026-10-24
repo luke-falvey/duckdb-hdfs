@@ -4,6 +4,20 @@ set -euo pipefail
 
 export HADOOP_CONF_DIR=/etc/hadoop-conf
 
+# HDFS_SITE_EXTRA: extra hdfs-site.xml properties, "name=value,name=value"
+# (run_hdfs_tests.sh uses this for small listing limits, to exercise paging).
+if [ -n "${HDFS_SITE_EXTRA:-}" ]; then
+    props=""
+    IFS=',' read -ra pairs <<< "${HDFS_SITE_EXTRA}"
+    for pair in "${pairs[@]}"; do
+        props+="  <property><name>${pair%%=*}</name><value>${pair#*=}</value></property>\n"
+    done
+    # The image's conf dir isn't writable by the hadoop user: use a copy.
+    rm -rf /tmp/hadoop-conf && cp -R "${HADOOP_CONF_DIR}" /tmp/hadoop-conf
+    export HADOOP_CONF_DIR=/tmp/hadoop-conf
+    sed -i "s#</configuration>#${props}</configuration>#" "${HADOOP_CONF_DIR}/hdfs-site.xml"
+fi
+
 NAME_DIR=/tmp/hdfs/name
 mkdir -p /tmp/hdfs/name /tmp/hdfs/data
 

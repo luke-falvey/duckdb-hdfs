@@ -1,8 +1,9 @@
 """Benchmark the hdfs extension against the Docker test cluster.
 
 For each query: the median wall time over N runs (one DuckDB process per run,
-so connection setup is included), and the number of NameNode RPCs one run
-makes, counted from the NameNode's audit log between two marker calls.
+so connection setup is included), and the NameNode RPCs one run makes, by
+method, from the NameNode's per-method RPC counters (JMX). The audit log can't
+count calls: it logs each path of a batched listing call separately.
 
 Run through run_bench.sh, which starts the cluster and seeds the data.
 Results are printed as a Markdown table and can be saved as JSON and compared
@@ -16,13 +17,16 @@ import statistics
 import subprocess
 import sys
 import time
-import uuid
+import urllib.request
 
-CONTAINER = "duckdb-hdfs-test"
 NN = "hdfs://localhost:9000"
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
 QUERIES = [
+    (
+        "glob only, 2000 partition directories",
+        "SELECT count(*) FROM glob('{nn}/bench/small/*/*.parquet')",
+    ),
     (
         "glob scan, 2000 small Parquet files",
         "SELECT count(*), sum(v) FROM read_parquet('{nn}/bench/small/*/*.parquet')",
@@ -69,32 +73,44 @@ def run_duckdb(duckdb, sql):
     return elapsed, proc.stdout.strip()
 
 
-def audit_lines():
-    proc = subprocess.run(["docker", "logs", CONTAINER], capture_output=True, text=True)
-    return [line for line in (proc.stdout + proc.stderr).splitlines() if "FSNamesystem.audit" in line]
+JMX = "http://localhost:9870/jmx?qry=Hadoop:service=NameNode,name=RpcDetailedActivityForPort9000"
+# DataNode-to-NameNode calls (heartbeats, block reports) share the port; they
+# aren't the query's.
+DATANODE_METHODS = {
+    "BlockReceivedAndDeleted",
+    "BlockReport",
+    "CacheReport",
+    "CommitBlockSynchronization",
+    "ErrorReport",
+    "RegisterDatanode",
+    "ReportBadBlocks",
+    "SendHeartbeat",
+    "SendLifeline",
+    "VersionRequest",
+}
+
+
+def rpc_counters():
+    """Client RPCs served so far, by method. JMX values are cached for ~10 s,
+    so this first waits that out."""
+    time.sleep(11)
+    with urllib.request.urlopen(JMX, timeout=10) as response:
+        bean = json.load(response)["beans"][0]
+    counts = {}
+    for key, value in bean.items():
+        method = key[: -len("NumOps")]
+        # "Overall<Method>NumOps" repeats each method's count.
+        if key.endswith("NumOps") and not method.startswith("Overall") and method not in DATANODE_METHODS:
+            counts[method[0].lower() + method[1:]] = value
+    return counts
 
 
 def count_rpcs(duckdb, sql):
-    """NameNode RPCs one run of `sql` makes, by audit-log command."""
-    marker = "/__bench_marker__/" + uuid.uuid4().hex
-    run_duckdb(duckdb, "SELECT hdfs_exists('%s%s-start')" % (NN, marker))
+    """NameNode RPCs one run of `sql` makes, by method."""
+    before = rpc_counters()
     run_duckdb(duckdb, sql)
-    run_duckdb(duckdb, "SELECT hdfs_exists('%s%s-end')" % (NN, marker))
-    # The audit log is written asynchronously; give it a moment.
-    for _ in range(20):
-        lines = audit_lines()
-        starts = [i for i, l in enumerate(lines) if marker + "-start" in l]
-        ends = [i for i, l in enumerate(lines) if marker + "-end" in l]
-        if starts and ends:
-            break
-        time.sleep(0.5)
-    else:
-        return {}
-    counts = {}
-    for line in lines[starts[-1] + 1 : ends[0]]:
-        cmd = next((f[4:] for f in line.split("\t") if f.startswith("cmd=")), "?")
-        counts[cmd] = counts.get(cmd, 0) + 1
-    return counts
+    after = rpc_counters()
+    return {m: n - before.get(m, 0) for m, n in after.items() if n - before.get(m, 0) > 0}
 
 
 def main():

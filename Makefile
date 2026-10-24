@@ -13,7 +13,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 VCPKG_INSTALLED_DIR ?= $(firstword $(filter-out %/vcpkg,$(wildcard build/release/vcpkg_installed/*)))
 UNIT_PKGS = libcurl libssl libcrypto
 
-test_unit: test_glob test_crypto
+test_unit: test_glob test_crypto test_batch
 
 test_glob:
 	mkdir -p build/unit_test
@@ -28,4 +28,9 @@ test_crypto:
 		-o build/unit_test/hdfs_crypto_test
 	./build/unit_test/hdfs_crypto_test
 
-.PHONY: test_unit test_glob test_crypto
+test_batch:
+	mkdir -p build/unit_test
+	$(CXX) -std=c++17 -O1 -Wall -Wextra -Isrc/include test/cpp/hdfs_batch_test.cpp -o build/unit_test/hdfs_batch_test
+	./build/unit_test/hdfs_batch_test
+
+.PHONY: test_unit test_glob test_crypto test_batch

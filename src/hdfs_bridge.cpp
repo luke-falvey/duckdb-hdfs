@@ -18,12 +18,14 @@
 #include "server/LocatedBlocks.h"
 
 #include "hdfs_bridge.h"
+#include "hdfs_batch.hpp"
 #include "hdfs_crypto.hpp"
 #include "hdfs_glob.hpp"
 
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -59,6 +61,10 @@ struct hdfs_client_t {
 	// NameNode again.
 	std::mutex readers_mu;
 	std::unordered_map<std::string, hdfs_reader_t *> open_readers;
+	// Directories per batched listing call (getBatchedListing); 0 lists one
+	// directory per call. Lowered when the NameNode rejects a call, and shared
+	// by this client's walks so the lesson is learned once.
+	std::shared_ptr<std::atomic<size_t>> batch_limit = std::make_shared<std::atomic<size_t>>(0);
 };
 
 namespace {
@@ -401,6 +407,7 @@ struct hdfs_list_stream_t {
 	bool include_hidden = false;
 	size_t max_parallelism = 1;
 	std::unique_ptr<hdfs_glob::GlobPlan> plan;
+	std::shared_ptr<std::atomic<size_t>> batch_limit; // see hdfs_client_t
 
 	std::mutex mu;
 	std::condition_variable cv; // any state change
@@ -435,9 +442,17 @@ struct hdfs_list_stream_t {
 		SpawnIfNeeded();
 	}
 
+	// Directories one worker takes at a time (one batched listing call).
+	size_t BatchSize() const {
+		auto limit = batch_limit ? batch_limit->load() : 0;
+		return limit > 1 ? limit : 1;
+	}
+
 	// Add a worker if there is queued work no idle worker can take. Caller holds `mu`.
 	void SpawnIfNeeded() {
-		if (idle_workers < pending.size() && workers.size() < max_parallelism) {
+		size_t batch = BatchSize();
+		size_t units = (pending.size() + batch - 1) / batch;
+		if (idle_workers < units && workers.size() < max_parallelism) {
 			workers.emplace_back([this] { Work(); });
 		}
 	}
@@ -472,11 +487,20 @@ struct hdfs_list_stream_t {
 				cv.notify_all(); // let the consumer see completion
 				return;
 			}
-			Task task = std::move(pending.back());
-			pending.pop_back();
+			// Take a batch of directories to list in one call; a stat runs alone.
+			std::vector<Task> batch;
+			size_t size = BatchSize();
+			do {
+				batch.push_back(std::move(pending.back()));
+				pending.pop_back();
+			} while (!batch[0].stat_only && batch.size() < size && !pending.empty() && !pending.back().stat_only);
 			in_flight++;
 			lock.unlock();
-			Run(task);
+			if (batch.size() == 1) {
+				Run(batch[0]);
+			} else {
+				RunBatch(batch);
+			}
 			lock.lock();
 			in_flight--;
 			cv.notify_all();
@@ -494,9 +518,19 @@ struct hdfs_list_stream_t {
 		return failure.code == HDFS_ERR_NOT_FOUND || (skip_permission_errors && failure.code == HDFS_ERR_PERMISSION);
 	}
 
+	using Children = std::vector<std::pair<string, Hdfs::FileStatus>>;
+
+	// A task's listing failed: prune it or fail the walk. Caller doesn't hold `mu`.
+	void HandleFailure(const Task &task, const Failure &failure) {
+		std::unique_lock<std::mutex> lock(mu);
+		if (!Prunable(task, failure)) {
+			Fail(lock, failure);
+		}
+	}
+
 	// Run one task without holding `mu` during RPCs.
 	void Run(const Task &task) {
-		std::vector<std::pair<string, Hdfs::FileStatus>> children;
+		Children children;
 		try {
 			if (task.stat_only) {
 				children.emplace_back(task.path, fs->getFileStatus(task.path.c_str()));
@@ -505,18 +539,86 @@ struct hdfs_list_stream_t {
 				              [&](const string &path, const Hdfs::FileStatus &st) { children.emplace_back(path, st); });
 			}
 		} catch (...) {
-			auto failure = Describe(std::current_exception());
-			std::unique_lock<std::mutex> lock(mu);
-			if (!Prunable(task, failure)) {
-				Fail(lock, std::move(failure));
-			}
+			HandleFailure(task, Describe(std::current_exception()));
 			return;
 		}
+		Process(task, children);
+	}
 
+	// List several directories in batched listing calls (one call unless the
+	// listings are too large for one response).
+	void RunBatch(std::vector<Task> &tasks) {
+		std::vector<string> paths;
+		for (auto &task : tasks) {
+			paths.push_back(task.path);
+		}
+		std::vector<Children> children(tasks.size());
+		std::vector<std::exception_ptr> errors(tasks.size());
+		try {
+			string key;
+			std::vector<Hdfs::BatchedListing> listings;
+			bool more;
+			do {
+				listings.clear();
+				more = fs->getBatchedListing(paths, key, listings);
+				for (auto &listing : listings) {
+					if (listing.error) {
+						errors[listing.index] = listing.error;
+						continue;
+					}
+					auto &dir = paths[listing.index];
+					for (auto &st : listing.entries) {
+						children[listing.index].emplace_back(ChildPath(dir, st.getPath()), st);
+					}
+				}
+			} while (more);
+		} catch (const Hdfs::HdfsRpcServerException &e) {
+			auto decision = hdfs_batch::ClassifyRejection(e.getErrClass(), e.getErrMsg());
+			if (decision.rejection != hdfs_batch::Rejection::NONE) {
+				// Learn the NameNode's limit (or that it can't batch), then
+				// hand the directories back to be listed that way.
+				batch_limit->store(decision.rejection == hdfs_batch::Rejection::UNSUPPORTED ? 0 : decision.limit);
+				Requeue(tasks);
+				return;
+			}
+			FailAll(tasks, Describe(std::current_exception()));
+			return;
+		} catch (...) {
+			FailAll(tasks, Describe(std::current_exception()));
+			return;
+		}
+		for (size_t i = 0; i < tasks.size(); i++) {
+			if (errors[i]) {
+				HandleFailure(tasks[i], Describe(errors[i]));
+			} else if (!Process(tasks[i], children[i])) {
+				return; // the walk is stopping
+			}
+		}
+	}
+
+	// A whole batched call failed (e.g. lost connection): each task fails as
+	// a single listing would have.
+	void FailAll(const std::vector<Task> &tasks, const Failure &failure) {
+		for (auto &task : tasks) {
+			HandleFailure(task, failure);
+		}
+	}
+
+	void Requeue(std::vector<Task> &tasks) {
+		std::lock_guard<std::mutex> lock(mu);
+		for (auto &task : tasks) {
+			pending.push_back(std::move(task));
+		}
+		SpawnIfNeeded();
+		cv.notify_all();
+	}
+
+	// Match and queue a listed directory's children. Returns false once the
+	// walk is stopping. Caller doesn't hold `mu`.
+	bool Process(const Task &task, Children &children) {
 		std::unique_lock<std::mutex> lock(mu);
 		if (task.stat_only) {
-			Emit(lock, ToEntry(children[0].second, children[0].first));
-			return;
+			return Emit(lock, ToEntry(children[0].second, children[0].first));
 		}
 		for (auto &child : children) {
 			const string &path = child.first;
@@ -533,7 +635,7 @@ struct hdfs_list_stream_t {
 					cv.notify_all();
 				}
 				if (step.emit && !Emit(lock, ToEntry(st, path))) {
-					return;
+					return false;
 				}
 			} else {
 				// The listed path itself is exempt from hidden filtering.
@@ -546,10 +648,11 @@ struct hdfs_list_stream_t {
 					cv.notify_all();
 				}
 				if (!Emit(lock, ToEntry(st, path))) {
-					return;
+					return false;
 				}
 			}
 		}
+		return true;
 	}
 
 	// Hand out up to `max_entries` entries, blocking until some are available.
@@ -704,6 +807,12 @@ hdfs_client_t *hdfs_bridge_connect(const char *url, const char *config_dir, cons
 		client->replication = session.getDefaultReplica();
 		client->block_size = session.getDefaultBlockSize();
 		client->prefetch_size = session.getDefaultBlockSize() * session.getPrefetchSize();
+		// Batched listings (Hadoop 3.3+), unless turned off in hdfs-site.xml.
+		// Older NameNodes and Routers reject the first call, and the client
+		// then lists one directory per call.
+		if (conf.getBool("duckdb.hdfs.batched-listing.enabled", true)) {
+			client->batch_limit->store(hdfs_batch::DEFAULT_LIMIT);
+		}
 		client->user = username;
 		client->kerberos = kerberos;
 		client->key_provider = conf.getString("hadoop.security.key.provider.path", "");
@@ -900,6 +1009,7 @@ hdfs_list_stream_t *hdfs_bridge_list_stream_open(hdfs_client_t *client, const ch
                                                  bool include_hidden) {
 	auto stream = std::make_unique<hdfs_list_stream_t>();
 	stream->fs = client->fs;
+	stream->batch_limit = client->batch_limit;
 	stream->display_path = path;
 	stream->recursive = recursive;
 	stream->max_parallelism = static_cast<size_t>(std::max(max_parallelism, 1));
@@ -920,6 +1030,7 @@ hdfs_list_stream_t *hdfs_bridge_glob_stream_open(hdfs_client_t *client, const ch
 	}
 	auto stream = std::make_unique<hdfs_list_stream_t>();
 	stream->fs = client->fs;
+	stream->batch_limit = client->batch_limit;
 	stream->display_path = pattern;
 	stream->glob = true;
 	stream->max_parallelism = static_cast<size_t>(std::max(max_parallelism, 1));

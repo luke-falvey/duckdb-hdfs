@@ -3,9 +3,10 @@
 `run_bench.sh` starts the Docker test cluster (`test/docker`), seeds benchmark
 data under `/bench`, and runs a fixed set of queries with `build/release/duckdb`.
 For each query it reports the median wall time (one DuckDB process per run, so
-connection setup counts) and the NameNode RPCs one run makes, counted from the
-NameNode audit log. RPC counts don't depend on machine noise, so they are the
-better signal for changes that remove round trips.
+connection setup counts) and the NameNode RPCs one run makes, by method, from
+the NameNode's per-method RPC counters (JMX; each count waits ~10 s for the
+JMX cache, so a run takes a few minutes). RPC counts don't depend on machine
+noise, so they are the better signal for changes that remove round trips.
 
 ```sh
 make
@@ -30,6 +31,9 @@ Parquet file, one 8M-row CSV file, and a three-level partitioned tree of
 ~490 directories (`/bench/tree`).
 
 ## Results
+
+### Round trips per file
+
 
 Docker Desktop on an Apple M-series Mac (10 cores; the HDFS image is amd64
 and runs emulated), DuckDB v2.0.0. Median of 5 runs (3 with latency).
@@ -79,3 +83,27 @@ Tried and dropped (no measurable gain):
 
 Large scans are bound by the (emulated) DataNode, not the client: at 32
 threads the client uses ~2.4 s of CPU over 4.7 s.
+
+The RPC counts in this table come from the NameNode audit log (one line per
+path), which this benchmark used before it counted calls through JMX.
+
+### Batched listing
+
+Hadoop 3.3+ NameNodes list up to 100 directories per call
+(`getBatchedListing`). Same setup; "one per call" sets
+`duckdb.hdfs.batched-listing.enabled=false` (via `BENCH_HADOOP_CONF_DIR`).
+Query results were identical.
+
+| query | one per call | batched | one per call, 2 ms RTT | batched, 2 ms RTT | NameNode RPCs |
+|---|---|---|---|---|---|
+| glob only, 2000 partition directories | 0.29s | 0.18s | 0.54s | 0.19s | 2002 → 22 |
+| glob scan, 2000 small Parquet files | 2.13s | 1.64s | 2.40s | 1.86s | 4003 → 2023 |
+| hdfs_ls wide tree, parallelism 1 | 0.25s | 0.08s | 2.44s | 0.10s | 486 → 8 |
+| hdfs_ls wide tree, parallelism 16 | 0.11s | 0.08s | 0.17s | 0.10s | 486 → 12–14 |
+| hdfs_ls wide tree, parallelism 64 | 0.11s | 0.08s | 0.14s | 0.10s | 486 → 13–17 |
+| same small-file scan twice | 2.90s | 2.63s | 3.63s | 2.83s | 8006 → 4046 |
+
+Queries that read few files (large scans, CSV) are unchanged. The remaining
+RPCs of the glob scan are one `getBlockLocations` per file opened. With more
+listing threads the batches get smaller (the queued directories are shared
+out), which costs a few more calls but no time.
