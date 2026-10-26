@@ -1,0 +1,29 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Protobuf CONFIG)
+find_dependency(LibXml2 CONFIG)
+find_dependency(OpenSSL)
+find_dependency(PkgConfig)
+pkg_check_modules(GSASL REQUIRED IMPORTED_TARGET libgsasl)
+pkg_check_modules(LIBHDFS3_KRB5 REQUIRED mit-krb5-gssapi)
+
+include("${CMAKE_CURRENT_LIST_DIR}/libhdfs3-targets.cmake")
+
+# libhdfs3 and gsasl are static, so consumers link MIT krb5's full static link
+# line (including its private libraries and macOS frameworks).
+set(_libhdfs3_krb5_link)
+set(_libhdfs3_framework OFF)
+foreach(_flag IN LISTS LIBHDFS3_KRB5_STATIC_LDFLAGS)
+  if(_libhdfs3_framework)
+    list(APPEND _libhdfs3_krb5_link "-framework ${_flag}")
+    set(_libhdfs3_framework OFF)
+  elseif(_flag STREQUAL "-framework")
+    set(_libhdfs3_framework ON)
+  else()
+    list(APPEND _libhdfs3_krb5_link "${_flag}")
+  endif()
+endforeach()
+set_property(TARGET libhdfs3::hdfs3 APPEND PROPERTY INTERFACE_LINK_LIBRARIES ${_libhdfs3_krb5_link})
+unset(_libhdfs3_krb5_link)
+unset(_libhdfs3_framework)

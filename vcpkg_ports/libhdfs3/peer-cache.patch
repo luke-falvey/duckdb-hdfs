@@ -1,0 +1,150 @@
+diff -ru a/src/client/PeerCache.cpp b/src/client/PeerCache.cpp
+--- a/src/client/PeerCache.cpp
++++ b/src/client/PeerCache.cpp
+@@ -32,12 +32,9 @@
+ namespace Hdfs {
+ namespace Internal {
+ 
+-LruMap<std::string, PeerCache::value_type> PeerCache::Map;
+-
+ PeerCache::PeerCache(const SessionConfig& conf)
+     : cacheSize(conf.getSocketCacheCapacity()),
+       expireTimeInterval(conf.getSocketCacheExpiry()) {
+-  Map.setMaxSize(cacheSize);
+ }
+ 
+ std::string PeerCache::buildKey(const DatanodeInfo& datanode) {
+@@ -50,31 +47,73 @@
+ 
+ shared_ptr<Socket> PeerCache::getConnection(const DatanodeInfo& datanode) {
+   std::string key = buildKey(datanode);
+-  value_type value;
+-  int64_t elipsed;
++  std::lock_guard<std::mutex> lock(mu);
++  auto it = idle.find(key);
+ 
+-  if (!Map.findAndErase(key, &value)) {
+-    LOG(DEBUG1, "PeerCache miss for datanode %s uuid(%s).",
+-        datanode.formatAddress().c_str(), datanode.getDatanodeId().c_str());
+-    return shared_ptr<Socket>();
+-  } else if ((elipsed = ToMilliSeconds(value.second, steady_clock::now())) >
+-             expireTimeInterval) {
+-    LOG(DEBUG1, "PeerCache expire for datanode %s uuid(%s).",
+-        datanode.formatAddress().c_str(), datanode.getDatanodeId().c_str());
+-    return shared_ptr<Socket>();
++  // The most recently used connection is the least likely to have been
++  // closed by the DataNode; anything past the expiry is dropped.
++  while (it != idle.end() && !it->second.empty()) {
++    value_type value = it->second.back();
++    it->second.pop_back();
++    count--;
++    int64_t elapsed = ToMilliSeconds(value.second, steady_clock::now());
++
++    if (elapsed <= expireTimeInterval) {
++      LOG(DEBUG1, "PeerCache hit for datanode %s uuid(%s), elapsed %" PRId64,
++          datanode.formatAddress().c_str(), datanode.getDatanodeId().c_str(),
++          elapsed);
++      return value.first;
++    }
++
++    // Everything older than this one has expired too.
++    count -= static_cast<int>(it->second.size());
++    it->second.clear();
+   }
+ 
+-  LOG(DEBUG1, "PeerCache hit for datanode %s uuid(%s), elipsed %" PRId64,
+-      datanode.formatAddress().c_str(), datanode.getDatanodeId().c_str(),
+-      elipsed);
+-  return value.first;
++  LOG(DEBUG1, "PeerCache miss for datanode %s uuid(%s).",
++      datanode.formatAddress().c_str(), datanode.getDatanodeId().c_str());
++  return shared_ptr<Socket>();
+ }
+ 
+ void PeerCache::addConnection(shared_ptr<Socket> peer,
+                               const DatanodeInfo& datanode) {
++  if (cacheSize <= 0) {
++    peer->close();
++    return;
++  }
++
+   std::string key = buildKey(datanode);
+-  value_type value(peer, steady_clock::now());
+-  Map.insert(key, value);
++  shared_ptr<Socket> evicted;
++  {
++    std::lock_guard<std::mutex> lock(mu);
++
++    if (count >= cacheSize) {
++      // Full: drop the oldest idle connection of any DataNode.
++      auto oldest = idle.end();
++
++      for (auto it = idle.begin(); it != idle.end(); ++it) {
++        if (!it->second.empty() &&
++            (oldest == idle.end() ||
++             it->second.front().second < oldest->second.front().second)) {
++          oldest = it;
++        }
++      }
++
++      if (oldest != idle.end()) {
++        evicted = oldest->second.front().first;
++        oldest->second.pop_front();
++        count--;
++      }
++    }
++
++    idle[key].push_back(value_type(peer, steady_clock::now()));
++    count++;
++  }
++
++  if (evicted) {
++    evicted->close();
++  }
++
+   LOG(DEBUG1, "PeerCache add for datanode %s uuid(%s).",
+       datanode.formatAddress().c_str(), datanode.getDatanodeId().c_str());
+ }
+diff -ru a/src/client/PeerCache.h b/src/client/PeerCache.h
+--- a/src/client/PeerCache.h
++++ b/src/client/PeerCache.h
+@@ -28,11 +28,13 @@
+ #ifndef _HDFS_LIBHDFS3_CLIENT_PEERCACHE_H_
+ #define _HDFS_LIBHDFS3_CLIENT_PEERCACHE_H_
+ 
++#include <deque>
++#include <map>
++#include <mutex>
+ #include <string>
+ #include <utility>
+ 
+ #include "common/DateTime.h"
+-#include "common/LruMap.h"
+ #include "common/Memory.h"
+ #include "common/SessionConfig.h"
+ #include "network/Socket.h"
+@@ -41,6 +43,12 @@
+ namespace Hdfs {
+ namespace Internal {
+ 
++/*
++ * Idle DataNode connections, for reuse by later block reads. Several idle
++ * connections per DataNode, so parallel readers of one DataNode each find one;
++ * at most dfs.client.socketcache.capacity in all. Owned by one FileSystem, so a
++ * connection (and its SASL state) is never shared across file systems.
++ */
+ class PeerCache {
+  public:
+   explicit PeerCache(const SessionConfig& conf);
+@@ -57,7 +65,10 @@
+  private:
+   const int cacheSize;
+   int64_t expireTimeInterval;  // milliseconds
+-  static LruMap<std::string, value_type> Map;
++  std::mutex mu;
++  // Per DataNode, oldest first.
++  std::map<std::string, std::deque<value_type> > idle;
++  int count = 0;
+ };
+ }
+ }

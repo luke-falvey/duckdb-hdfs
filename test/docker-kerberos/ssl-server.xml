@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<!-- Self-signed keystore (built into the image) for the HTTPS-only web endpoints. -->
+<configuration>
+    <property><name>ssl.server.keystore.location</name><value>/etc/hadoop-conf/keystore.jks</value></property>
+    <property><name>ssl.server.keystore.password</name><value>changeit</value></property>
+    <property><name>ssl.server.keystore.keypassword</name><value>changeit</value></property>
+</configuration>

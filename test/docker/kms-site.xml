@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!--
+  Hadoop KMS for the encryption-zone tests: keys live in a local Java
+  keystore, and clients authenticate with simple (user.name) auth.
+-->
+<configuration>
+    <property>
+        <name>hadoop.kms.key.provider.uri</name>
+        <value>jceks://file@/tmp/kms/kms.keystore</value>
+    </property>
+    <property>
+        <name>hadoop.kms.authentication.type</name>
+        <value>simple</value>
+    </property>
+    <property>
+        <name>hadoop.kms.http.port</name>
+        <value>9600</value>
+    </property>
+</configuration>

@@ -1,7 +1,19 @@
 {
-        "dependencies": [],
+        "dependencies": [
+                "libhdfs3",
+                "openssl",
+                {
+                        "name": "curl",
+                        "default-features": false,
+                        "features": [
+                                "openssl",
+                                "gssapi"
+                        ]
+                }
+        ],
         "vcpkg-configuration": {
                 "overlay-ports": [
+                        "./vcpkg_ports",
                         "./extension-ci-tools/vcpkg_ports"
                 ],
                 "overlay-triplets": [

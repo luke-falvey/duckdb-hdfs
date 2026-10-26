@@ -18,12 +18,10 @@ jobs:
     with:
       ci_tools_version: v2.0-cyanoptera
       extension_name: hdfs
-      # The Rust FFI bridge (hdfs-bridge) is built via Corrosion during cmake.
       # DuckDB itself is built from the commit pinned by the duckdb submodule.
-      enable_rust: true
-      # hdfs-native depends on tokio (async networking), which cannot target
-      # WebAssembly, and the rustls/aws-lc TLS stack is not built for Windows
-      # here. Restrict to the Linux/macOS desktop+server platforms.
+      # The native HDFS client (libhdfs3, built by vcpkg from vcpkg_ports/)
+      # needs POSIX sockets and doesn't support Windows or WebAssembly, so
+      # restrict to the Linux/macOS desktop+server platforms.
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
 
   code-quality-check:
@@ -32,6 +30,7 @@ jobs:
     with:
       ci_tools_version: v2.0-cyanoptera
       extension_name: hdfs
-      format_checks: "format;tidy"
-      # clang-tidy configures the cmake build, which builds the Rust bridge.
-      extra_toolchains: "rust"
+      # clang-tidy is left out: it configures the full build, which needs the
+      # vcpkg dependencies this workflow doesn't install. Run `make tidy-check`
+      # locally (with VCPKG_TOOLCHAIN_PATH set) instead.
+      format_checks: "format"

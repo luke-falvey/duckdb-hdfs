@@ -5,7 +5,10 @@ services:
     build: .
     image: duckdb-hdfs-test:latest
     container_name: duckdb-hdfs-test
+    environment:
+      HDFS_SITE_EXTRA: ${HDFS_SITE_EXTRA:-}
     ports:
       - "9000:9000"   # NameNode RPC
       - "9866:9866"   # DataNode data transfer
       - "9870:9870"   # NameNode web UI (debugging)
+      - "9600:9600"   # KMS (encryption zones)

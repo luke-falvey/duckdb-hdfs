@@ -10,5 +10,8 @@ test/python/__pycache__/
 # clangd index cache
 .cache/
 
-# Rust bridge build output
-hdfs-bridge/target/
+# vcpkg manifest-mode output
+vcpkg_installed/
+
+# Benchmark results (test/bench/run_bench.sh --save)
+test/bench/results/

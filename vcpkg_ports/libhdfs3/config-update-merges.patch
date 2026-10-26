@@ -1,0 +1,14 @@
+diff --git a/src/common/XmlConfig.cpp b/src/common/XmlConfig.cpp
+index 9b31b46..2f5f059 100644
+--- a/src/common/XmlConfig.cpp
++++ b/src/common/XmlConfig.cpp
+@@ -188,7 +188,8 @@ Config::Config(const char * p) :
+ void Config::update(const char * p) {
+     xmlDocPtr doc; /* the resulting document tree */
+     LIBXML_TEST_VERSION
+-    kv.clear();
++    // Merge into the existing items (later files override earlier ones), so
++    // core-site.xml and hdfs-site.xml can both be loaded.
+     path = p;
+ 
+     if (access(path.c_str(), R_OK)) {

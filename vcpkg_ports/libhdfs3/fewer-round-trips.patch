@@ -1,0 +1,144 @@
+diff --git a/src/client/DirectoryIterator.cpp b/src/client/DirectoryIterator.cpp
+index b5b5043..61ae887 100644
+--- a/src/client/DirectoryIterator.cpp
++++ b/src/client/DirectoryIterator.cpp
+@@ -43,8 +43,8 @@ DirectoryIterator::DirectoryIterator(Hdfs::Internal::FileSystemImpl * const fs,
+ }
+ 
+ DirectoryIterator::DirectoryIterator(const DirectoryIterator & it) :
+-    needLocations(it.needLocations), filesystem(it.filesystem), next(it.next), path(it.path), startAfter(
+-        it.startAfter), lists(it.lists) {
++    needLocations(it.needLocations), filesystem(it.filesystem), next(it.next), exhausted(it.exhausted), path(it.path),
++    startAfter(it.startAfter), lists(it.lists) {
+ }
+ 
+ DirectoryIterator & DirectoryIterator::operator =(const DirectoryIterator & it) {
+@@ -55,6 +55,7 @@ DirectoryIterator & DirectoryIterator::operator =(const DirectoryIterator & it)
+     needLocations = it.needLocations;
+     filesystem = it.filesystem;
+     next = it.next;
++    exhausted = it.exhausted;
+     path = it.path;
+     startAfter = it.startAfter;
+     lists = it.lists;
+@@ -64,13 +65,14 @@ DirectoryIterator & DirectoryIterator::operator =(const DirectoryIterator & it)
+ bool DirectoryIterator::getListing() {
+     bool more;
+ 
+-    if (NULL == filesystem) {
++    if (NULL == filesystem || exhausted) {
+         return false;
+     }
+ 
+     next = 0;
+     lists.clear();
+     more = filesystem->getListing(path, startAfter, needLocations, lists);
++    exhausted = !more;
+ 
+     if (!lists.empty()) {
+         startAfter = lists.back().getPath();
+diff --git a/src/client/DirectoryIterator.h b/src/client/DirectoryIterator.h
+index cb12ad8..5710723 100644
+--- a/src/client/DirectoryIterator.h
++++ b/src/client/DirectoryIterator.h
+@@ -53,6 +53,8 @@ private:
+     bool needLocations;
+     Hdfs::Internal::FileSystemImpl * filesystem;
+     size_t next;
++    // The NameNode reported no remaining entries: don't ask again.
++    bool exhausted = false;
+     std::string path;
+     std::string startAfter;
+     std::vector<FileStatus> lists;
+diff --git a/src/client/FileSystemImpl.cpp b/src/client/FileSystemImpl.cpp
+index afcb769..2827857 100644
+--- a/src/client/FileSystemImpl.cpp
++++ b/src/client/FileSystemImpl.cpp
+@@ -190,10 +190,8 @@ void FileSystemImpl::connect() {
+ #else
+     nn = new NamenodeProxy(namenodeInfos, tokenService, sconf, RpcAuth(user, RpcAuth::ParseMethod(sconf.getRpcAuthMethod())));
+ #endif
+-    /*
+-     * To test if the connection is ok
+-     */
+-    getFsStats();
++    // The first real RPC validates the connection; an extra getFsStats here
++    // would only add a round trip.
+ }
+ 
+ /**
+diff --git a/src/proto/hdfs.proto b/src/proto/hdfs.proto
+index 716f85c..8487045 100644
+--- a/src/proto/hdfs.proto
++++ b/src/proto/hdfs.proto
+@@ -213,6 +213,7 @@ message LocatedBlocksProto {
+   required bool underConstruction = 3;
+   optional LocatedBlockProto lastBlock = 4;
+   required bool isLastBlockComplete = 5;
++  optional HdfsFileEncryptionInfoProto fileEncryptionInfo = 6;
+ 
+   // Optional field for erasure coding
+   optional ErasureCodingPolicyProto ecPolicy = 7;
+diff --git a/src/server/LocatedBlocks.h b/src/server/LocatedBlocks.h
+index 9da46bf..24849b4 100644
+--- a/src/server/LocatedBlocks.h
++++ b/src/server/LocatedBlocks.h
+@@ -31,6 +31,7 @@
+ #include "LocatedBlock.h"
+ #include "Memory.h"
+ #include "client/ECPolicy.h"
++#include "client/FileStatus.h"
+ 
+ #include <cassert>
+ 
+@@ -41,6 +42,27 @@ class LocatedBlocks {
+ public:
+     virtual ~LocatedBlocks() = default;
+ 
++    // How the file is encrypted, if it is in an encryption zone; lets a
++    // reader skip a separate getFileInfo.
++    bool isEncrypted() const {
++        return encrypted;
++    }
++
++    const FileEncryptionInfo & getEncryptionInfo() const {
++        return encryptionInfo;
++    }
++
++    void setEncryptionInfo(const FileEncryptionInfo & info) {
++        encryptionInfo = info;
++        encrypted = true;
++    }
++
++protected:
++    bool encrypted = false;
++    FileEncryptionInfo encryptionInfo;
++
++public:
++
+     virtual int64_t getFileLength() const = 0;
+ 
+     virtual void setFileLength(int64_t fileLength) = 0;
+diff --git a/src/server/RpcHelper.h b/src/server/RpcHelper.h
+index b2fde70..65e05e6 100644
+--- a/src/server/RpcHelper.h
++++ b/src/server/RpcHelper.h
+@@ -229,6 +229,18 @@ static inline void Convert(LocatedBlocks & lbs,
+                            const LocatedBlocksProto & proto) {
+     shared_ptr<LocatedBlock> lb;
+     lbs.setFileLength(proto.filelength());
++
++    if (proto.has_fileencryptioninfo()) {
++        const HdfsFileEncryptionInfoProto & fe = proto.fileencryptioninfo();
++        FileEncryptionInfo info;
++        info.suite = static_cast<int>(fe.suite());
++        info.protocolVersion = static_cast<int>(fe.cryptoprotocolversion());
++        info.key = fe.key();
++        info.iv = fe.iv();
++        info.keyName = fe.keyname();
++        info.ezKeyVersionName = fe.ezkeyversionname();
++        lbs.setEncryptionInfo(info);
++    }
+     lbs.setIsLastBlockComplete(proto.islastblockcomplete());
+     lbs.setUnderConstruction(proto.underconstruction());
+ 

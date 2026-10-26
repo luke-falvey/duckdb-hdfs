@@ -1,0 +1,12 @@
+diff --git a/src/common/WriteBuffer.cpp b/src/common/WriteBuffer.cpp
+--- a/src/common/WriteBuffer.cpp
++++ b/src/common/WriteBuffer.cpp
+@@ -30,7 +30,7 @@
+ #include <google/protobuf/io/coded_stream.h>
+ 
+ using namespace google::protobuf::io;
+-using google::protobuf::uint8;
++using uint8 = uint8_t;
+ 
+ namespace Hdfs {
+ namespace Internal {

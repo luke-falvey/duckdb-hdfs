@@ -1,0 +1,14 @@
+# name: test/sql/hdfs_kerberos_no_ticket.test
+# description: A Kerberos-secured HDFS without a Kerberos ticket.
+# group: [sql]
+
+# Run via test/scripts/run_kerberos_tests.sh with an empty ticket cache.
+
+require hdfs
+
+require-env HDFS_KERBEROS_NO_TICKET
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://localhost:19000/');
+----
+ticket cache

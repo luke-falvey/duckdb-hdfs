@@ -1,0 +1,3 @@
+    <!-- Mode "none": no wire protection. ignore.secure.ports.for.testing lets
+         the secure DataNode use unprivileged ports without data-transfer SASL. -->
+    <property><name>ignore.secure.ports.for.testing</name><value>true</value></property>

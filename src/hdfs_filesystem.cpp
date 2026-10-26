@@ -234,6 +234,21 @@ void HdfsFileSystem::Execute(const string &authority, BridgeStatus &status, FN &
 	}
 }
 
+unique_ptr<FileHandle> HdfsFileSystem::OpenFileExtended(const OpenFileInfo &file, FileOpenFlags flags,
+                                                        optional_ptr<FileOpener> opener) {
+	auto handle = OpenFile(file.path, flags, opener);
+	if (!handle || !file.extended_info || flags.OpenForWriting()) {
+		return handle;
+	}
+	auto &h = handle->Cast<HdfsFileHandle>();
+	timestamp_t mtime;
+	if (file.extended_info->TryGetOption("last_modified", mtime)) {
+		h.mtime = mtime;
+		h.has_mtime = true;
+	}
+	return handle;
+}
+
 unique_ptr<FileHandle> HdfsFileSystem::OpenFile(const string &path, FileOpenFlags flags,
                                                 optional_ptr<FileOpener> opener) {
 	string authority;
@@ -353,6 +368,10 @@ int64_t HdfsFileSystem::GetFileSize(FileHandle &handle) {
 }
 
 timestamp_t HdfsFileSystem::GetLastModifiedTime(FileHandle &handle) {
+	auto &h = handle.Cast<HdfsFileHandle>();
+	if (h.has_mtime) {
+		return h.mtime;
+	}
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(handle.path, authority, hdfs_path);
@@ -365,7 +384,19 @@ timestamp_t HdfsFileSystem::GetLastModifiedTime(FileHandle &handle) {
 		throw IOException("Failed to stat HDFS file '%s': %s", handle.path, status.Message());
 	}
 	// HDFS modification times are epoch milliseconds.
-	return Timestamp::FromEpochMs(static_cast<int64_t>(info.mtime));
+	h.mtime = Timestamp::FromEpochMs(static_cast<int64_t>(info.mtime));
+	// A reader sees the file as it was at open, so its mtime can be cached;
+	// a writer's keeps changing.
+	h.has_mtime = h.reader != nullptr;
+	return h.mtime;
+}
+
+string HdfsFileSystem::GetVersionTag(FileHandle &handle) {
+	auto &h = handle.Cast<HdfsFileHandle>();
+	if (!h.reader) {
+		return string();
+	}
+	return std::to_string(Timestamp::GetEpochMs(GetLastModifiedTime(handle))) + ":" + std::to_string(h.length);
 }
 
 bool HdfsFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
@@ -539,18 +570,18 @@ bool HdfsFileSystem::ListFilesExtended(const string &directory, const std::funct
 vector<OpenFileInfo> HdfsFileSystem::Glob(const string &path, FileOpener *opener) {
 	int32_t max_parallelism = static_cast<int32_t>(DEFAULT_HDFS_LIST_PARALLELISM);
 	Value setting;
-	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_list_parallelism", setting)) {
+	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_list_parallelism", setting) && !setting.IsNull()) {
 		max_parallelism =
-		    static_cast<int32_t>(MinValue<uint64_t>(setting.GetValue<uint64_t>(), NumericLimits<int32_t>::Maximum()));
+		    static_cast<int32_t>(MinValue<uint64_t>(UBigIntValue::Get(setting), NumericLimits<int32_t>::Maximum()));
 	}
 	// Glob discovery is a per-query surface, so the walk behavior settings
 	// apply here (hdfs_ls can additionally override them per call).
 	HdfsWalkOptions options;
-	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_skip_permission_errors", setting)) {
-		options.skip_permission_errors = setting.GetValue<bool>();
+	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_skip_permission_errors", setting) && !setting.IsNull()) {
+		options.skip_permission_errors = BooleanValue::Get(setting);
 	}
-	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_include_hidden", setting)) {
-		options.include_hidden = setting.GetValue<bool>();
+	if (FileOpener::TryGetCurrentSetting(opener, "hdfs_include_hidden", setting) && !setting.IsNull()) {
+		options.include_hidden = BooleanValue::Get(setting);
 	}
 	auto stream = OpenGlobStream(path, max_parallelism, options);
 	vector<OpenFileInfo> result;

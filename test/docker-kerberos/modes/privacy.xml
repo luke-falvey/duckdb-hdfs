@@ -1,0 +1,7 @@
+    <!-- Mode "privacy": encrypted RPC (GSSAPI) and DataNode traffic (DIGEST-MD5 3DES). -->
+    <property><name>hadoop.rpc.protection</name><value>privacy</value></property>
+    <property><name>dfs.data.transfer.protection</name><value>privacy</value></property>
+    <!-- DataNode SASL instead of privileged ports needs HTTPS-only web endpoints. -->
+    <property><name>dfs.http.policy</name><value>HTTPS_ONLY</value></property>
+    <property><name>dfs.namenode.https-address</name><value>0.0.0.0:19871</value></property>
+    <property><name>dfs.datanode.https.address</name><value>0.0.0.0:19865</value></property>

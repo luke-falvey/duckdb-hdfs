@@ -451,6 +451,136 @@ SELECT count(*), sum(n) FROM read_parquet('hdfs://localhost:9000/test/nested/row
 statement ok
 RESET threads;
 
+# --- encryption zones ----------------------------------------------------------
+# /ez is an encryption zone (key "ezkey" in the test cluster's KMS). Its
+# contents are encrypted client-side; /.reserved/raw/... (superuser only)
+# returns the stored bytes without decrypting them.
+
+# A file written and encrypted by the Java client reads back as plaintext.
+query IT
+SELECT id, name FROM read_csv('hdfs://localhost:9000/ez/java_written.csv') ORDER BY id;
+----
+1	alice
+2	bob
+3	carol
+
+query I
+SELECT content::VARCHAR LIKE 'id,name%' FROM read_blob('hdfs://localhost:9000/.reserved/raw/ez/java_written.csv');
+----
+false
+
+# Round-trip through DuckDB's own encrypted writes. Parquet reads come in at
+# arbitrary offsets from many threads, exercising mid-block decryption.
+statement ok
+COPY (SELECT range AS n, md5(range::VARCHAR) AS h FROM range(200000))
+TO 'hdfs://localhost:9000/ez/roundtrip.parquet' (FORMAT parquet, ROW_GROUP_SIZE 10000);
+
+statement ok
+SET threads = 8;
+
+query III
+SELECT count(*), sum(n), count(DISTINCT h) FROM read_parquet('hdfs://localhost:9000/ez/roundtrip.parquet');
+----
+200000	19999900000	200000
+
+statement ok
+RESET threads;
+
+# What's stored is ciphertext: without decryption it isn't valid Parquet.
+statement error
+SELECT * FROM read_parquet('hdfs://localhost:9000/.reserved/raw/ez/roundtrip.parquet');
+----
+
+# CTR encryption keeps the size: the plaintext and stored sizes match.
+query I
+SELECT (SELECT size FROM hdfs_stat('hdfs://localhost:9000/ez/roundtrip.parquet')) =
+       (SELECT size FROM hdfs_stat('hdfs://localhost:9000/.reserved/raw/ez/roundtrip.parquet'));
+----
+true
+
+# Overwriting through a temporary file renames within the zone.
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/ez/tmp.csv' (FORMAT csv, HEADER, USE_TMP_FILE true);
+
+statement ok
+COPY (SELECT 2 AS v) TO 'hdfs://localhost:9000/ez/tmp.csv' (FORMAT csv, HEADER, USE_TMP_FILE true);
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:9000/ez/tmp.csv');
+----
+2
+
+# --- caching and read paths ----------------------------------------------------
+
+# A file overwritten between two scans is re-read, not served from DuckDB's
+# external file cache (validated by modification time and size). Both versions
+# have the same size, so only the modification time tells them apart.
+statement ok
+SET enable_external_file_cache = true;
+
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/cache.parquet' (FORMAT parquet);
+
+query I
+SELECT v FROM read_parquet('hdfs://localhost:9000/test/cache.parquet');
+----
+1
+
+statement ok
+COPY (SELECT 2 AS v) TO 'hdfs://localhost:9000/test/cache.parquet' (FORMAT parquet);
+
+query I
+SELECT v FROM read_parquet('hdfs://localhost:9000/test/cache.parquet');
+----
+2
+
+# A CSV larger than DuckDB's read buffer: one thread reads it front to back,
+# several threads read it at scattered offsets on shared streams; both must
+# see the same bytes. Also inside an encryption zone, where decryption depends
+# on the read offset.
+statement ok
+COPY (SELECT range AS v, md5(range::VARCHAR) AS s FROM range(1000000))
+    TO 'hdfs://localhost:9000/test/seq.csv' (FORMAT csv, HEADER);
+
+statement ok
+COPY (SELECT range AS v, md5(range::VARCHAR) AS s FROM range(1000000))
+    TO 'hdfs://localhost:9000/ez/seq.csv' (FORMAT csv, HEADER);
+
+statement ok
+SET threads = 1;
+
+query III
+SELECT count(*), sum(v), min(s) FROM read_csv('hdfs://localhost:9000/test/seq.csv');
+----
+1000000	499999500000	0000104cd168386a335ba6bf6e32219d
+
+query III
+SELECT count(*), sum(v), min(s) FROM read_csv('hdfs://localhost:9000/ez/seq.csv');
+----
+1000000	499999500000	0000104cd168386a335ba6bf6e32219d
+
+statement ok
+SET threads = 8;
+
+query III
+SELECT count(*), sum(v), min(s) FROM read_csv('hdfs://localhost:9000/test/seq.csv');
+----
+1000000	499999500000	0000104cd168386a335ba6bf6e32219d
+
+query III
+SELECT count(*), sum(v), min(s) FROM read_csv('hdfs://localhost:9000/ez/seq.csv');
+----
+1000000	499999500000	0000104cd168386a335ba6bf6e32219d
+
+# Whole-file reads: the plain and the encrypted copy hold the same bytes.
+query I
+SELECT count(DISTINCT md5(content)) FROM read_blob(['hdfs://localhost:9000/test/seq.csv', 'hdfs://localhost:9000/ez/seq.csv']);
+----
+1
+
+statement ok
+RESET threads;
+
 # --- error handling ----------------------------------------------------------
 
 # Opening a non-existent file surfaces a clear IO error.

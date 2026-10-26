@@ -1,0 +1,21 @@
+diff --git a/src/client/FileSystem.cpp b/src/client/FileSystem.cpp
+index 5995f6d..85e8fdf 100644
+--- a/src/client/FileSystem.cpp
++++ b/src/client/FileSystem.cpp
+@@ -258,16 +258,13 @@ void FileSystem::connect(const char * uri, const char * username, const char * t
+         if (auth == AuthMethod::KERBEROS) {
+             if (username) {
+                 principal = username;
+-                std::cerr << "principal passed to FileSystem::connect is " << principal << std::endl;
+             }
+ 
+             // principal = ExtractPrincipalFromTicketCache(sconf.getKerberosCachePath());
+             const std::string & cache_path = sconf.getKerberosCachePath();
+-            std::cerr << "cache_path is " << cache_path << std::endl;
+ 
+             if (principal.empty()) {
+                 principal = ExtractPrincipalFromTicketCache(cache_path);
+-                std::cerr << "principal obtained via ExtractPrincipalFromTicketCache is " << principal << std::endl;
+             } else {
+                 SetKRB5CCNAME(cache_path);
+             }
