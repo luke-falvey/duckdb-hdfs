@@ -1,0 +1,118 @@
+# name: test/sql/hdfs_rpc_log.test
+# description: The HDFS log type: one entry per NameNode RPC, so the RPC budget of common operations is pinned.
+# group: [sql]
+
+# Needs the test cluster (see test/sql/hdfs.test), with the fixtures seeded by test/scripts/hdfs_up.sh.
+
+require hdfs
+
+require parquet
+
+require-env HDFS_TEST_RUNNING
+
+statement ok
+CALL enable_logging('HDFS');
+
+# --- a single-file read ---------------------------------------------------------
+# Two RPCs: the scan's file list stats the path (an all-literal glob), and opening the file fetches its block
+# locations. Parquet opens the file twice (metadata, then the scan); the second open shares the first reader.
+
+query I
+SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/data.parquet');
+----
+5
+
+query TTB
+SELECT op, path, ok FROM duckdb_logs_parsed('HDFS') ORDER BY op;
+----
+getBlockLocations	/test/data.parquet	true
+getFileInfo	/test/data.parquet	true
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('HDFS') WHERE duration_us IS NULL OR duration_us < 0;
+----
+0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# --- listings --------------------------------------------------------------------
+
+# A plain directory listing: one listing, however many entries (other test files may add some to /test).
+query I
+SELECT count(*) > 0 FROM hdfs_ls('hdfs://localhost:9000/test');
+----
+true
+
+query TT
+SELECT op, path FROM duckdb_logs_parsed('HDFS');
+----
+listDirectory	/test
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# A recursive walk without batching: one listing per directory (/hidtest, its _temporary and nested).
+statement ok
+SET hdfs_batched_listing = false;
+
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/hidtest/**', include_hidden := true);
+----
+7
+
+query TI
+SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') GROUP BY op;
+----
+listDirectory	3
+
+statement ok
+RESET hdfs_batched_listing;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# With batching, the two subdirectories (queued together by the root's listing) are listed in one call.
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/hidtest/**', include_hidden := true);
+----
+7
+
+query TI
+SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') GROUP BY op ORDER BY op;
+----
+getBatchedListing	1
+listDirectory	1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# --- failed calls ------------------------------------------------------------------
+
+# A missing path: the RPC is logged as failed.
+statement error
+SELECT * FROM hdfs_stat('hdfs://localhost:9000/test/does_not_exist');
+----
+Failed to stat HDFS path 'hdfs://localhost:9000/test/does_not_exist'
+
+query TTB
+SELECT op, path, ok FROM duckdb_logs_parsed('HDFS');
+----
+getFileInfo	/test/does_not_exist	false
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Nothing is logged unless the HDFS log type is enabled.
+statement ok
+CALL disable_logging();
+
+query I
+SELECT count(*) > 0 FROM hdfs_ls('hdfs://localhost:9000/test');
+----
+true
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('HDFS');
+----
+0

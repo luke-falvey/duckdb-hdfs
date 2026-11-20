@@ -8,6 +8,7 @@
 #include "duckdb/main/secret/secret.hpp"
 #include "hdfs_filesystem.hpp"
 #include "hdfs_functions.hpp"
+#include "hdfs_logging.hpp"
 
 namespace duckdb {
 
@@ -37,17 +38,32 @@ static void RegisterHdfsSecret(ExtensionLoader &loader) {
 	loader.RegisterFunction(config_function);
 }
 
+//! hdfs_list_parallelism is the number of threads each walk starts: 1 to HdfsWalkOptions::MAX_PARALLELISM.
+static void SetHdfsListParallelism(ClientContext &, SetScope, Value &parameter) {
+	if (parameter.IsNull()) {
+		return;
+	}
+	auto value = UBigIntValue::Get(parameter);
+	if (value < 1 || value > HdfsWalkOptions::MAX_PARALLELISM) {
+		throw InvalidInputException("hdfs_list_parallelism must be between 1 and %llu, got %llu",
+		                            HdfsWalkOptions::MAX_PARALLELISM, value);
+	}
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	// Connections are configured from an hdfs secret matching the URL, else from the Hadoop environment
 	// (HADOOP_CONF_DIR, HADOOP_USER_NAME, Kerberos ticket cache), as for the Hadoop CLI.
 	loader.SetDescription("Reads and writes hdfs:// URLs with a native HDFS client, and lists HDFS metadata");
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
+	// One entry per NameNode RPC: CALL enable_logging('HDFS'), then duckdb_logs_parsed('HDFS').
+	db.GetLogManager().RegisterLogType(make_uniq<HdfsLogType>());
 	config.AddExtensionOption("hdfs_list_parallelism",
-	                          "Maximum number of concurrent HDFS directory-listing RPCs used by listings and "
-	                          "globs that walk more than one directory (e.g. hdfs_ls('/path/**')); 1 disables "
-	                          "parallelism",
-	                          LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_HDFS_LIST_PARALLELISM));
+	                          "Maximum number of concurrent HDFS directory-listing RPCs (threads) used by each listing "
+	                          "or glob that walks more than one directory (e.g. hdfs_ls('/path/**')), from 1 (no "
+	                          "parallelism) to 64",
+	                          LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_HDFS_LIST_PARALLELISM),
+	                          SetHdfsListParallelism);
 	config.AddExtensionOption("hdfs_skip_permission_errors",
 	                          "Prune subtrees whose listing fails with a permission error during HDFS globs and "
 	                          "recursive listings instead of failing the query; an error on the listed path or "
@@ -70,6 +86,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &hdfs = *hdfs_fs;
 	db.GetFileSystem().RegisterSubSystem(std::move(hdfs_fs));
 	RegisterHdfsFunctions(loader, hdfs);
+	RegisterHdfsConnectionFunctions(loader, hdfs);
 	RegisterHdfsSecret(loader);
 }
 

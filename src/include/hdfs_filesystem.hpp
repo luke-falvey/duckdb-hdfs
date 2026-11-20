@@ -15,6 +15,7 @@
 
 namespace duckdb {
 
+class ExtensionLoader;
 class HdfsConnection;
 
 //! Default for the hdfs_list_parallelism setting.
@@ -34,6 +35,8 @@ struct HdfsEntry {
 	int64_t block_size = -1;
 	timestamp_t mtime;
 	timestamp_t atime;
+	//! The NameNode's inode id (0 if unknown).
+	int64_t file_id = 0;
 };
 
 struct HdfsFileHandle : public FileHandle {
@@ -43,13 +46,9 @@ public:
 	    : FileHandle(fs, std::move(path), flags), client(std::move(client)), reader(std::move(reader)),
 	      writer(std::move(writer)) {
 	}
-	~HdfsFileHandle() override {
-		// Close() can throw (a writer flush may fail); an explicit Close() surfaces the error.
-		try {
-			HdfsFileHandle::Close();
-		} catch (...) { // NOLINT: destructors must not throw
-		}
-	}
+	//! A writer dropped without Close() commits, as local files do (core's EXPORT DATABASE relies on it), unless it
+	//! is destroyed while an exception unwinds or after a failed write: that write is aborted instead.
+	~HdfsFileHandle() override;
 
 	//! The client the handle was opened on: a reconnect may replace the filesystem's client while it is open.
 	shared_ptr<HdfsClient> client;
@@ -59,19 +58,25 @@ public:
 	idx_t position = 0;
 	//! The file length for readers; bytes written so far for writers.
 	idx_t length = 0;
-	//! The modification time, from the listing that found the file or fetched once.
+	//! The modification time: a reader's is that of the version it reads; a writer's is fetched when asked.
 	bool has_mtime = false;
 	timestamp_t mtime;
+	//! A write (or closing the writer) failed: the file is incomplete, and only Abort() is left.
+	bool failed = false;
 
 public:
+	//! Complete the file (writers). If that fails, the file is aborted (removed) and the error thrown.
 	void Close() override;
+	//! Abandon a write: remove the file this handle created, without completing it. Readers just close. Throws if
+	//! the file could not be removed.
+	void Abort();
 };
 
 //! A listing or glob running in the background (backs hdfs_ls): entries arrive in batches while the walk
 //! continues, in no particular order. Not thread-safe.
 class HdfsListStream {
 public:
-	HdfsListStream(HdfsConnection &connection, string url, bool glob, HdfsWalkOptions options);
+	HdfsListStream(shared_ptr<HdfsConnection> connection, string url, bool glob, HdfsWalkOptions options);
 
 	//! Replace `out` with the next batch (at most `max_entries`), blocking until one arrives. Returns false at the
 	//! end. A connection failure is retried once while no entries have been handed out yet. With a `context`, the
@@ -81,7 +86,7 @@ public:
 private:
 	void Open();
 
-	HdfsConnection &connection;
+	shared_ptr<HdfsConnection> connection;
 	const string url;
 	string authority;
 	string hdfs_path;
@@ -111,8 +116,11 @@ public:
 
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
+	//! HDFS files are written sequentially: a write must start at the end of what was written so far.
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
+	//! Removes the file the handle created, without completing it (see HdfsFileHandle::Abort).
+	void AbortFileWrite(FileHandle &handle) override;
 
 	void Seek(FileHandle &handle, idx_t location) override;
 	idx_t SeekPosition(FileHandle &handle) override;
@@ -127,10 +135,11 @@ public:
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
-	//! HDFS mkdirs creates missing parents, so SINGLE behaves like RECURSIVE.
+	//! SINGLE requires the parent to exist; RECURSIVE creates missing parents. Returns false if the directory exists.
 	bool CreateDirectoryExtended(const string &directory, const CreateDirectoryOptions &options,
 	                             optional_ptr<FileOpener> opener = nullptr) override;
-	//! SINGLE removes only an existing, empty directory.
+	//! SINGLE removes only an existing, empty directory (one non-recursive delete); it returns false, not an error,
+	//! if the directory is missing or not empty, also when that changes concurrently.
 	bool RemoveDirectoryExtended(const string &directory, const RemoveDirectoryOptions &options,
 	                             optional_ptr<FileOpener> opener = nullptr) override;
 	//! Each entry carries type/size/last-modified in OpenFileInfo::extended_info.
@@ -140,10 +149,10 @@ public:
 		return true;
 	}
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
+	//! Source and target must be on the same NameNode, under the same hdfs secret configuration.
 	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
-	//! Durability comes with closing the writer (HdfsWriter::Close).
-	void FileSync(FileHandle &handle) override {
-	}
+	//! Writers: hsync what was written so far to the DataNodes' disks (the file completes only on Close).
+	void FileSync(FileHandle &handle) override;
 	//! Globs (with Hadoop-style {a,b} alternation) run as a parallel walk; see HdfsGlobResult.
 	unique_ptr<MultiFileList> GlobFilesExtended(const string &path, const FileGlobInput &input,
 	                                            optional_ptr<FileOpener> opener = nullptr) override;
@@ -161,6 +170,10 @@ public:
 	HdfsEntry Stat(const string &url, optional_ptr<FileOpener> opener);
 	//! Whether `url` exists (file or directory).
 	bool Exists(const string &url, optional_ptr<FileOpener> opener);
+	//! Drop every cached connection (hdfs_reset_connections()), so the next access reconnects with the current
+	//! secrets and Hadoop configuration. Open files and running listings keep their client. Returns the number
+	//! dropped.
+	idx_t ResetConnections();
 
 	bool CanHandleFile(const string &fpath) override;
 	string GetName() const override {
@@ -174,19 +187,22 @@ public:
 	}
 
 private:
-	//! The configuration of the hdfs secret matching `url` (empty without one).
-	static HdfsConnectionConfig LookupConfig(const string &url, optional_ptr<FileOpener> opener);
 	//! The connection for `url`: its authority ("hdfs://host:port", or "" for the default FS) and the configuration
-	//! of the hdfs secret matching it. Created once, never removed.
-	HdfsConnection &GetConnection(const string &url, const string &authority, optional_ptr<FileOpener> opener);
-	//! `expected_length`: the size a listing reported (-1 if unknown).
+	//! of the hdfs secret matching it. Cached per (normalized) authority and secret, and replaced when that secret's
+	//! configuration changes.
+	shared_ptr<HdfsConnection> GetConnection(const string &url, const string &authority,
+	                                         optional_ptr<FileOpener> opener);
+	//! `expected`: the status a listing reported (null if unknown).
 	unique_ptr<FileHandle> OpenFileInternal(const string &path, FileOpenFlags flags, optional_ptr<FileOpener> opener,
-	                                        int64_t expected_length);
+	                                        optional_ptr<const HdfsFileStatus> expected);
 	//! Status of `url`, or false if it doesn't exist.
 	bool TryStat(const string &url, HdfsFileStatus &result, optional_ptr<FileOpener> opener);
 
 	mutex connections_lock;
-	unordered_map<string, unique_ptr<HdfsConnection>> connections;
+	unordered_map<string, shared_ptr<HdfsConnection>> connections;
 };
+
+//! Registers hdfs_reset_connections().
+void RegisterHdfsConnectionFunctions(ExtensionLoader &loader, HdfsFileSystem &hdfs);
 
 } // namespace duckdb

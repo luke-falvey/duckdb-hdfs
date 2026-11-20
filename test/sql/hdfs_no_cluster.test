@@ -26,6 +26,55 @@ SELECT current_setting('hdfs_list_parallelism');
 statement ok
 RESET hdfs_list_parallelism;
 
+# Each walk starts up to hdfs_list_parallelism threads: 1 to 64.
+statement error
+SET hdfs_list_parallelism = 0;
+----
+Invalid Input Error: hdfs_list_parallelism must be between 1 and 64, got 0
+
+statement error
+SET hdfs_list_parallelism = 65;
+----
+Invalid Input Error: hdfs_list_parallelism must be between 1 and 64, got 65
+
+statement error
+SET GLOBAL hdfs_list_parallelism = 100000;
+----
+Invalid Input Error: hdfs_list_parallelism must be between 1 and 64, got 100000
+
+statement error
+SET hdfs_list_parallelism = -1;
+----
+Conversion Error
+
+# A rejected value leaves the setting as it was.
+query T
+SELECT current_setting('hdfs_list_parallelism');
+----
+16
+
+statement ok
+SET hdfs_list_parallelism = 1;
+
+statement ok
+RESET hdfs_list_parallelism;
+
+# --- logging -------------------------------------------------------------------
+# The HDFS log type (one entry per NameNode RPC) is registered; test/sql/hdfs_rpc_log.test counts entries.
+
+statement ok
+CALL enable_logging('HDFS');
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('HDFS');
+----
+0
+
+statement ok
+CALL disable_logging();
+
+# --- other settings ------------------------------------------------------------
+
 statement ok
 SET hdfs_include_hidden = true;
 
@@ -70,8 +119,8 @@ permissions	VARCHAR
 mode	USMALLINT
 replication	INTEGER
 block_size	BIGINT
-last_modified	TIMESTAMP
-last_accessed	TIMESTAMP
+last_modified	TIMESTAMP WITH TIME ZONE
+last_accessed	TIMESTAMP WITH TIME ZONE
 
 query TT
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/data'));
@@ -86,8 +135,8 @@ permissions	VARCHAR
 mode	USMALLINT
 replication	INTEGER
 block_size	BIGINT
-last_modified	TIMESTAMP
-last_accessed	TIMESTAMP
+last_modified	TIMESTAMP WITH TIME ZONE
+last_accessed	TIMESTAMP WITH TIME ZONE
 
 # --- hdfs_ls named parameters ------------------------------------------------
 # Both per-call overrides bind (alone, together, any case, either order).
@@ -143,6 +192,25 @@ SELECT * FROM read_csv('hdfs://127.0.0.1:1/a/{b/*.csv');
 ----
 <REGEX>:Invalid Input Error: .*Unclosed brace group.*
 
+# Brace expansion is capped: each {a,b} group doubles the pattern count, so 14 groups (16384 patterns) are refused
+# up front instead of running out of memory.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/d/' || repeat('{a,b}', 14));
+----
+<REGEX>:Invalid Input Error: .*expands to more than 10000 patterns.*
+
+statement error
+SELECT * FROM read_csv('hdfs://127.0.0.1:1/d/' || repeat('{a,b}', 40) || '.csv');
+----
+<REGEX>:Invalid Input Error: .*expands to more than 10000 patterns.*
+
+# A brace inside a character class is a class member, not a group: the pattern is valid, and fails only for want
+# of a NameNode.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/d/[{]x');
+----
+IO Error
+
 # --- hdfs_exists ---------------------------------------------------------------
 
 query T
@@ -154,6 +222,27 @@ query T
 SELECT typeof(hdfs_exists('hdfs://127.0.0.1:1/data'))
 ----
 BOOLEAN
+
+# Whether a path exists changes over time, so the answer must not be constant-folded into a prepared statement's
+# plan (test/sql/hdfs_glob.test checks EXECUTE sees a new file).
+query TT
+SELECT function_name, stability FROM duckdb_functions() WHERE function_name = 'hdfs_exists';
+----
+hdfs_exists	CONSISTENT_WITHIN_QUERY
+
+statement ok
+PREPARE exists_data AS SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
+
+# Each EXECUTE asks again (and fails again here) rather than replaying a result from PREPARE.
+statement error
+EXECUTE exists_data;
+----
+IO Error
+
+statement error
+EXECUTE exists_data;
+----
+IO Error
 
 # A NameNode that can't be reached is an IO error. It must not be reported as
 # "does not exist", or as an internal error from a function DuckDB thinks can't fail.
