@@ -20,8 +20,21 @@ COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/globtest/{file}' (FORMAT csv);
 
 endloop
 
+# Names with glob characters (no foreach: its {file} substitution would see the braces).
 statement ok
 COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/globtest/lit/file*name' (FORMAT csv);
+
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/globtest/lit/data[1].csv' (FORMAT csv);
+
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/globtest/lit/a{b}.csv' (FORMAT csv);
+
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/globtest/lit/{x' (FORMAT csv);
+
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/globtest/lit/dir[1]/f.csv' (FORMAT csv);
 
 # --- wildcards and classes -----------------------------------------------------------
 
@@ -130,6 +143,75 @@ query T
 FROM globbed('/lit/file\*name');
 ----
 /lit/file*name
+
+# --- literal fallback ----------------------------------------------------------------------
+# A pattern that matches nothing is tried as a literal path, in hdfs_ls as in scans: names with glob characters
+# can be listed and read by their own name. Brackets and braces count alike.
+
+query T
+FROM globbed('/lit/data[1].csv');
+----
+/lit/data[1].csv
+
+query T
+FROM globbed('/lit/a{b}.csv');
+----
+/lit/a{b}.csv
+
+# A literal directory lists its children, as for a path without glob characters.
+query T
+FROM globbed('/lit/dir[1]');
+----
+/lit/dir[1]/f.csv
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:9000/globtest/lit/a{b}.csv');
+----
+1
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:9000/globtest/lit/data[1].csv');
+----
+1
+
+# No fallback when the pattern matches something, or when the literal path doesn't exist either.
+query T
+FROM globbed('/lit/data[1-9].csv');
+----
+
+query T
+FROM globbed('/lit/*.csv');
+----
+/lit/a{b}.csv
+/lit/data[1].csv
+
+# A brace inside a character class is a class member, not a group.
+query T
+FROM globbed('/lit/[{]x');
+----
+/lit/{x
+
+# --- hdfs_exists in prepared statements -----------------------------------------------------
+# The answer is computed per EXECUTE, not kept from PREPARE. OVERWRITE first removes p=2 left by an earlier run.
+
+statement ok
+COPY (SELECT 1 AS p, 1 AS v) TO 'hdfs://localhost:9000/globtest/prep' (FORMAT csv, PARTITION_BY (p), OVERWRITE);
+
+statement ok
+PREPARE exists_later AS SELECT hdfs_exists('hdfs://localhost:9000/globtest/prep/p=2');
+
+query T
+EXECUTE exists_later;
+----
+false
+
+statement ok
+COPY (SELECT 2 AS p, 1 AS v) TO 'hdfs://localhost:9000/globtest/prep' (FORMAT csv, PARTITION_BY (p), OVERWRITE_OR_IGNORE);
+
+query T
+EXECUTE exists_later;
+----
+true
 
 # --- hidden names --------------------------------------------------------------------------
 

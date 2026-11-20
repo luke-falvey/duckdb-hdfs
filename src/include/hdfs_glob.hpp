@@ -8,8 +8,14 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/unordered_set.hpp"
 
 namespace duckdb {
+
+//! Whether an HDFS path is a glob pattern: it contains `*`, `?`, `[` or `{`. Unlike FileSystem::HasGlob, this
+//! includes `{` (brace alternation). Scans and hdfs_ls both use it, so they agree on what a pattern is; as in
+//! DuckDB's globber, escapes don't suppress glob mode.
+bool IsHdfsGlob(const string &path);
 
 //! Glob patterns for HDFS directory walks: DuckDB's syntax (`*`, `?`, `[abc]`, `[a-b]`, `[!abc]`, `\` escapes, and
 //! `**` as a whole component matching zero or more levels, at most once per pattern), plus Hadoop-style `{a,b}`
@@ -19,8 +25,8 @@ namespace duckdb {
 //! spells the hidden character out (a literal, or a pattern starting with a possibly escaped `.`/`_`, like `_*`);
 //! `**` neither matches nor descends into them.
 //!
-//! Brace groups expand into a set of patterns, and matching runs as a small state machine over directory levels:
-//! the walk carries a set of states per directory and calls Match for each child.
+//! Brace groups expand into a set of patterns (at most MAX_EXPANDED_PATTERNS), and matching runs as a small state
+//! machine over directory levels: the walk carries a set of states per directory and calls Match for each child.
 class HdfsGlobPlan {
 public:
 	//! A position in the patterns: the directory has matched components 0..comp of pattern `pattern_idx`.
@@ -40,7 +46,12 @@ public:
 	};
 
 public:
-	//! Throws InvalidInputException for an invalid pattern (unclosed brace group, more than one `**`).
+	//! The most patterns brace expansion may produce: each group multiplies the count, so a few dozen groups would
+	//! otherwise exhaust memory.
+	static constexpr idx_t MAX_EXPANDED_PATTERNS = 10000;
+
+	//! Throws InvalidInputException for an invalid pattern (unclosed brace group, more than one `**`, more than
+	//! MAX_EXPANDED_PATTERNS expanded patterns).
 	static HdfsGlobPlan Parse(const string &pattern, bool include_hidden);
 
 	//! The literal directory the walk starts from (for an all-literal pattern: the path itself).
@@ -60,7 +71,8 @@ public:
 
 	//! Hadoop's hidden-name convention: a leading `.` or `_`.
 	static bool IsHidden(const string &name);
-	//! Expand `{a,b}` groups into brace-free patterns. Throws InvalidInputException for an unclosed group.
+	//! Expand `{a,b}` groups into brace-free patterns. Braces inside a character class (`[{]`) or escaped (`\{`) are
+	//! literal. Throws InvalidInputException for an unclosed group or more than MAX_EXPANDED_PATTERNS results.
 	static vector<string> ExpandBraces(const string &pattern);
 
 private:
@@ -71,7 +83,14 @@ private:
 		string text;
 	};
 
-	void MatchAt(State state, const string &name, bool is_dir, Step &step) const;
+	struct StateHash {
+		size_t operator()(const State &state) const;
+	};
+	//! The states already in a Step's `next`, so adding one is O(1) however many patterns braces produced.
+	using StateSet = unordered_set<State, StateHash>;
+
+	void MatchAt(State state, const string &name, bool is_dir, Step &step, StateSet &seen) const;
+	static void ExpandBraces(const string &pattern, const string &original, vector<string> &result);
 
 	vector<vector<Component>> patterns;
 	string root;

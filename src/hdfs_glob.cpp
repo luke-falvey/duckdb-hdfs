@@ -1,9 +1,8 @@
 #include "hdfs_glob.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/hash.hpp"
 #include "duckdb/function/scalar/string_common.hpp"
-
-#include <algorithm>
 
 namespace duckdb {
 
@@ -20,10 +19,44 @@ bool ExplicitHiddenPrefix(const string &pattern) {
 	return pattern[0] == '.' || pattern[0] == '_';
 }
 
-void AddState(vector<HdfsGlobPlan::State> &states, HdfsGlobPlan::State state) {
-	if (std::find(states.begin(), states.end(), state) == states.end()) {
-		states.push_back(state);
+//! If `pattern[open]` is `[` and starts a character class, the index just past its closing `]`; otherwise npos.
+//! Mirrors the bracket parsing of DuckDB's Glob(): an optional `!`, a `]` right after that is literal, `a-z`
+//! ranges, and no escapes inside the class. A `[` without a closing `]` is not a class.
+idx_t ClassEnd(const string &pattern, idx_t open) {
+	auto pos = open + 1;
+	if (pos < pattern.size() && pattern[pos] == '!') {
+		pos++;
 	}
+	auto first = pos;
+	while (pos < pattern.size()) {
+		if (pattern[pos] == ']' && pos > first) {
+			return pos + 1;
+		}
+		if (pos + 1 == pattern.size()) {
+			break;
+		}
+		if (pattern[pos + 1] == '-' && pos + 2 < pattern.size() && pattern[pos + 2] != ']') {
+			pos += 3;
+		} else {
+			pos++;
+		}
+	}
+	return string::npos;
+}
+
+//! Characters that ExpandBraces copies verbatim starting at `pos` (an escape pair or a whole character class), or 1
+//! for an ordinary character.
+idx_t VerbatimLength(const string &pattern, idx_t pos) {
+	if (pattern[pos] == '\\') {
+		return pos + 1 < pattern.size() ? 2 : 1;
+	}
+	if (pattern[pos] == '[') {
+		auto end = ClassEnd(pattern, pos);
+		if (end != string::npos) {
+			return end - pos;
+		}
+	}
+	return 1;
 }
 
 vector<string> SplitComponents(const string &path) {
@@ -48,39 +81,60 @@ bool HdfsGlobPlan::IsHidden(const string &name) {
 	return !name.empty() && (name[0] == '.' || name[0] == '_');
 }
 
+size_t HdfsGlobPlan::StateHash::operator()(const State &state) const {
+	return CombineHash(Hash(static_cast<uint64_t>(state.pattern_idx)), Hash(static_cast<uint64_t>(state.comp)));
+}
+
+bool IsHdfsGlob(const string &path) {
+	return path.find_first_of("*?[{") != string::npos;
+}
+
 vector<string> HdfsGlobPlan::ExpandBraces(const string &pattern) {
-	// The first unescaped '{'.
+	vector<string> result;
+	ExpandBraces(pattern, pattern, result);
+	return result;
+}
+
+void HdfsGlobPlan::ExpandBraces(const string &pattern, const string &original, vector<string> &result) {
+	// The first '{' that isn't escaped or inside a character class.
 	auto start = string::npos;
-	for (idx_t char_idx = 0; char_idx < pattern.size(); char_idx++) {
-		if (pattern[char_idx] == '\\') {
-			char_idx++;
-		} else if (pattern[char_idx] == '{') {
+	for (idx_t char_idx = 0; char_idx < pattern.size();) {
+		if (pattern[char_idx] == '{') {
 			start = char_idx;
 			break;
 		}
+		char_idx += VerbatimLength(pattern, char_idx);
 	}
 	if (start == string::npos) {
-		return {pattern};
+		if (result.size() >= MAX_EXPANDED_PATTERNS) {
+			throw InvalidInputException("Glob pattern '%s' expands to more than %llu patterns: each {a,b} group "
+			                            "multiplies the count. Use fewer brace groups or several queries",
+			                            original, MAX_EXPANDED_PATTERNS);
+		}
+		result.push_back(pattern);
+		return;
 	}
 	// Its top-level alternatives, up to the matching '}'.
 	vector<string> alternatives;
 	string current;
 	auto close = string::npos;
 	idx_t depth = 1;
-	for (idx_t char_idx = start + 1; char_idx < pattern.size(); char_idx++) {
+	for (idx_t char_idx = start + 1; char_idx < pattern.size();) {
 		auto c = pattern[char_idx];
-		if (c == '\\') {
-			current.push_back(c);
-			if (char_idx + 1 < pattern.size()) {
-				current.push_back(pattern[++char_idx]);
-			}
-		} else if (c == '{') {
+		if (c == '\\' || c == '[') {
+			auto length = VerbatimLength(pattern, char_idx);
+			current.append(pattern, char_idx, length);
+			char_idx += length;
+			continue;
+		}
+		char_idx++;
+		if (c == '{') {
 			depth++;
 			current.push_back(c);
 		} else if (c == '}') {
 			if (--depth == 0) {
 				alternatives.push_back(current);
-				close = char_idx;
+				close = char_idx - 1;
 				break;
 			}
 			current.push_back(c);
@@ -92,18 +146,14 @@ vector<string> HdfsGlobPlan::ExpandBraces(const string &pattern) {
 		}
 	}
 	if (close == string::npos) {
-		throw InvalidInputException("Unclosed brace group in glob pattern '%s'", pattern);
+		throw InvalidInputException("Unclosed brace group in glob pattern '%s'", original);
 	}
 	auto prefix = pattern.substr(0, start);
 	auto suffix = pattern.substr(close + 1);
-	vector<string> expanded;
 	for (auto &alternative : alternatives) {
-		// Each level removes one brace pair, so the recursion terminates.
-		for (auto &result : ExpandBraces(prefix + alternative + suffix)) {
-			expanded.push_back(std::move(result));
-		}
+		// Each level removes one brace pair, so the recursion terminates; the count check above bounds the work.
+		ExpandBraces(prefix + alternative + suffix, original, result);
 	}
-	return expanded;
 }
 
 HdfsGlobPlan HdfsGlobPlan::Parse(const string &pattern, bool include_hidden) {
@@ -183,10 +233,11 @@ HdfsGlobPlan::Step HdfsGlobPlan::Match(const vector<State> &states, const string
 	// A crawl never enters a hidden level. Its zero-level case still runs, so an explicit component after `**`
 	// (e.g. `**/_SUCCESS`) can match.
 	bool crawl_blocked = !include_hidden && IsHidden(name);
+	StateSet seen;
 	for (auto state : states) {
 		auto &components = patterns[state.pattern_idx];
 		if (components[state.comp].kind != ComponentKind::CRAWL) {
-			MatchAt(state, name, is_dir, step);
+			MatchAt(state, name, is_dir, step, seen);
 			continue;
 		}
 		if (state.comp + 1 == components.size()) {
@@ -194,16 +245,16 @@ HdfsGlobPlan::Step HdfsGlobPlan::Match(const vector<State> &states, const string
 			step.emit |= !crawl_blocked;
 		} else {
 			// Zero levels: match the component after the `**`.
-			MatchAt(State {state.pattern_idx, state.comp + 1}, name, is_dir, step);
+			MatchAt(State {state.pattern_idx, state.comp + 1}, name, is_dir, step, seen);
 		}
-		if (is_dir && !crawl_blocked) {
-			AddState(step.next, state);
+		if (is_dir && !crawl_blocked && seen.insert(state).second) {
+			step.next.push_back(state);
 		}
 	}
 	return step;
 }
 
-void HdfsGlobPlan::MatchAt(State state, const string &name, bool is_dir, Step &step) const {
+void HdfsGlobPlan::MatchAt(State state, const string &name, bool is_dir, Step &step, StateSet &seen) const {
 	auto &components = patterns[state.pattern_idx];
 	auto &component = components[state.comp];
 	bool matched;
@@ -221,7 +272,10 @@ void HdfsGlobPlan::MatchAt(State state, const string &name, bool is_dir, Step &s
 	if (state.comp + 1 == components.size()) {
 		step.emit = true;
 	} else if (is_dir) {
-		AddState(step.next, State {state.pattern_idx, state.comp + 1});
+		State next {state.pattern_idx, state.comp + 1};
+		if (seen.insert(next).second) {
+			step.next.push_back(next);
+		}
 	}
 }
 

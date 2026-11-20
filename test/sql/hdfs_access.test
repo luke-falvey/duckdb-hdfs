@@ -1,0 +1,153 @@
+# name: test/sql/hdfs_access.test
+# description: hdfs_ls, hdfs_stat and hdfs_exists obey disabled_filesystems, enable_external_access,
+# group: [sql]
+
+#              allowed_directories and allowed_paths, as reads through DuckDB's file system do. Needs no cluster:
+#              a refused call fails before connecting, an allowed one gets as far as the (unreachable) NameNode.
+#              A separate file because enable_external_access can't be turned back on.
+
+require hdfs
+
+# --- disabled_filesystems --------------------------------------------------------
+
+statement ok
+SET disabled_filesystems = 'HdfsFileSystem';
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data');
+----
+Permission Error: File system HdfsFileSystem has been disabled by configuration
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data/*.csv');
+----
+Permission Error: File system HdfsFileSystem has been disabled by configuration
+
+statement error
+SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/data');
+----
+Permission Error: File system HdfsFileSystem has been disabled by configuration
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
+----
+Permission Error: File system HdfsFileSystem has been disabled by configuration
+
+# A scheme-less path (on the default FS) is refused too.
+statement error
+SELECT * FROM hdfs_stat('/data');
+----
+Permission Error: File system HdfsFileSystem has been disabled by configuration
+
+# The same as a scan.
+statement error
+SELECT * FROM read_csv('hdfs://127.0.0.1:1/data/x.csv');
+----
+Permission Error: File system HdfsFileSystem has been disabled by configuration
+
+statement ok
+RESET disabled_filesystems;
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
+----
+IO Error
+
+# --- enable_external_access = false -------------------------------------------------
+
+statement ok
+SET allowed_directories = ['hdfs://127.0.0.1:1/allowed'];
+
+statement ok
+SET allowed_paths = ['hdfs://127.0.0.1:1/one.csv'];
+
+statement ok
+PREPARE ls_data AS SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data');
+
+statement ok
+PREPARE exists_data AS SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
+
+statement error
+EXECUTE ls_data;
+----
+IO Error
+
+statement ok
+SET enable_external_access = false;
+
+# Binding needs no access, so DESCRIBE still works.
+statement ok
+DESCRIBE SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data');
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data');
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/data" - file system operations are disabled by configuration
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/**');
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/**" - file system operations are disabled by configuration
+
+statement error
+SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/data');
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/data" - file system operations are disabled by configuration
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/data" - file system operations are disabled by configuration
+
+statement error
+SELECT * FROM hdfs_stat('/data');
+----
+Permission Error: Cannot access path "/data" - file system operations are disabled by configuration
+
+# An allowed directory is a whole path component: a sibling with the same prefix is refused.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed2');
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/allowed2" - file system operations are disabled by configuration
+
+statement error
+SELECT hdfs_exists(p) FROM (VALUES ('hdfs://127.0.0.1:1/other/b'), ('hdfs://127.0.0.1:1/allowed/a')) t(p);
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/other/b" - file system operations are disabled by configuration
+
+# Allowed paths pass the check and get as far as the NameNode, which isn't there.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed');
+----
+IO Error
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/sub/*.csv');
+----
+IO Error
+
+statement error
+SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/allowed/sub');
+----
+IO Error
+
+statement error
+SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/one.csv');
+----
+IO Error
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/a.csv');
+----
+IO Error
+
+# Statements prepared while access was allowed are checked again when they run.
+statement error
+EXECUTE ls_data;
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/data" - file system operations are disabled by configuration
+
+statement error
+EXECUTE exists_data;
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/data" - file system operations are disabled by configuration
