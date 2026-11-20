@@ -1,7 +1,8 @@
 # name: test/sql/hdfs_disabled_filesystems.test
 # description: hdfs_ls, hdfs_stat and hdfs_exists obey disabled_filesystems, as reads through DuckDB's file
-#              system do. A file of its own: a disabled file system can't be re-enabled in the same database.
 # group: [sql]
+
+#              system do. A file of its own: a disabled file system can't be re-enabled in the same database.
 
 require hdfs
 
