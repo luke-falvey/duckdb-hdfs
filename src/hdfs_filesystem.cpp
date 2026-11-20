@@ -85,9 +85,10 @@ shared_ptr<ExtendedOpenFileInfo> MakeExtendedInfo(const HdfsEntry &entry) {
 	info->options.emplace("type", Value(entry.is_dir ? "directory" : "file"));
 	info->options.emplace("file_size", Value::BIGINT(entry.size));
 	info->options.emplace("last_modified", Value::TIMESTAMP(entry.mtime));
-	if (entry.file_id != 0) {
+	if (entry.file_id > 0) {
 		// Lets OpenFileExtended share an open reader only with the same file, not one that replaced it.
-		info->options.emplace("hdfs_file_id", Value::BIGINT(entry.file_id));
+		// UBIGINT: core exports ExtendedOpenFileInfo::TryGetOption for idx_t, not for int64_t.
+		info->options.emplace("hdfs_file_id", Value::UBIGINT(static_cast<uint64_t>(entry.file_id)));
 	}
 	return info;
 }
@@ -388,9 +389,9 @@ unique_ptr<FileHandle> HdfsFileSystem::OpenFileExtended(const OpenFileInfo &file
 	HdfsFileStatus expected;
 	expected.length = NumericCast<int64_t>(file_size);
 	expected.mtime = NumericCast<uint64_t>(MaxValue<int64_t>(Timestamp::GetEpochMs(last_modified), 0));
-	int64_t file_id;
+	idx_t file_id;
 	if (file.extended_info->TryGetOption("hdfs_file_id", file_id)) {
-		expected.file_id = file_id;
+		expected.file_id = NumericCast<int64_t>(file_id);
 	}
 	return OpenFileInternal(file.path, flags, opener, &expected);
 }
