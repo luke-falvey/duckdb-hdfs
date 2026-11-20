@@ -62,12 +62,6 @@ void DefineMetadataSchema(vector<LogicalType> &types, vector<Identifier> &names)
 	         "permissions", "mode", "replication", "block_size", "last_modified", "last_accessed"};
 }
 
-//! The 9 permission bits as "rwxr-xr-x", as `hdfs dfs -ls` shows them.
-string PermissionString(uint16_t mode) {
-	static const char *const RWX[] = {"---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"};
-	return string(RWX[(mode >> 6) & 0x7]) + RWX[(mode >> 3) & 0x7] + RWX[mode & 0x7];
-}
-
 //! The functions take hdfs:// URLs only, as scans do (HdfsFileSystem::CanHandleFile). A scheme-less "/data" would
 //! name a path on fs.defaultFS while DuckDB's allowed_directories check judges it as a local path; "", "s3://..."
 //! and typos like "hdfs:/nn/x" would silently go to the default FS too.
@@ -227,7 +221,7 @@ void WriteColumn(column_t column_id, const vector<HdfsEntry> &rows, idx_t first_
 				writer.WriteValue(string_t(row.group));
 				break;
 			default: {
-				auto permissions = PermissionString(row.permission);
+				auto permissions = HdfsPermissionString(row.permission);
 				writer.WriteValue(string_t(permissions));
 				break;
 			}
@@ -252,7 +246,7 @@ void WriteColumn(column_t column_id, const vector<HdfsEntry> &rows, idx_t first_
 	case COL_MODE: {
 		auto writer = FlatVector::Writer<uint16_t>(result, count);
 		for (auto &row : rows) {
-			writer.WriteValue(row.permission);
+			writer.WriteValue(HdfsPermissionMode(row.permission));
 		}
 		break;
 	}

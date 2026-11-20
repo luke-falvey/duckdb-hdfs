@@ -25,4 +25,20 @@ inline timestamp_t HdfsTimestampFromEpochMs(int64_t ms, const string &url) {
 	return timestamp_t(micros);
 }
 
+//! The permission bits HDFS has (rwx for user, group and other, plus the sticky bit 01000) of a status's mode.
+inline uint16_t HdfsPermissionMode(uint16_t mode) {
+	return mode & 01777;
+}
+
+//! The permission bits as `hdfs dfs -ls` shows them: "rwxr-xr-x", with the sticky bit as 't' in the last place
+//! ('T' if others can't execute), e.g. "rwxrwxrwt" for /tmp.
+inline string HdfsPermissionString(uint16_t mode) {
+	static const char *const RWX[] = {"---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"};
+	auto result = string(RWX[(mode >> 6) & 0x7]) + RWX[(mode >> 3) & 0x7] + RWX[mode & 0x7];
+	if (mode & 01000) {
+		result.back() = (mode & 01) ? 't' : 'T';
+	}
+	return result;
+}
+
 } // namespace duckdb

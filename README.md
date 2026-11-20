@@ -136,8 +136,8 @@ guaranteed — add `ORDER BY path` if it matters.
 | `type` | `VARCHAR` | `'file'` or `'directory'` |
 | `size` | `BIGINT` | Length in bytes (0 for directories) |
 | `owner`, `group` | `VARCHAR` | |
-| `permissions` | `VARCHAR` | `rwxr-xr-x`, as `hdfs dfs -ls` shows it |
-| `mode` | `USMALLINT` | The permission bits as a number (`rwxr-xr-x` = 493) |
+| `permissions` | `VARCHAR` | `rwxr-xr-x`, as `hdfs dfs -ls` shows it (the sticky bit as `t`/`T`: `rwxrwxrwt`) |
+| `mode` | `USMALLINT` | The permission bits as a number, sticky bit included (`rwxr-xr-x` = 493, `rwxrwxrwt` = 1023) |
 | `replication` | `INTEGER` | `NULL` for directories |
 | `block_size` | `BIGINT` | `NULL` for directories |
 | `last_modified` | `TIMESTAMP WITH TIME ZONE` | Modification time (an instant, as `read_blob`'s `last_modified`) |
