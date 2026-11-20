@@ -105,22 +105,21 @@ echo "OK"
 
 echo "==> Checking the Java client reads DuckDB's multi-block encrypted writes..."
 # hdfs_edge.test writes the same bytes in and outside the zone, across 1 MiB blocks.
+# Compared through files: `hdfs dfs -cat` on a zone file can print the Java client's crypto-library warnings
+# on stdout, which would end up in a checksum of its output.
 multi_block_failed=0
 for f in rows.csv 2097153.bin 1048576.bin 0.bin; do
-    plain="$(docker exec duckdb-hdfs-test bash -lc "set -o pipefail; hdfs dfs -cat /edge/duck/${f} | md5sum" | cut -d' ' -f1)"
-    encrypted="$(docker exec duckdb-hdfs-test bash -lc "set -o pipefail; hdfs dfs -cat /ez/edge/duck/${f} | md5sum" | cut -d' ' -f1)"
-    if [ "${plain}" != "${encrypted}" ]; then
-        echo "ERROR: the Java client decrypted /ez/edge/duck/${f} differently (md5 ${encrypted}, expected ${plain})" >&2
-        # Where the bytes differ tells a keystream error (from some offset on) from a truncation or a block-sized gap.
-        docker exec duckdb-hdfs-test bash -lc "
+    if ! docker exec duckdb-hdfs-test bash -lc "
+            set -e
             rm -f /tmp/mb_plain /tmp/mb_enc
             hdfs dfs -get /edge/duck/${f} /tmp/mb_plain >/dev/null 2>&1
-            hdfs dfs -get /ez/edge/duck/${f} /tmp/mb_enc 2>&1 | tail -3
-            echo \"  sizes on the NameNode: \$(hdfs dfs -stat '%b %o' /edge/duck/${f}) (plain), \$(hdfs dfs -stat '%b %o' /ez/edge/duck/${f}) (zone)\"
-            echo \"  sizes read by Java: \$(stat -c %s /tmp/mb_plain) (plain), \$(stat -c %s /tmp/mb_enc 2>/dev/null) (zone)\"
+            hdfs dfs -get /ez/edge/duck/${f} /tmp/mb_enc >/dev/null 2>&1
+            cmp /tmp/mb_plain /tmp/mb_enc"; then
+        echo "ERROR: the Java client decrypted /ez/edge/duck/${f} differently from the plain copy" >&2
+        docker exec duckdb-hdfs-test bash -lc "
+            echo \"  sizes read by Java: \$(stat -c %s /tmp/mb_plain 2>/dev/null) (plain), \$(stat -c %s /tmp/mb_enc 2>/dev/null) (zone)\"
             echo \"  first differing bytes (offset, plain, zone):\"
             cmp -l /tmp/mb_plain /tmp/mb_enc 2>&1 | head -5
-            echo \"  differing bytes in total: \$(cmp -l /tmp/mb_plain /tmp/mb_enc 2>/dev/null | wc -l)\"
         " >&2 || true
         multi_block_failed=1
     fi
