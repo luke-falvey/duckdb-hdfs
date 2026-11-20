@@ -63,6 +63,9 @@ public:
 	timestamp_t mtime;
 	//! A write (or closing the writer) failed: the file is incomplete, and only Abort() is left.
 	bool failed = false;
+	//! Where the NameNode RPCs made on this handle are logged (HDFS log type): the logger of the query that opened
+	//! it, whichever thread later closes or aborts it.
+	weak_ptr<Logger> rpc_logger;
 
 public:
 	//! Complete the file (writers). If that fails, the file is aborted (removed) and the error thrown.

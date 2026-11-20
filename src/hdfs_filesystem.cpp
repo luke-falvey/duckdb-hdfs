@@ -217,6 +217,7 @@ private:
 };
 
 HdfsFileHandle::~HdfsFileHandle() {
+	HdfsRpcLoggerScope log_scope(rpc_logger.lock());
 	// Some core writers drop a handle without calling Close() (EXPORT DATABASE's schema.sql / load.sql), as local
 	// files allow, so a writer destroyed normally still commits. One destroyed while an exception unwinds, or after a
 	// failed write, belongs to a failed write: it is aborted, and the file it created is removed. Neither path lets an
@@ -225,7 +226,21 @@ HdfsFileHandle::~HdfsFileHandle() {
 		try {
 			Close();
 			return;
-		} catch (...) { // NOLINT: Close() already aborted the write
+		} catch (std::exception &error) {
+			// Close() already aborted (removed) the file. The caller dropped the handle without Close(), so the error
+			// has nowhere to go but the log.
+			try {
+				if (logger) {
+					auto message =
+					    StringUtil::Format("Failed to complete HDFS file '%s' (handle dropped without Close; "
+					                       "the file was removed): %s",
+					                       path, ErrorData(error).RawMessage());
+					DUCKDB_LOG_ERROR(logger, message);
+				}
+			} catch (...) { // NOLINT: destructors must not throw
+			}
+			return;
+		} catch (...) { // NOLINT: destructors must not throw
 			return;
 		}
 	}
@@ -236,6 +251,7 @@ HdfsFileHandle::~HdfsFileHandle() {
 }
 
 void HdfsFileHandle::Close() {
+	HdfsRpcLoggerScope log_scope(rpc_logger.lock());
 	if (reader || writer) {
 		DUCKDB_LOG_FILE_SYSTEM_CLOSE((*this));
 	}
@@ -266,6 +282,7 @@ void HdfsFileHandle::Close() {
 }
 
 void HdfsFileHandle::Abort() {
+	HdfsRpcLoggerScope log_scope(rpc_logger.lock());
 	reader.reset();
 	if (!writer) {
 		return;
@@ -500,6 +517,7 @@ unique_ptr<FileHandle> HdfsFileSystem::OpenFileInternal(const string &path, File
 		handle->mtime = HdfsTimestampFromEpochMs(static_cast<int64_t>(handle->reader->ModificationTime()), path);
 		handle->has_mtime = true;
 	}
+	handle->rpc_logger = HdfsLoggerFor(opener);
 	if (opener) {
 		handle->TryAddLogger(*opener);
 	}
@@ -636,6 +654,7 @@ timestamp_t HdfsFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	ParseHdfsPath(handle.path, authority, hdfs_path);
 	HdfsFileStatus status;
 	try {
+		HdfsRpcLoggerScope log_scope(hdfs_handle.rpc_logger.lock());
 		status = hdfs_handle.client->Stat(hdfs_path);
 	} catch (const HdfsError &error) {
 		ThrowHdfsError(StringUtil::Format("Failed to stat HDFS file '%s'", handle.path), error);

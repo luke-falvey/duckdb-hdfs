@@ -1288,6 +1288,10 @@ void HdfsClient::SetThreadLogger(const shared_ptr<Logger> &logger) {
 	ThreadLogger() = logger;
 }
 
+shared_ptr<Logger> HdfsClient::GetThreadLogger() {
+	return ThreadLogger().lock();
+}
+
 shared_ptr<HdfsClient> HdfsClient::Connect(const string &authority, const HdfsConnectionConfig &config) {
 	// The caller names the connection in its error message.
 	return Guard("", [&]() -> shared_ptr<HdfsClient> {

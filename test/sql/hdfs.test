@@ -918,3 +918,41 @@ query I
 SELECT bool_and(starts_with(filename, 'hdfs://LOCALHOST:9000/test/')) FROM read_csv('hdfs://LOCALHOST:9000/test/seq*.csv', filename = true);
 ----
 true
+
+# --- EXPORT / IMPORT DATABASE --------------------------------------------------------
+
+# EXPORT DATABASE writes schema.sql and load.sql through handles it drops without Close(): the destructor commits
+# them. A round trip through HDFS proves both files arrive whole. (Kept last: it switches the default database.)
+statement ok
+ATTACH ':memory:' AS export_src;
+
+statement ok
+USE export_src;
+
+statement ok
+CREATE TABLE t AS SELECT range AS id, 'v' || range AS s FROM range(1000);
+
+statement ok
+CREATE VIEW v AS SELECT id FROM t WHERE id % 2 = 0;
+
+statement ok
+EXPORT DATABASE 'hdfs://localhost:9000/test/export_db' (FORMAT parquet);
+
+statement ok
+ATTACH ':memory:' AS export_dst;
+
+statement ok
+USE export_dst;
+
+statement ok
+IMPORT DATABASE 'hdfs://localhost:9000/test/export_db';
+
+query III
+SELECT count(*), sum(id), max(s) FROM t;
+----
+1000	499500	v999
+
+query I
+SELECT count(*) FROM v;
+----
+500

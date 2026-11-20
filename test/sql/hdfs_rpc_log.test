@@ -112,6 +112,31 @@ listDirectory	1
 statement ok
 CALL truncate_duckdb_logs();
 
+# --- a failed write ------------------------------------------------------------------
+
+# A COPY that fails removes its file. The create and the delete both go to the query's log, whichever thread
+# aborts the write (the handle logs to the query that opened it, not to whatever that thread last served).
+statement error
+COPY (SELECT CASE WHEN range = 50000 THEN error('boom') ELSE range END AS v FROM range(100000))
+    TO 'hdfs://localhost:9000/test/rpc_abort.csv';
+----
+boom
+
+query TB
+SELECT op, ok FROM duckdb_logs_parsed('HDFS') WHERE path = '/test/rpc_abort.csv' AND op IN ('create', 'delete')
+ORDER BY op;
+----
+create	true
+delete	true
+
+query I
+SELECT count(DISTINCT query_id) FROM duckdb_logs_parsed('HDFS') WHERE path = '/test/rpc_abort.csv';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
 # --- failed calls ------------------------------------------------------------------
 
 # A missing path: the RPC is logged as failed.
