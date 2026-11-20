@@ -651,8 +651,24 @@ string HdfsFileSystem::GetVersionTag(FileHandle &handle) {
 	if (!hdfs_handle.reader) {
 		return string();
 	}
-	return std::to_string(Timestamp::GetEpochMs(GetLastModifiedTime(handle))) + ":" +
+	// The same identity reader sharing uses (file id, mtime, length): a file replaced by one of the same length with
+	// its mtime kept (`hdfs dfs -cp -p`, `distcp -pt`) has a new inode id. With a tag, DuckDB's external file cache
+	// trusts it alone (no recently-modified margin), so it must tell those versions apart.
+	return std::to_string(hdfs_handle.reader->FileId()) + ":" +
+	       std::to_string(Timestamp::GetEpochMs(GetLastModifiedTime(handle))) + ":" +
 	       std::to_string(hdfs_handle.length);
+}
+
+bool HdfsFileSystem::TryStat(const string &url, HdfsEntry &result, optional_ptr<FileOpener> opener) {
+	HdfsFileStatus status;
+	if (!TryStat(url, status, opener)) {
+		return false;
+	}
+	string authority;
+	string hdfs_path;
+	ParseHdfsPath(url, authority, hdfs_path);
+	result = MakeHdfsEntry(authority, status);
+	return true;
 }
 
 bool HdfsFileSystem::TryStat(const string &url, HdfsFileStatus &result, optional_ptr<FileOpener> opener) {
@@ -933,11 +949,10 @@ protected:
 			}
 		}
 		// As in DuckDB's local glob: a pattern that matches nothing may be a file whose name contains glob characters.
-		if (expanded_files.empty() && IsHdfsGlob(pattern) && fs.Exists(pattern, opener)) {
-			auto entry = fs.Stat(pattern, opener);
-			if (!entry.is_dir) {
-				expanded_files.push_back(MakeOpenFileInfo(entry));
-			}
+		// One stat answers both "does it exist" and "what is it".
+		HdfsEntry entry;
+		if (expanded_files.empty() && IsHdfsGlob(pattern) && fs.TryStat(pattern, entry, opener) && !entry.is_dir) {
+			expanded_files.push_back(MakeOpenFileInfo(entry));
 		}
 		std::sort(expanded_files.begin(), expanded_files.end());
 		return !expanded_files.empty();
@@ -1018,7 +1033,9 @@ bool HdfsListStream::Next(vector<HdfsEntry> &out, idx_t max_entries, optional_pt
 			continue;
 		}
 		for (auto &status : batch) {
-			out.push_back(MakeHdfsEntry(connection->authority, status));
+			// The caller's own spelling of the authority: a connection is shared by spellings that differ in the
+			// host's case, and the URLs are matched against secret scopes and allowed paths as given.
+			out.push_back(MakeHdfsEntry(authority, status));
 		}
 		emitted_any |= !out.empty();
 		return more;

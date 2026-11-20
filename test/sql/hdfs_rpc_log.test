@@ -87,6 +87,31 @@ listDirectory	1
 statement ok
 CALL truncate_duckdb_logs();
 
+# --- the literal fallback ------------------------------------------------------------
+
+# A pattern that matches nothing may be a file whose name contains glob characters. One getFileInfo after the
+# listing answers both whether it exists and what it is.
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/rpc[1].csv';
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:9000/test/rpc[1].csv');
+----
+1
+
+query TI
+SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') GROUP BY op ORDER BY op;
+----
+getBlockLocations	1
+getFileInfo	1
+listDirectory	1
+
+statement ok
+CALL truncate_duckdb_logs();
+
 # --- failed calls ------------------------------------------------------------------
 
 # A missing path: the RPC is logged as failed.

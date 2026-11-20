@@ -893,6 +893,10 @@ public:
 		return mtime;
 	}
 
+	int64_t FileId() const override {
+		return file_id;
+	}
+
 	// Replace the version a reader was opened with (before it is shared): the file changed after `version` was
 	// taken, so a fresh stat names it.
 	void SetVersion(const HdfsFileStatus &version) {

@@ -86,6 +86,8 @@ public:
 	virtual int64_t Length() const = 0;
 	//! The modification time (epoch milliseconds) of the file version this reader reads.
 	virtual uint64_t ModificationTime() const = 0;
+	//! The NameNode inode id of that version (0 if unknown).
+	virtual int64_t FileId() const = 0;
 	//! Read exactly `nr_bytes` at `offset`; files in an encryption zone are decrypted.
 	virtual void Read(data_ptr_t buffer, idx_t nr_bytes, idx_t offset) = 0;
 };

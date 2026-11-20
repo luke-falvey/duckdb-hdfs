@@ -170,6 +170,8 @@ public:
 	HdfsEntry Stat(const string &url, optional_ptr<FileOpener> opener);
 	//! Whether `url` exists (file or directory).
 	bool Exists(const string &url, optional_ptr<FileOpener> opener);
+	//! Stat(), or false if `url` doesn't exist (one NameNode call either way).
+	bool TryStat(const string &url, HdfsEntry &result, optional_ptr<FileOpener> opener);
 	//! Drop every cached connection (hdfs_reset_connections()), so the next access reconnects with the current
 	//! secrets and Hadoop configuration. Open files and running listings keep their client. Returns the number
 	//! dropped.

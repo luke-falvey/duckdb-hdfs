@@ -893,3 +893,28 @@ SELECT count(DISTINCT md5(content)) FROM read_blob(['hdfs://localhost:9000/test/
 
 statement ok
 RESET threads;
+
+# --- URLs keep the caller's authority ----------------------------------------------
+
+# Spellings of a host that differ only in case share one connection; listings and globs still return URLs in the
+# spelling of the call, whichever spelling connected first (as hdfs_stat does). Secret scopes and allowed paths
+# are matched against these URLs as given.
+query I
+SELECT count(*) > 0 FROM hdfs_ls('hdfs://localhost:9000/test');
+----
+true
+
+query II
+SELECT count(*) > 0, bool_and(starts_with(path, 'hdfs://LOCALHOST:9000/test/')) FROM hdfs_ls('hdfs://LOCALHOST:9000/test');
+----
+true	true
+
+query I
+SELECT bool_and(starts_with(path, 'hdfs://LOCALHOST:9000/test/')) FROM hdfs_ls('hdfs://LOCALHOST:9000/test/*.csv');
+----
+true
+
+query I
+SELECT bool_and(starts_with(filename, 'hdfs://LOCALHOST:9000/test/')) FROM read_csv('hdfs://LOCALHOST:9000/test/seq*.csv', filename = true);
+----
+true
