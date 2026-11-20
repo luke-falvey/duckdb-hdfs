@@ -8,29 +8,20 @@ work so far (bug fixes, DuckDB integration, the C++ client interface, tests and 
 
 Ordered by priority. Each item is meant to be one small pull request.
 
-### 1. Verify the libhdfs3 security fixes on a secured cluster
+### 1. More tests for the libhdfs3 security fixes
 
-`vcpkg_ports/libhdfs3/wire-encryption-fixes.patch` compiles. The DIGEST-MD5 sequence and MAC checks were tested with
-a standalone harness. It has not run against a Kerberos cluster, because the environment where it was written had no
-KDC.
+`vcpkg_ports/libhdfs3/wire-encryption-fixes.patch` is exercised by the Kerberos suite, which CI runs in every wire
+mode (none, integrity, privacy, aes, encrypt-key). Still missing:
 
-- **Run:** `test/scripts/run_kerberos_tests.sh`, in every wire mode (none, integrity, privacy, aes, encrypt-key).
-- **The `aes` mode matters most.** It covers the key-order fix, which failed every AES connection on GCC builds.
-- **Consider adding tests:**
-  - a DataNode that answers `ERROR_UNKNOWN_KEY` (e.g. restart the cluster with a client still connected);
-  - an expired block token.
+- a DataNode that answers `ERROR_UNKNOWN_KEY` (e.g. restart the cluster with a client still connected);
+- an expired block token;
+- a production cluster check, beyond the Docker one.
 
-### 2. Run the cluster tests and code checks in CI
+### 2. clang-tidy in CI
 
-These items were deliberately left out because they change CI.
-
-- **Cluster tests in CI.** Run `test/scripts/run_hdfs_tests.sh` in a CI job, as DuckDB's httpfs runs its S3 tests
-  against MinIO. Run the Kerberos suite nightly. Today CI runs only `hdfs_no_cluster.test`.
-- **clang-tidy in CI.** Bring it back in a job that installs the vcpkg dependencies. DuckDB uses it to enforce naming
-  and smart-pointer rules. It passes locally today with DuckDB's `.clang-tidy`.
-- **`make test_unit` in CI.** Run it after the build; it covers the glob planner, the metadata time conversion, and
-  the crypto and batched-listing C++ tests.
-- **Cost:** a few minutes per run for the Docker cluster, and one more vcpkg build for clang-tidy.
+The Integration workflow runs `make test_unit`, the Docker cluster tests, the Kerberos suite and the benchmark
+ceilings. clang-tidy is still left out: bring it back in a job that installs the vcpkg dependencies (one more vcpkg
+build). DuckDB uses it to enforce naming and smart-pointer rules. It passes locally with DuckDB's `.clang-tidy`.
 
 ### 3. Keep the listing parallel when batched listing is on
 
@@ -76,7 +67,10 @@ holding back a directory's results until every directory sorting before it is do
 The SQL tests cover aborted writes caused by query errors. These paths have no test, because they need a NameNode
 that fails at a chosen moment (e.g. a proxy that drops the connection, or a test-only `HdfsClient`):
 
-- `HdfsWriter::Abort` when the delete fails (the stream is left unclosed, so the file is not completed);
+- `HdfsWriter::Abort` when the delete fails (the stream is left unclosed, so the file is not completed). The cached
+  client keeps renewing the file's lease until it disconnects; see the open item in
+  [REVIEW_QUORUM_ROUND2.md](REVIEW_QUORUM_ROUND2.md);
+- a commit that fails when a handle is dropped without `Close()` (it is logged; nothing checks the entry);
 - the connection-failure recovery of create, delete and rename (`HdfsConnection::RunMutation` callers in
   `hdfs_filesystem.cpp`);
 - `FileSync` (core calls it only from its log storage and WAL-like writers).

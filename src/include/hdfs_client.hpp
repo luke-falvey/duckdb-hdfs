@@ -106,9 +106,10 @@ public:
 	//! Flush and complete the file; the data is durable once this returns. If it throws, the file may be
 	//! incomplete; Abort() still removes it.
 	virtual void Close() = 0;
-	//! Abandon the write without completing the file: delete it on the NameNode, then release the stream. The
-	//! file is never published under its name with partial contents. Never waits for the file to complete. Throws
-	//! if the delete fails (the incomplete file may then remain, until its lease expires).
+	//! Abandon the write without completing the file: delete it on the NameNode, then release the stream. Never
+	//! waits for the file to complete. Throws if the delete fails: the file then stays under construction while
+	//! this client keeps renewing its lease, and once the client disconnects and the lease expires, HDFS recovers
+	//! it under its name with what was written.
 	virtual void Abort() = 0;
 };
 

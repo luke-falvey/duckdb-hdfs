@@ -1067,7 +1067,8 @@ public:
 			auto failure = Describe(std::current_exception());
 			// The NameNode is unreachable, or refused: releasing the stream now would try to complete the file
 			// (and block on the same NameNode). Leave the stream unclosed instead: the file stays under construction,
-			// not complete, and its lease lapses once this client disconnects.
+			// not complete, and its lease lapses once this client disconnects. Connections are cached, so that can be
+			// as late as hdfs_reset_connections() or the process exiting (docs/REVIEW_QUORUM_ROUND2.md, open item).
 			(void)out.release(); // NOLINT: deliberately leaked, see above
 			throw HdfsError(failure.type, "delete incomplete file '" + path + "' failed: " + failure.message);
 		}

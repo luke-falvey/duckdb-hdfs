@@ -8,6 +8,16 @@ cluster used to exercise the `hdfs` extension end-to-end.
 - `sql/hdfs_no_cluster.test` — checks that need no cluster: settings,
   `hdfs_ls`/`hdfs_stat` schemas, named-parameter binding, and `hdfs_exists`
   error reporting. Runs as part of `make test`.
+- `sql/hdfs_access.test` — `enable_external_access`, `allowed_directories`
+  and `allowed_paths` for the metadata functions and scans, hdfs:// URLs only,
+  and `.`/`..` components. No cluster; runs in `make test` (its own file,
+  because external access can't be turned back on).
+- `sql/hdfs_disabled_filesystems.test` — `disabled_filesystems`. No cluster;
+  `make test` (its own file, because a disabled file system can't be
+  re-enabled).
+- `sql/hdfs_connections.test` — secret scope matching by whole path components,
+  connection replacement when a secret changes, `hdfs_reset_connections()`. No
+  cluster; `make test`.
 - `sql/hdfs.test` — integration tests run against a real HDFS. Gated behind
   `require-env HDFS_TEST_RUNNING`, so `make test` skips them unless a cluster is
   up. The tests that need the parquet extension come last, after a late
@@ -22,11 +32,16 @@ cluster used to exercise the `hdfs` extension end-to-end.
   HDFS permission checks and can never see an AccessControlException).
 - `sql/hdfs_ez_no_provider.test` — encrypted files without a key provider
   configured (run by `run_hdfs_tests.sh` with a stripped client config).
+- `sql/hdfs_rpc_log.test` — the `HDFS` log type: the exact NameNode RPCs of a
+  single-file read, a metadata-only read, listings, the glob literal fallback
+  and a failed write. Cluster; `run_hdfs_tests.sh`.
 - `sql/hdfs_glob.test` — glob semantics (wildcards, classes, `**`, braces,
   hidden names) against a fixture tree it creates under `/globtest`.
-- `cpp/hdfs_crypto_test.cpp`, `cpp/hdfs_batch_test.cpp` — C++ unit tests for
-  the encryption helpers and batched-listing rejection handling
-  (`make test_unit`, after `make`).
+- `cpp/hdfs_glob_test.cpp`, `cpp/hdfs_functions_test.cpp`,
+  `cpp/hdfs_crypto_test.cpp`, `cpp/hdfs_batch_test.cpp` — C++ unit tests for
+  the glob planner (brace expansion and its bounds, roots, hidden names,
+  `**`), the metadata time and permission helpers, the encryption helpers and
+  batched-listing rejection handling (`make test_unit`, after `make`).
 - `sql/hdfs_kerberos.test`, `sql/hdfs_kerberos_no_ticket.test` — a
   Kerberos-secured cluster, with and without a ticket. Run by
   `scripts/run_kerberos_tests.sh`, which starts `docker-kerberos/` (an MIT KDC
@@ -64,18 +79,22 @@ test/scripts/run_hdfs_tests.sh
 
 This builds the HDFS image, starts the cluster, seeds fixtures under `/test`,
 `/hidtest`, `/permtest`, `/edge` and the encryption zone `/ez`, runs
-`test/sql/hdfs.test`, `hdfs_glob.test` and `hdfs_edge.test` (as the superuser)
-and `test/sql/hdfs_permissions.test` (as a plain user) with
-`HDFS_TEST_RUNNING=1` and `HADOOP_CONF_DIR` pointing at `test/hdfs-conf`, then
-a few checks outside SQL (batched and unbatched listings agree; the Java client
-decrypts what DuckDB encrypted) and `hdfs_ez_no_provider.test`, and tears
-everything down.
+`test/sql/hdfs.test`, `hdfs_glob.test`, `hdfs_edge.test` and
+`hdfs_rpc_log.test` (as the superuser) and `test/sql/hdfs_permissions.test`
+(as a plain user) with `HDFS_TEST_RUNNING=1` and `HADOOP_CONF_DIR` pointing at
+`test/hdfs-conf`, then a few checks outside SQL (a same-size replacement isn't
+served from the external file cache; batched and unbatched listings agree;
+the Java client decrypts what DuckDB encrypted) and
+`hdfs_ez_no_provider.test`, and tears everything down. It fails if a
+`test/sql` file that requires `HDFS_TEST_RUNNING` wasn't run, so a new cluster
+test can't be skipped silently: add it to the script.
 
 The Kerberos suite: `test/scripts/run_kerberos_tests.sh [mode...]`.
 
 CI (`.github/workflows/Integration.yml`, Linux amd64) runs `make test_unit`,
-`make test`, both scripts, and `test/bench/run_bench.sh --check` on every push
-and pull request.
+`make test`, both scripts, and `test/bench/run_bench.sh --check` for every pull
+request and for pushes to `main` and `duckdb-review` (docs-only changes skip
+it).
 
 To keep the cluster up between runs, use `hdfs_up.sh` / `hdfs_down.sh` directly
 (see the project README).
