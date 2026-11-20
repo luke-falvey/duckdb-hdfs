@@ -36,6 +36,23 @@ SELECT count(*) FROM duckdb_logs_parsed('HDFS') WHERE duration_us IS NULL OR dur
 statement ok
 CALL truncate_duckdb_logs();
 
+# --- metadata-only reads -----------------------------------------------------------
+
+# read_blob without the content column needs only the file's status: the scan's stat answers it, and the file is
+# never opened (no getBlockLocations; in an encryption zone, no KMS call).
+query B
+SELECT size > 0 FROM read_blob('hdfs://localhost:9000/test/data.parquet');
+----
+true
+
+query TT
+SELECT op, path FROM duckdb_logs_parsed('HDFS');
+----
+getFileInfo	/test/data.parquet
+
+statement ok
+CALL truncate_duckdb_logs();
+
 # --- listings --------------------------------------------------------------------
 
 # A plain directory listing: one listing, however many entries (other test files may add some to /test).

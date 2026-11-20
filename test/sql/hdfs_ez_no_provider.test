@@ -22,3 +22,9 @@ query I
 SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/data.csv');
 ----
 3
+
+# Metadata only: answered from the file's status, without opening it, so no key is needed.
+query IB
+SELECT size > 0, last_modified IS NOT NULL FROM read_blob('hdfs://localhost:9000/ez/java_written.csv');
+----
+true	true

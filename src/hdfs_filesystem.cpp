@@ -665,17 +665,60 @@ timestamp_t HdfsFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	return hdfs_handle.mtime;
 }
 
+namespace {
+
+//! The version tag of a file: the same identity reader sharing uses (file id, mtime, length). A file replaced by
+//! one of the same length with its mtime kept (`hdfs dfs -cp -p`, `distcp -pt`) has a new inode id. With a tag,
+//! DuckDB's external file cache trusts it alone (no recently-modified margin), so it must tell those versions apart.
+string HdfsVersionTag(int64_t file_id, timestamp_t mtime, int64_t length) {
+	return std::to_string(file_id) + ":" + std::to_string(Timestamp::GetEpochMs(mtime)) + ":" + std::to_string(length);
+}
+
+} // namespace
+
 string HdfsFileSystem::GetVersionTag(FileHandle &handle) {
 	auto &hdfs_handle = handle.Cast<HdfsFileHandle>();
 	if (!hdfs_handle.reader) {
 		return string();
 	}
-	// The same identity reader sharing uses (file id, mtime, length): a file replaced by one of the same length with
-	// its mtime kept (`hdfs dfs -cp -p`, `distcp -pt`) has a new inode id. With a tag, DuckDB's external file cache
-	// trusts it alone (no recently-modified margin), so it must tell those versions apart.
-	return std::to_string(hdfs_handle.reader->FileId()) + ":" +
-	       std::to_string(Timestamp::GetEpochMs(GetLastModifiedTime(handle))) + ":" +
-	       std::to_string(hdfs_handle.length);
+	return HdfsVersionTag(hdfs_handle.reader->FileId(), GetLastModifiedTime(handle),
+	                      NumericCast<int64_t>(hdfs_handle.length));
+}
+
+FileType HdfsFileSystem::GetFileType(FileHandle &handle) {
+	return FileType::FILE_TYPE_REGULAR;
+}
+
+optional<FileMetadata> HdfsFileSystem::GetStatsIfExists(const OpenFileInfo &file, optional_ptr<FileOpener> opener) {
+	FileMetadata metadata;
+	idx_t file_size;
+	timestamp_t last_modified;
+	string type;
+	if (file.extended_info && file.extended_info->TryGetOption("file_size", file_size) &&
+	    file.extended_info->TryGetOption("last_modified", last_modified) &&
+	    (!file.extended_info->TryGetOption("type", type) || type == "file")) {
+		metadata.file_size = NumericCast<int64_t>(file_size);
+		metadata.last_modification_time = last_modified;
+		metadata.file_type = FileType::FILE_TYPE_REGULAR;
+		idx_t file_id;
+		if (file.extended_info->TryGetOption("hdfs_file_id", file_id)) {
+			metadata.file_id = file_id;
+			metadata.version_tag = HdfsVersionTag(NumericCast<int64_t>(file_id), last_modified, metadata.file_size);
+		}
+		return metadata;
+	}
+	HdfsEntry entry;
+	if (!TryStat(file.path, entry, opener)) {
+		return nullopt;
+	}
+	metadata.file_size = entry.size;
+	metadata.last_modification_time = entry.mtime;
+	metadata.file_type = entry.is_dir ? FileType::FILE_TYPE_DIR : FileType::FILE_TYPE_REGULAR;
+	if (entry.file_id > 0) {
+		metadata.file_id = NumericCast<idx_t>(entry.file_id);
+		metadata.version_tag = HdfsVersionTag(entry.file_id, entry.mtime, entry.size);
+	}
+	return metadata;
 }
 
 bool HdfsFileSystem::TryStat(const string &url, HdfsEntry &result, optional_ptr<FileOpener> opener) {

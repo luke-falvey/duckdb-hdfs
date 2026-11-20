@@ -133,6 +133,12 @@ public:
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override;
 	//! "<mtime>:<length>", so the external file cache validates without another RPC.
 	string GetVersionTag(FileHandle &handle) override;
+	//! Open handles are always files.
+	FileType GetFileType(FileHandle &handle) override;
+	//! Answered from the listing's status when `file` comes from a glob (no NameNode call), else by one stat; the
+	//! default would open the file (block locations, and a KMS call in an encryption zone) for metadata-only reads
+	//! such as `SELECT size FROM read_blob(...)`.
+	optional<FileMetadata> GetStatsIfExists(const OpenFileInfo &file, optional_ptr<FileOpener> opener) override;
 
 	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
