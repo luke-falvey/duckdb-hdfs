@@ -40,6 +40,10 @@ HDFS_TEST_RUNNING=1 \
 HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
 HADOOP_USER_NAME=hadoop \
     "${UNITTEST}" test/sql/hdfs_glob.test
+HDFS_TEST_RUNNING=1 \
+HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
+HADOOP_USER_NAME=hadoop \
+    "${UNITTEST}" test/sql/hdfs_edge.test
 
 echo "==> Running HDFS permission tests (as a non-superuser)..."
 # A separate run as a plain user: the superuser above bypasses HDFS permission
@@ -97,6 +101,18 @@ if [ "${actual}" != "${expected}" ]; then
     echo "ERROR: the Java client decrypted /ez/tmp.csv differently (md5 ${actual}, expected ${expected})" >&2
     exit 1
 fi
+echo "OK"
+
+echo "==> Checking the Java client reads DuckDB's multi-block encrypted writes..."
+# hdfs_edge.test writes the same bytes in and outside the zone, across 1 MiB blocks.
+for f in rows.csv 2097153.bin 1048576.bin 0.bin; do
+    plain="$(docker exec duckdb-hdfs-test bash -lc "set -o pipefail; hdfs dfs -cat /edge/duck/${f} | md5sum" | cut -d' ' -f1)"
+    encrypted="$(docker exec duckdb-hdfs-test bash -lc "set -o pipefail; hdfs dfs -cat /ez/edge/duck/${f} | md5sum" | cut -d' ' -f1)"
+    if [ "${plain}" != "${encrypted}" ]; then
+        echo "ERROR: the Java client decrypted /ez/edge/duck/${f} differently (md5 ${encrypted}, expected ${plain})" >&2
+        exit 1
+    fi
+done
 echo "OK"
 
 echo "==> Running encryption-zone tests without a key provider..."

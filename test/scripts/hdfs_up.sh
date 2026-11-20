@@ -86,6 +86,16 @@ docker exec "${CONTAINER}" bash -lc "
     hdfs dfs -chmod 700 /permtest/locked
 "
 
+# Edge-case fixtures for hdfs_edge.test, written by the Java client: an empty
+# file, a 1-byte file, and a file spanning several blocks (dfs.blocksize is
+# 1 MiB in test/docker/hdfs-site.xml).
+docker exec "${CONTAINER}" bash -lc "
+    hdfs dfs -mkdir -p /edge &&
+    hdfs dfs -touchz /edge/java_empty.bin &&
+    printf x > /tmp/one.bin && hdfs dfs -put -f /tmp/one.bin /edge/java_one.bin &&
+    seq 1 1000000 > /tmp/seq.txt && hdfs dfs -put -f /tmp/seq.txt /edge/java_seq.txt
+"
+
 # Encryption-zone fixtures: a KMS key, the zone /ez, and a file written (and so
 # encrypted) by the Java client, which hdfs.test reads back.
 echo "==> Waiting for the KMS..."
@@ -102,9 +112,11 @@ docker exec "${CONTAINER}" bash -lc "
     hadoop key create ezkey >/dev/null &&
     hdfs dfs -mkdir -p /ez &&
     hdfs crypto -createZone -keyName ezkey -path /ez &&
-    hdfs dfs -put -f /tmp/data.csv /ez/java_written.csv
+    hdfs dfs -put -f /tmp/data.csv /ez/java_written.csv &&
+    hdfs dfs -mkdir -p /ez/edge &&
+    hdfs dfs -put -f /tmp/seq.txt /ez/edge/java_seq.txt
 "
 
 echo "==> HDFS is ready. Fixtures:"
-docker exec "${CONTAINER}" hdfs dfs -ls -R /test /hidtest /permtest /ez
+docker exec "${CONTAINER}" hdfs dfs -ls -R /test /hidtest /permtest /edge /ez
 docker exec "${CONTAINER}" hdfs crypto -listZones

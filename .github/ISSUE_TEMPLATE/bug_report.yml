@@ -1,0 +1,70 @@
+name: Bug report
+description: Something in the hdfs extension doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check the README's "Not supported yet" list first. Leave out host names, principals and paths you
+        can't share; replace them with placeholders.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The query, what you expected, and the full error message.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: |
+        Ideally SQL that fails against the test cluster: `test/scripts/hdfs_up.sh`, then
+        `HADOOP_CONF_DIR=test/hdfs-conf HADOOP_USER_NAME=hadoop build/release/duckdb`. If it needs your cluster,
+        say what is special about it.
+      render: sql
+    validations:
+      required: true
+  - type: input
+    id: duckdb-version
+    attributes:
+      label: DuckDB version and extension build
+      description: "`SELECT version();`, and the extension's commit or where you installed it from."
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: e.g. linux_amd64, osx_arm64
+    validations:
+      required: true
+  - type: input
+    id: hadoop-version
+    attributes:
+      label: Hadoop version of the cluster
+      description: The NameNode's version (`hdfs version`), and whether a Router or proxy sits in front of it.
+    validations:
+      required: true
+  - type: dropdown
+    id: auth
+    attributes:
+      label: Authentication
+      options:
+        - simple
+        - kerberos
+    validations:
+      required: true
+  - type: input
+    id: protection
+    attributes:
+      label: Wire protection and other cluster features
+      description: |
+        `hadoop.rpc.protection`, `dfs.data.transfer.protection`, `dfs.encrypt.data.transfer`, and whether the paths
+        involve NameNode HA, erasure coding or an encryption zone.
+  - type: textarea
+    id: config
+    attributes:
+      label: Client configuration
+      description: How the connection is configured (`HADOOP_CONF_DIR`, an `hdfs` secret, environment variables), and
+        any relevant `core-site.xml` / `hdfs-site.xml` properties, with secrets removed.

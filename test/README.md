@@ -10,7 +10,13 @@ cluster used to exercise the `hdfs` extension end-to-end.
   error reporting. Runs as part of `make test`.
 - `sql/hdfs.test` — integration tests run against a real HDFS. Gated behind
   `require-env HDFS_TEST_RUNNING`, so `make test` skips them unless a cluster is
-  up.
+  up. The tests that need the parquet extension come last, after a late
+  `require parquet`, so the rest still run without it.
+- `sql/hdfs_edge.test` — boundaries: empty and 1-byte files, reads and writes
+  on either side of a block boundary and of the block locations prefetched on
+  open, multi-block files plain and in the encryption zone (with
+  `run_hdfs_tests.sh` checking that the Java client decrypts DuckDB's writes),
+  and overwrites. Its fixtures are under `/edge` and `/ez/edge`.
 - `sql/hdfs_permissions.test` — permission-error handling. Run separately with
   `HADOOP_USER_NAME=guest` (a non-superuser; the main suite's superuser bypasses
   HDFS permission checks and can never see an AccessControlException).
@@ -29,10 +35,17 @@ cluster used to exercise the `hdfs` extension end-to-end.
   wire-protection mode (`docker-kerberos/modes/`: none, integrity, privacy,
   aes, encrypt-key), and checks that the cluster refuses clients without the
   required protection.
-- `docker/` — a single-node HDFS (NameNode + DataNode) image + compose file.
+- `docker/` — a single-node HDFS (NameNode + DataNode + KMS) image + compose
+  file. Blocks are 1 MiB (`dfs.blocksize`), so small files span several.
 - `hdfs-conf/` — host-side Hadoop client config (`core-site.xml` /
   `hdfs-site.xml`) for talking to that cluster. Pointed at via `HADOOP_CONF_DIR`.
-- `scripts/` — `hdfs_up.sh`, `hdfs_down.sh`, and `run_hdfs_tests.sh`.
+  It sets the same 1 MiB block size for DuckDB's writes and fetches the
+  locations of only 2 blocks on open (`dfs.prefetchsize`), so reads past 2 MiB
+  fetch more.
+- `scripts/` — `hdfs_up.sh`, `hdfs_down.sh`, `run_hdfs_tests.sh` and
+  `run_kerberos_tests.sh`.
+- `bench/` — a benchmark of wall times and NameNode RPC counts; see
+  [bench/README.md](bench/README.md).
 
 ## Running
 
@@ -50,9 +63,19 @@ test/scripts/run_hdfs_tests.sh
 ```
 
 This builds the HDFS image, starts the cluster, seeds fixtures under `/test`,
-`/hidtest`, `/permtest` and the encryption zone `/ez`, runs `test/sql/hdfs.test` (as the superuser) and
-`test/sql/hdfs_permissions.test` (as a plain user) with `HDFS_TEST_RUNNING=1`
-and `HADOOP_CONF_DIR` pointing at `test/hdfs-conf`, then tears everything down.
+`/hidtest`, `/permtest`, `/edge` and the encryption zone `/ez`, runs
+`test/sql/hdfs.test`, `hdfs_glob.test` and `hdfs_edge.test` (as the superuser)
+and `test/sql/hdfs_permissions.test` (as a plain user) with
+`HDFS_TEST_RUNNING=1` and `HADOOP_CONF_DIR` pointing at `test/hdfs-conf`, then
+a few checks outside SQL (batched and unbatched listings agree; the Java client
+decrypts what DuckDB encrypted) and `hdfs_ez_no_provider.test`, and tears
+everything down.
+
+The Kerberos suite: `test/scripts/run_kerberos_tests.sh [mode...]`.
+
+CI (`.github/workflows/Integration.yml`, Linux amd64) runs `make test_unit`,
+`make test`, both scripts, and `test/bench/run_bench.sh --check` on every push
+and pull request.
 
 To keep the cluster up between runs, use `hdfs_up.sh` / `hdfs_down.sh` directly
 (see the project README).
