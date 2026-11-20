@@ -10,8 +10,9 @@ require hdfs
 
 # --- enable_external_access = false -------------------------------------------------
 
+# '/data/' is a local directory: it must not grant access to /data on HDFS.
 statement ok
-SET allowed_directories = ['hdfs://127.0.0.1:1/allowed'];
+SET allowed_directories = ['hdfs://127.0.0.1:1/allowed', '/data/'];
 
 statement ok
 SET allowed_paths = ['hdfs://127.0.0.1:1/one.csv'];
@@ -54,10 +55,54 @@ SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
 ----
 Permission Error: Cannot access path "hdfs://127.0.0.1:1/data" - file system operations are disabled by configuration
 
+# Only hdfs:// URLs are accepted. A scheme-less path would be a path on fs.defaultFS that the allowed_directories
+# check judges as a local path: with '/tmp/' allowed for local files, hdfs_ls('/tmp') would list HDFS /tmp.
 statement error
 SELECT * FROM hdfs_stat('/data');
 ----
-Permission Error: Cannot access path "/data" - file system operations are disabled by configuration
+Invalid Input Error: hdfs_stat: '/data' is not an hdfs:// URL (use hdfs:///path for a path on fs.defaultFS)
+
+statement error
+SELECT * FROM hdfs_ls('/data/x');
+----
+Invalid Input Error: hdfs_ls: '/data/x' is not an hdfs:// URL (use hdfs:///path for a path on fs.defaultFS)
+
+statement error
+SELECT hdfs_exists('/data/x');
+----
+Invalid Input Error: hdfs_exists: '/data/x' is not an hdfs:// URL (use hdfs:///path for a path on fs.defaultFS)
+
+statement error
+SELECT * FROM hdfs_ls('');
+----
+Invalid Input Error: hdfs_ls: '' is not an hdfs:// URL (use hdfs:///path for a path on fs.defaultFS)
+
+statement error
+SELECT hdfs_exists('s3://bucket/x');
+----
+Invalid Input Error: hdfs_exists: 's3://bucket/x' is not an hdfs:// URL (use hdfs:///path for a path on fs.defaultFS)
+
+# DuckDB doesn't canonicalize remote paths before the allowed_directories check, so a '..' component passes it;
+# it is refused before any connection is made (HDFS forbids '.' and '..' in names anyway).
+statement error
+SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/allowed/../secret');
+----
+Invalid Input Error: HDFS path 'hdfs://127.0.0.1:1/allowed/../secret' has a '..' component; HDFS paths cannot contain '.' or '..'
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/../secret/*.csv');
+----
+Invalid Input Error: HDFS path 'hdfs://127.0.0.1:1/allowed/../secret/*.csv' has a '..' component; HDFS paths cannot contain '.' or '..'
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/./a');
+----
+Invalid Input Error: HDFS path 'hdfs://127.0.0.1:1/allowed/./a' has a '.' component; HDFS paths cannot contain '.' or '..'
+
+statement error
+SELECT * FROM read_csv('hdfs://127.0.0.1:1/allowed/../secret.csv');
+----
+<REGEX>:.*Invalid Input Error.*has a '\.\.' component.*
 
 # An allowed directory is a whole path component: a sibling with the same prefix is refused.
 statement error

@@ -176,6 +176,8 @@ public:
 	idx_t ResetConnections();
 
 	bool CanHandleFile(const string &fpath) override;
+	//! Whether `path` is an hdfs:// URL (the paths this file system handles).
+	static bool IsHdfsUrl(const string &path);
 	string GetName() const override {
 		return "HdfsFileSystem";
 	}

@@ -30,7 +30,7 @@ namespace {
 
 //! Split a URL into its authority ("hdfs://host:port", or "" for the default FS) and the scheme-less path ("/a/b").
 //! Inputs without the hdfs:// scheme are a path on the default FS.
-void ParseHdfsPath(const string &path, string &authority, string &hdfs_path) {
+void ParseHdfsUrl(const string &path, string &authority, string &hdfs_path) {
 	const string scheme = "hdfs://";
 	if (path.rfind(scheme, 0) != 0) {
 		authority = "";
@@ -50,6 +50,30 @@ void ParseHdfsPath(const string &path, string &authority, string &hdfs_path) {
 		authority = path.substr(0, slash_pos);
 		hdfs_path = path.substr(slash_pos);
 	}
+}
+
+//! Refuse a path with a "." or ".." component. HDFS forbids them in names, and DuckDB doesn't canonicalize remote
+//! paths before its allowed_directories check, so "hdfs://nn/allowed/../x" would otherwise pass that check.
+void CheckNoDotComponents(const string &url, const string &hdfs_path) {
+	idx_t start = 0;
+	while (start <= hdfs_path.size()) {
+		auto slash = hdfs_path.find('/', start);
+		if (slash == string::npos) {
+			slash = hdfs_path.size();
+		}
+		auto length = slash - start;
+		if ((length == 1 || length == 2) && hdfs_path.compare(start, length, string(length, '.')) == 0) {
+			throw InvalidInputException("HDFS path '%s' has a '%s' component; HDFS paths cannot contain '.' or '..'",
+			                            url, hdfs_path.substr(start, length));
+		}
+		start = slash + 1;
+	}
+}
+
+//! ParseHdfsUrl, refusing "." and ".." components.
+void ParseHdfsPath(const string &path, string &authority, string &hdfs_path) {
+	ParseHdfsUrl(path, authority, hdfs_path);
+	CheckNoDotComponents(path, hdfs_path);
 }
 
 //! Reattach an authority to a scheme-less path.
@@ -1018,7 +1042,11 @@ unique_ptr<HdfsListStream> HdfsFileSystem::OpenGlobStream(const string &url, Hdf
 }
 
 bool HdfsFileSystem::CanHandleFile(const string &fpath) {
-	return StringUtil::StartsWith(fpath, "hdfs://");
+	return IsHdfsUrl(fpath);
+}
+
+bool HdfsFileSystem::IsHdfsUrl(const string &path) {
+	return StringUtil::StartsWith(path, "hdfs://");
 }
 
 namespace {
