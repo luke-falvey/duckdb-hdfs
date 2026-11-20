@@ -16,8 +16,11 @@ cluster used to exercise the `hdfs` extension end-to-end.
   HDFS permission checks and can never see an AccessControlException).
 - `sql/hdfs_ez_no_provider.test` — encrypted files without a key provider
   configured (run by `run_hdfs_tests.sh` with a stripped client config).
-- `cpp/hdfs_glob_test.cpp`, `cpp/hdfs_crypto_test.cpp` — unit tests for the
-  glob engine and the encryption helpers (`make test_unit`).
+- `sql/hdfs_glob.test` — glob semantics (wildcards, classes, `**`, braces,
+  hidden names) against a fixture tree it creates under `/globtest`.
+- `cpp/hdfs_crypto_test.cpp`, `cpp/hdfs_batch_test.cpp` — C++ unit tests for
+  the encryption helpers and batched-listing rejection handling
+  (`make test_unit`, after `make`).
 - `sql/hdfs_kerberos.test`, `sql/hdfs_kerberos_no_ticket.test` — a
   Kerberos-secured cluster, with and without a ticket. Run by
   `scripts/run_kerberos_tests.sh`, which starts `docker-kerberos/` (an MIT KDC

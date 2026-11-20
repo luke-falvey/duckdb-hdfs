@@ -31,11 +31,15 @@ echo "==> Running HDFS integration tests..."
 cd "${REPO_ROOT}"
 # HADOOP_CONF_DIR provides client config; HADOOP_USER_NAME makes us the owner of
 # the hadoop-owned /test dir so the write tests are permitted. Both are the
-# standard Hadoop env vars that hdfs-native reads natively.
+# standard Hadoop env vars the extension reads, as the Hadoop CLI does.
 HDFS_TEST_RUNNING=1 \
 HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
 HADOOP_USER_NAME=hadoop \
     "${UNITTEST}" test/sql/hdfs.test
+HDFS_TEST_RUNNING=1 \
+HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
+HADOOP_USER_NAME=hadoop \
+    "${UNITTEST}" test/sql/hdfs_glob.test
 
 echo "==> Running HDFS permission tests (as a non-superuser)..."
 # A separate run as a plain user: the superuser above bypasses HDFS permission

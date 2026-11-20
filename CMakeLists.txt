@@ -16,7 +16,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(src/include)
 
 # The native HDFS client (ClickHouse's libhdfs3), built by the overlay port in
-# vcpkg_ports/libhdfs3. Only src/hdfs_bridge.cpp includes its headers.
+# vcpkg_ports/libhdfs3. Only src/hdfs_client.cpp includes its headers.
 find_package(libhdfs3 CONFIG REQUIRED)
 # Encryption zones: AES-CTR (OpenSSL) and the KMS REST client (libcurl).
 find_package(OpenSSL REQUIRED)
@@ -24,7 +24,7 @@ find_package(CURL CONFIG REQUIRED)
 
 set(EXTENSION_SOURCES
     src/hdfs_extension.cpp src/hdfs_filesystem.cpp src/hdfs_functions.cpp
-    src/hdfs_bridge.cpp src/hdfs_crypto.cpp src/hdfs_glob.cpp)
+    src/hdfs_client.cpp src/hdfs_crypto.cpp src/hdfs_glob.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

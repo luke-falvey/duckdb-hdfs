@@ -17,6 +17,7 @@ vcpkg_from_github(
         fewer-round-trips.patch
         peer-cache.patch
         batched-listing.patch
+        wire-encryption-fixes.patch
 )
 
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/cmake/CMakeLists.txt" DESTINATION "${SOURCE_PATH}/vcpkg-build")

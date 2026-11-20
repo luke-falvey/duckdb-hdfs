@@ -25,6 +25,17 @@ SELECT * FROM read_csv('hdfs://localhost:9000/permtest/**/*.csv');
 ----
 Permission denied
 
+# A walk that fails while other workers are still listing must stop cleanly
+# (repeated: the teardown used to race with workers starting new threads).
+loop i 0 20
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://localhost:9000/permtest/**');
+----
+Permission denied
+
+endloop
+
 # Opting in prunes the forbidden subtree and keeps everything readable. The
 # locked directory itself still appears: its name comes from the parent's
 # (permitted) listing; only its contents are unknown.

@@ -246,6 +246,7 @@ data.parquet	file
 statement error
 SELECT * FROM hdfs_stat('hdfs://localhost:9000/test/does_not_exist');
 ----
+Failed to stat HDFS path 'hdfs://localhost:9000/test/does_not_exist'
 
 # hdfs_exists is a scalar boolean predicate (true for files and directories).
 query I
@@ -262,6 +263,95 @@ query I
 SELECT count(*) FROM range(1) WHERE hdfs_exists('hdfs://localhost:9000/test/does_not_exist');
 ----
 0
+
+# A walk abandoned after the first row (LIMIT) stops its workers cleanly; the
+# loop repeats it because teardown used to race with workers starting threads.
+loop i 0 20
+
+query I
+SELECT count(*) FROM (SELECT path FROM hdfs_ls('hdfs://localhost:9000/**', include_hidden := true) LIMIT 1);
+----
+1
+
+endloop
+
+# More rows than one output vector (2048): 1,100 partition directories, each
+# holding one file.
+statement ok
+COPY (SELECT range AS p, range AS v FROM range(1100)) TO 'hdfs://localhost:9000/many' (FORMAT csv, PARTITION_BY (p));
+
+query III
+SELECT count(*), count(*) FILTER (type = 'directory'), count(DISTINCT path) FROM hdfs_ls('hdfs://localhost:9000/many/**');
+----
+2200	1100	2200
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/many/*/*.csv');
+----
+1100
+
+query I
+SELECT count(*) FROM (SELECT * FROM hdfs_ls('hdfs://localhost:9000/many/**') LIMIT 0);
+----
+0
+
+# The same walk listing one directory per NameNode call.
+statement ok
+SET hdfs_batched_listing = false;
+
+query II
+SELECT count(*), count(*) FILTER (type = 'directory') FROM hdfs_ls('hdfs://localhost:9000/many/**');
+----
+2200	1100
+
+query I
+SELECT count(*) FROM glob('hdfs://localhost:9000/many/*/*.csv');
+----
+1100
+
+statement ok
+RESET hdfs_batched_listing;
+
+# Glob results come back sorted by path, as with local globs, although the
+# walk lists directories in parallel.
+query I
+SELECT list(file) = list_sort(list(file)) FROM glob('hdfs://localhost:9000/many/*/*.csv');
+----
+true
+
+# A file whose name contains glob characters: the pattern matches nothing, so
+# the path is taken literally (as DuckDB's local glob does).
+statement ok
+COPY (SELECT 42 AS v) TO 'hdfs://localhost:9000/lit/data[1].csv' (FORMAT csv, HEADER);
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:9000/lit/data[1].csv');
+----
+42
+
+# A long walk stops at the query deadline (one listing call at a time, so it
+# is still running when the deadline passes).
+statement ok
+SET hdfs_list_parallelism = 1;
+
+statement ok
+SET max_execution_time = 1;
+
+statement error
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/many/**');
+----
+Query exceeded maximum execution time
+
+statement error
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/many/*/*.csv');
+----
+Query exceeded maximum execution time
+
+statement ok
+RESET max_execution_time;
+
+statement ok
+RESET hdfs_list_parallelism;
 
 # --- hidden entries (/hidtest fixtures) ---------------------------------------
 # Names starting with '_' or '.' (Hadoop's hidden convention) are excluded from
@@ -490,6 +580,7 @@ RESET threads;
 statement error
 SELECT * FROM read_parquet('hdfs://localhost:9000/.reserved/raw/ez/roundtrip.parquet');
 ----
+No magic bytes found at end of file
 
 # CTR encryption keeps the size: the plaintext and stored sizes match.
 query I
@@ -512,9 +603,8 @@ SELECT v FROM read_csv('hdfs://localhost:9000/ez/tmp.csv');
 
 # --- caching and read paths ----------------------------------------------------
 
-# A file overwritten between two scans is re-read, not served from DuckDB's
-# external file cache (validated by modification time and size). Both versions
-# have the same size, so only the modification time tells them apart.
+# DuckDB counts hdfs:// as a local scheme, so its external file cache keeps
+# HDFS reads only with cache_local_files.
 statement ok
 SET enable_external_file_cache = true;
 
@@ -526,6 +616,28 @@ SELECT v FROM read_parquet('hdfs://localhost:9000/test/cache.parquet');
 ----
 1
 
+query I
+SELECT count(*) FROM duckdb_external_file_cache() WHERE path LIKE 'hdfs://%/test/cache.parquet';
+----
+0
+
+statement ok
+SET cache_local_files = true;
+
+query I
+SELECT v FROM read_parquet('hdfs://localhost:9000/test/cache.parquet');
+----
+1
+
+query I
+SELECT count(*) > 0 FROM duckdb_external_file_cache() WHERE path LIKE 'hdfs://%/test/cache.parquet';
+----
+true
+
+# A file overwritten between two scans is re-read, not served from the cache
+# (validated by modification time and size). Both versions have the same
+# size, so only the modification time tells them apart.
+
 statement ok
 COPY (SELECT 2 AS v) TO 'hdfs://localhost:9000/test/cache.parquet' (FORMAT parquet);
 
@@ -533,6 +645,9 @@ query I
 SELECT v FROM read_parquet('hdfs://localhost:9000/test/cache.parquet');
 ----
 2
+
+statement ok
+RESET cache_local_files;
 
 # A CSV larger than DuckDB's read buffer: one thread reads it front to back,
 # several threads read it at scattered offsets on shared streams; both must
@@ -581,9 +696,65 @@ SELECT count(DISTINCT md5(content)) FROM read_blob(['hdfs://localhost:9000/test/
 statement ok
 RESET threads;
 
+# --- hdfs secrets -------------------------------------------------------------------
+
+# A secret scoped to /permtest acts as the unprivileged user "guest" there,
+# while the rest of the cluster keeps the environment's (super)user.
+statement ok
+CREATE SECRET as_guest (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest', USER 'guest');
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
+----
+Permission denied
+
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/permtest/open');
+----
+1
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/data.csv');
+----
+3
+
+statement ok
+DROP SECRET as_guest;
+
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
+----
+1
+
+# --- logging --------------------------------------------------------------------
+
+# Opens, reads, writes and closes show up in DuckDB's FileSystem log.
+statement ok
+CALL enable_logging('FileSystem');
+
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/logged.csv' (FORMAT csv);
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/logged.csv');
+----
+1
+
+query II
+SELECT DISTINCT fs, op FROM duckdb_logs_parsed('FileSystem') WHERE path = 'hdfs://localhost:9000/test/logged.csv' ORDER BY op;
+----
+HdfsFileSystem	CLOSE
+HdfsFileSystem	OPEN
+HdfsFileSystem	READ
+HdfsFileSystem	WRITE
+
+statement ok
+CALL disable_logging();
+
 # --- error handling ----------------------------------------------------------
 
 # Opening a non-existent file surfaces a clear IO error.
 statement error
 SELECT * FROM read_csv('hdfs://localhost:9000/test/does_not_exist.csv');
 ----
+No files found that match the pattern "hdfs://localhost:9000/test/does_not_exist.csv"

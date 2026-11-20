@@ -1,42 +1,27 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// hdfs_filesystem.hpp
+//
+//===----------------------------------------------------------------------===//
+
 #pragma once
 
 #include "duckdb/common/file_system.hpp"
-#include "hdfs_bridge.h"
-
-#include <memory>
-#include <mutex>
-#include <unordered_map>
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/unordered_map.hpp"
+#include "hdfs_client.hpp"
 
 namespace duckdb {
 
-// Implementation details defined in hdfs_filesystem.cpp.
-struct BridgeStatus;  // RAII wrapper around hdfs_status_t.
-class HdfsConnection; // A reconnectable, lazily-established client for one authority.
-class HdfsFileSystem;
+class HdfsConnection;
 
-// Default for the hdfs_list_parallelism setting (registered in
-// hdfs_extension.cpp); also the fallback when no setting context is available.
-static constexpr uint64_t DEFAULT_HDFS_LIST_PARALLELISM = 16;
+//! Default for the hdfs_list_parallelism setting.
+static constexpr idx_t DEFAULT_HDFS_LIST_PARALLELISM = 16;
 
-// Per-walk behavior toggles for listings and globs; the defaults mirror the
-// hdfs_skip_permission_errors / hdfs_include_hidden settings' defaults.
-struct HdfsWalkOptions {
-	// Prune subtrees whose listing fails with a permission error instead of
-	// failing the walk. Only applies below the walk root: an error on the
-	// path/pattern-root the caller named always surfaces.
-	bool skip_permission_errors = false;
-	// Return entries whose name starts with '.' or '_' (Hadoop's hidden
-	// convention). When false, hidden entries are neither returned nor
-	// descended into, except where a glob component names them explicitly
-	// (e.g. '_temporary' or '_*') or the entry is itself the listed path.
-	bool include_hidden = false;
-};
-
-// A fully-resolved metadata row for one HDFS path, backing the hdfs_ls /
-// hdfs_stat table functions. `url` carries the authority back
-// (e.g. "hdfs://host:port/a/b"); `name` is the basename. `replication` and
-// `block_size` are -1 when not applicable (HDFS leaves them unset for
-// directories); `mtime`/`atime` are epoch milliseconds.
+//! A metadata row for one HDFS path (hdfs_ls / hdfs_stat). `url` carries the authority ("hdfs://host:port/a/b");
+//! `name` is the basename. `replication` and `block_size` are -1 for directories.
 struct HdfsEntry {
 	string url;
 	string name;
@@ -47,79 +32,64 @@ struct HdfsEntry {
 	uint16_t permission = 0;
 	int32_t replication = -1;
 	int64_t block_size = -1;
-	uint64_t mtime = 0;
-	uint64_t atime = 0;
+	timestamp_t mtime;
+	timestamp_t atime;
 };
 
 struct HdfsFileHandle : public FileHandle {
-	HdfsFileHandle(FileSystem &fs, string path, FileOpenFlags flags, std::shared_ptr<hdfs_client_t> client,
-	               hdfs_reader_t *reader, hdfs_writer_t *writer)
-	    : FileHandle(fs, std::move(path), std::move(flags)), client(std::move(client)), reader(reader), writer(writer) {
+public:
+	HdfsFileHandle(FileSystem &fs, string path, FileOpenFlags flags, shared_ptr<HdfsClient> client,
+	               shared_ptr<HdfsReader> reader, unique_ptr<HdfsWriter> writer)
+	    : FileHandle(fs, std::move(path), flags), client(std::move(client)), reader(std::move(reader)),
+	      writer(std::move(writer)) {
 	}
-
 	~HdfsFileHandle() override {
-		// Close() can throw (a writer flush may fail). A destructor must not
-		// propagate, so swallow here; explicit Close() surfaces the error.
+		// Close() can throw (a writer flush may fail); an explicit Close() surfaces the error.
 		try {
 			HdfsFileHandle::Close();
-		} catch (...) { // NOLINT: intentional - destructors must not throw
+		} catch (...) { // NOLINT: destructors must not throw
 		}
 	}
 
-	void Close() override;
-
-	// The client this handle was opened on. Held so the reader/writer can
-	// never outlive it: a connection-level retry may drop the filesystem's
-	// cached client (see HdfsConnection::Invalidate) while this handle is
-	// still open.
-	std::shared_ptr<hdfs_client_t> client;
-	hdfs_reader_t *reader = nullptr;
-	hdfs_writer_t *writer = nullptr;
-	// Cursor for the streaming Read/Write/Seek interface.
+	//! The client the handle was opened on: a reconnect may replace the filesystem's client while it is open.
+	shared_ptr<HdfsClient> client;
+	shared_ptr<HdfsReader> reader;
+	unique_ptr<HdfsWriter> writer;
+	//! Cursor for the streaming Read/Write/Seek interface.
 	idx_t position = 0;
-	// Cached length for readers; bytes written so far for writers.
+	//! The file length for readers; bytes written so far for writers.
 	idx_t length = 0;
-	// Modification time, known from the listing that found the file (or
-	// fetched once on first use), so cache validation costs no RPC.
+	//! The modification time, from the listing that found the file or fetched once.
 	bool has_mtime = false;
 	timestamp_t mtime;
+
+public:
+	void Close() override;
 };
 
-// A streaming listing or glob backing hdfs_ls: a background walk
-// in the bridge produces entries while Next() hands them out in batches, so
-// rows flow before a large tree is fully walked. Walks touching more than one
-// directory fan out up to `max_parallelism` concurrent listing RPCs and
-// deliver entries in completion order (no global ordering guarantee). Not
-// thread-safe: drive from one thread at a time. Created via
-// HdfsFileSystem::OpenListStream() / OpenGlobStream().
+//! A listing or glob running in the background (backs hdfs_ls): entries arrive in batches while the walk
+//! continues, in no particular order. Not thread-safe.
 class HdfsListStream {
 public:
-	~HdfsListStream();
-	HdfsListStream(const HdfsListStream &) = delete;
-	HdfsListStream &operator=(const HdfsListStream &) = delete;
+	HdfsListStream(HdfsConnection &connection, string url, bool glob, HdfsWalkOptions options);
 
-	// Replace `out` with the next batch (at most max_entries), blocking until
-	// at least one entry arrives. Returns false when the listing is exhausted
-	// (`out` left empty). Throws on listing errors; a connection-level failure
-	// is transparently retried once, but only while no entries have been
-	// handed out yet (afterwards a restart would duplicate them).
-	bool Next(vector<HdfsEntry> &out, idx_t max_entries);
+	//! Replace `out` with the next batch (at most `max_entries`), blocking until one arrives. Returns false at the
+	//! end. A connection failure is retried once while no entries have been handed out yet. With a `context`, the
+	//! wait checks for interrupts, so the query can be cancelled during a long walk.
+	bool Next(vector<HdfsEntry> &out, idx_t max_entries, optional_ptr<ClientContext> context = nullptr);
 
 private:
-	friend class HdfsFileSystem;
-	HdfsListStream() = default;
-	// (Re)establish the client and open the bridge stream.
 	void Open();
 
-	string url;       // original URL, for error messages
-	string authority; // "hdfs://host:port", or "" for the default FS
-	string hdfs_path; // scheme-less path (a pattern when `glob`)
-	bool glob = false;
-	int32_t max_parallelism = 1;
-	HdfsWalkOptions options;
-	HdfsConnection *conn = nullptr; // owned by the filesystem, which outlives us
-	std::shared_ptr<hdfs_client_t> client;
-	hdfs_list_stream_t *handle = nullptr;
+	HdfsConnection &connection;
+	const string url;
+	string authority;
+	string hdfs_path;
+	const bool glob;
+	const HdfsWalkOptions options;
+	shared_ptr<HdfsClient> client;
+	unique_ptr<HdfsWalk> walk;
+	vector<HdfsFileStatus> batch;
 	bool emitted_any = false;
 	bool retried = false;
 };
@@ -129,10 +99,10 @@ public:
 	HdfsFileSystem();
 	~HdfsFileSystem() override;
 
+public:
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener = nullptr) override;
-	// Like OpenFile, but uses the size/mtime a listing already returned
-	// (OpenFileInfo::extended_info) instead of asking the NameNode again.
+	//! Uses the size/mtime a listing returned (OpenFileInfo::extended_info) instead of asking again.
 	unique_ptr<FileHandle> OpenFileExtended(const OpenFileInfo &file, FileOpenFlags flags,
 	                                        optional_ptr<FileOpener> opener) override;
 	bool SupportsOpenFileExtended() const override {
@@ -150,26 +120,20 @@ public:
 
 	int64_t GetFileSize(FileHandle &handle) override;
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override;
-	// "<mtime>:<length>": lets DuckDB's external file cache validate cached
-	// reads without another RPC.
+	//! "<mtime>:<length>", so the external file cache validates without another RPC.
 	string GetVersionTag(FileHandle &handle) override;
 
 	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
-	// The option-taking variants DuckDB's COPY uses to create and clean up its
-	// output directories. CreateDirectoryExtended reports whether this call
-	// created the directory (HDFS mkdirs also creates missing parents, so SINGLE
-	// behaves like RECURSIVE). RemoveDirectoryExtended in SINGLE mode removes
-	// only an existing, empty directory and returns false otherwise.
+	//! HDFS mkdirs creates missing parents, so SINGLE behaves like RECURSIVE.
 	bool CreateDirectoryExtended(const string &directory, const CreateDirectoryOptions &options,
 	                             optional_ptr<FileOpener> opener = nullptr) override;
+	//! SINGLE removes only an existing, empty directory.
 	bool RemoveDirectoryExtended(const string &directory, const RemoveDirectoryOptions &options,
 	                             optional_ptr<FileOpener> opener = nullptr) override;
-	// Extended listing: each entry carries type/size/last-modified in
-	// OpenFileInfo::extended_info, so DuckDB doesn't re-stat per file. The base
-	// FileSystem::ListFiles(name, is_dir) overload routes through this.
+	//! Each entry carries type/size/last-modified in OpenFileInfo::extended_info.
 	bool ListFilesExtended(const string &directory, const std::function<void(OpenFileInfo &info)> &callback,
 	                       optional_ptr<FileOpener> opener) override;
 	bool SupportsListFilesExtended() const override {
@@ -177,36 +141,29 @@ public:
 	}
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
-	// HDFS has no mid-stream flush in the sync API; data is durable on Close().
+	//! Durability comes with closing the writer (HdfsWriter::Close).
 	void FileSync(FileHandle &handle) override {
 	}
-	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override;
+	//! Globs (with Hadoop-style {a,b} alternation) run as a parallel walk; see HdfsGlobResult.
+	unique_ptr<MultiFileList> GlobFilesExtended(const string &path, const FileGlobInput &input,
+	                                            optional_ptr<FileOpener> opener = nullptr) override;
+	bool SupportsGlobExtended() const override {
+		return true;
+	}
 
-	// Rich-metadata accessors backing the SQL metadata functions. Unlike Glob()
-	// (which drops directories and exposes only type/size/mtime), these carry the
-	// full FileStatus and keep directory entries.
-	//
-	// OpenListStream: streaming listing of `url`'s immediate children; a file
-	//   path yields that single entry. The path is taken literally.
-	// OpenGlobStream: streaming glob of a wildcard `url`; matched entries are
-	//   returned themselves, directories included. Throws on an invalid
-	//   pattern; a pattern matching nothing yields an empty stream.
-	// Stat: metadata for a single `url` (file or directory).
-	//
-	// `max_parallelism` bounds the concurrent listing RPCs of walks that touch
-	// more than one directory (the hdfs_list_parallelism setting); `options`
-	// carries the hidden-entry and permission-error behavior (see
-	// HdfsWalkOptions).
-	unique_ptr<HdfsListStream> OpenListStream(const string &url, int32_t max_parallelism = 1,
-	                                          HdfsWalkOptions options = {});
-	unique_ptr<HdfsListStream> OpenGlobStream(const string &url, int32_t max_parallelism = 1,
-	                                          HdfsWalkOptions options = {});
-	HdfsEntry Stat(const string &url);
-	// True if `url` exists (file or directory); a single stat RPC.
-	bool Exists(const string &url);
+	//! Metadata for the SQL functions. Unlike globs, these keep directories and the full file status.
+	//! OpenListStream lists `url`'s children (a file lists as itself); OpenGlobStream returns the entries a pattern
+	//! matches (throws for an invalid pattern). The `opener` finds the hdfs secret for the URL.
+	unique_ptr<HdfsListStream> OpenListStream(const string &url, HdfsWalkOptions options,
+	                                          optional_ptr<FileOpener> opener);
+	unique_ptr<HdfsListStream> OpenGlobStream(const string &url, HdfsWalkOptions options,
+	                                          optional_ptr<FileOpener> opener);
+	HdfsEntry Stat(const string &url, optional_ptr<FileOpener> opener);
+	//! Whether `url` exists (file or directory).
+	bool Exists(const string &url, optional_ptr<FileOpener> opener);
 
 	bool CanHandleFile(const string &fpath) override;
-	std::string GetName() const override {
+	string GetName() const override {
 		return "HdfsFileSystem";
 	}
 	bool CanSeek() override {
@@ -217,28 +174,19 @@ public:
 	}
 
 private:
-	// Look up (or create) the connection for the given authority
-	// (e.g. "hdfs://namenode:8020", or "" for the configured default FS).
-	// Connections are created once and reused; the returned reference is stable.
-	HdfsConnection &GetConnection(const string &authority);
+	//! The configuration of the hdfs secret matching `url` (empty without one).
+	static HdfsConnectionConfig LookupConfig(const string &url, optional_ptr<FileOpener> opener);
+	//! The connection for `url`: its authority ("hdfs://host:port", or "" for the default FS) and the configuration
+	//! of the hdfs secret matching it. Created once, never removed.
+	HdfsConnection &GetConnection(const string &url, const string &authority, optional_ptr<FileOpener> opener);
+	//! `expected_length`: the size a listing reported (-1 if unknown).
+	unique_ptr<FileHandle> OpenFileInternal(const string &path, FileOpenFlags flags, optional_ptr<FileOpener> opener,
+	                                        int64_t expected_length);
+	//! Status of `url`, or false if it doesn't exist.
+	bool TryStat(const string &url, HdfsFileStatus &result, optional_ptr<FileOpener> opener);
 
-	// Run `op(client, &status)` against a live client for `authority`; `op`
-	// receives the shared_ptr keeping that client alive and returns true on
-	// success. An `op` handing out a resource tied to the client (a reader or
-	// writer) must copy the shared_ptr alongside it. If the first attempt fails
-	// with a connection-level error (stale client after a NameNode failover, a
-	// dropped socket, an expired ticket), the connection is invalidated and `op`
-	// is retried once on a freshly established client. The final outcome is
-	// left in `status` (OK on success, otherwise the last failure with its
-	// category and message). A failure to (re)connect propagates as an
-	// IOException.
-	template <class FN>
-	void Execute(const string &authority, BridgeStatus &status, FN &&op);
-
-	// Guards only insertion/lookup into `connections`; entries are never erased,
-	// so the per-connection lock (inside HdfsConnection) covers (re)connection.
-	std::mutex connections_mutex;
-	std::unordered_map<string, unique_ptr<HdfsConnection>> connections;
+	mutex connections_lock;
+	unordered_map<string, unique_ptr<HdfsConnection>> connections;
 };
 
 } // namespace duckdb

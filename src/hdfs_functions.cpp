@@ -3,56 +3,53 @@
 #include "hdfs_filesystem.hpp"
 
 #include "duckdb/common/file_opener.hpp"
-#include "duckdb/common/limits.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/vector_writer.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
 namespace duckdb {
 
 namespace {
 
-// Which HDFS metadata call a hdfs_ls / hdfs_stat table function invocation
-// maps to. Both share one output schema and execution path; only the backing
-// RPC differs.
+//! Which call an hdfs_ls / hdfs_stat invocation makes; both share one schema and execution path.
 enum class HdfsMetaOp { LIST, STAT };
 
-// Carries the borrowed filesystem and the operation into a table function's
-// bind, via TableFunction::function_info.
 struct HdfsTableFunctionInfo : public TableFunctionInfo {
-	HdfsTableFunctionInfo(HdfsFileSystem *hdfs, HdfsMetaOp op) : hdfs(hdfs), op(op) {
+	HdfsTableFunctionInfo(HdfsFileSystem &hdfs, HdfsMetaOp op) : hdfs(hdfs), op(op) {
 	}
-	HdfsFileSystem *hdfs;
+
+	reference<HdfsFileSystem> hdfs;
 	HdfsMetaOp op;
 };
 
-// Same, for the hdfs_exists scalar function.
 struct HdfsScalarFunctionInfo : public ScalarFunctionInfo {
-	explicit HdfsScalarFunctionInfo(HdfsFileSystem *hdfs) : hdfs(hdfs) {
+	explicit HdfsScalarFunctionInfo(HdfsFileSystem &hdfs) : hdfs(hdfs) {
 	}
-	HdfsFileSystem *hdfs;
+
+	reference<HdfsFileSystem> hdfs;
 };
 
-// Column layout shared by hdfs_ls / hdfs_stat.
-enum ColumnIndex : idx_t {
-	COL_PATH = 0,
-	COL_NAME,
-	COL_TYPE,
-	COL_SIZE,
-	COL_OWNER,
-	COL_GROUP,
-	COL_PERMISSIONS,
-	COL_MODE,
-	COL_REPLICATION,
-	COL_BLOCK_SIZE,
-	COL_LAST_MODIFIED,
-	COL_LAST_ACCESSED,
-	COL_COUNT
-};
+//! Column layout of hdfs_ls / hdfs_stat.
+constexpr idx_t COL_PATH = 0;
+constexpr idx_t COL_NAME = 1;
+constexpr idx_t COL_TYPE = 2;
+constexpr idx_t COL_SIZE = 3;
+constexpr idx_t COL_OWNER = 4;
+constexpr idx_t COL_GROUP = 5;
+constexpr idx_t COL_PERMISSIONS = 6;
+constexpr idx_t COL_MODE = 7;
+constexpr idx_t COL_REPLICATION = 8;
+constexpr idx_t COL_BLOCK_SIZE = 9;
+constexpr idx_t COL_LAST_MODIFIED = 10;
+constexpr idx_t COL_LAST_ACCESSED = 11;
 
 void DefineMetadataSchema(vector<LogicalType> &types, vector<Identifier> &names) {
 	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::BIGINT,
@@ -62,23 +59,20 @@ void DefineMetadataSchema(vector<LogicalType> &types, vector<Identifier> &names)
 	         "permissions", "mode", "replication", "block_size", "last_modified", "last_accessed"};
 }
 
-// Format the 9 permission bits as "rwxr-xr-x", matching `hdfs dfs -ls`.
+//! The 9 permission bits as "rwxr-xr-x", as `hdfs dfs -ls` shows them.
 string PermissionString(uint16_t mode) {
-	static const char *rwx[] = {"---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"};
-	string out;
-	out += rwx[(mode >> 6) & 0x7];
-	out += rwx[(mode >> 3) & 0x7];
-	out += rwx[mode & 0x7];
-	return out;
+	static const char *const RWX[] = {"---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"};
+	return string(RWX[(mode >> 6) & 0x7]) + RWX[(mode >> 3) & 0x7] + RWX[mode & 0x7];
 }
 
 struct HdfsMetaBindData : public TableFunctionData {
-	HdfsFileSystem *hdfs = nullptr;
-	HdfsMetaOp op = HdfsMetaOp::LIST;
+	HdfsMetaBindData(HdfsFileSystem &hdfs, HdfsMetaOp op, string path) : hdfs(hdfs), op(op), path(std::move(path)) {
+	}
+
+	reference<HdfsFileSystem> hdfs;
+	HdfsMetaOp op;
 	string path;
-	// Per-call overrides of the hdfs_skip_permission_errors /
-	// hdfs_include_hidden settings; NULL (unset) falls back to the setting at
-	// execution time.
+	//! Per-call overrides of the hdfs_skip_permission_errors / hdfs_include_hidden settings; NULL if not given.
 	Value skip_permission_errors;
 	Value include_hidden;
 };
@@ -86,191 +80,246 @@ struct HdfsMetaBindData : public TableFunctionData {
 unique_ptr<FunctionData> HdfsMetaBind(ClientContext &context, TableFunctionBindInput &input,
                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<HdfsTableFunctionInfo>();
-	auto result = make_uniq<HdfsMetaBindData>();
-	result->hdfs = info.hdfs;
-	result->op = info.op;
-	result->path = input.inputs[0].GetValue<string>();
-	// Only hdfs_ls registers these; for hdfs_stat the map is empty.
-	for (auto &kv : input.named_parameters) {
-		if (kv.first == "skip_permission_errors") {
-			result->skip_permission_errors = kv.second;
-		} else if (kv.first == "include_hidden") {
-			result->include_hidden = kv.second;
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("%s: the path cannot be NULL", info.op == HdfsMetaOp::LIST ? "hdfs_ls" : "hdfs_stat");
+	}
+	auto result = make_uniq<HdfsMetaBindData>(info.hdfs.get(), info.op, StringValue::Get(input.inputs[0]));
+	// Only hdfs_ls has named parameters.
+	for (auto &parameter : input.named_parameters) {
+		if (parameter.first == "skip_permission_errors") {
+			result->skip_permission_errors = parameter.second;
+		} else if (parameter.first == "include_hidden") {
+			result->include_hidden = parameter.second;
 		}
 	}
-
 	DefineMetadataSchema(return_types, names);
 	return std::move(result);
 }
 
-// LIST streams batches from a background walk as they arrive; STAT runs its
-// RPC once in Init and holds the resulting row.
+//! LIST streams batches from a background walk; STAT runs its RPC once in Init and holds the row.
 struct HdfsMetaGlobalState : public GlobalTableFunctionState {
+	vector<column_t> column_ids;
 	unique_ptr<HdfsListStream> stream;
 	vector<HdfsEntry> entries;
 	idx_t offset = 0;
+	//! Rows emitted so far (the next row id).
+	idx_t rows_emitted = 0;
 };
 
-// An extension setting's current value. Read through the client's FileOpener
-// rather than ClientContext::TryGetCurrentSetting: the latter references the
-// table of all built-in settings, which pulls the SQL parser and more into the
-// binary (about 1.5 MB).
+//! An extension setting's current value. Read through the client's FileOpener rather than
+//! ClientContext::TryGetCurrentSetting: the latter references the table of all built-in settings, which pulls the
+//! SQL parser and more into the binary (about 1.5 MB).
 bool TryGetSetting(ClientContext &context, const char *name, Value &value) {
 	return FileOpener::TryGetCurrentSetting(ClientData::Get(context).file_opener.get(), name, value) && !value.IsNull();
 }
 
-// hdfs_list_parallelism (registered at extension load) bounds the number of
-// concurrent listing RPCs of a walk that touches more than one directory.
-// Capped at INT32_MAX for the FFI signature.
-int32_t ListParallelism(ClientContext &context) {
-	Value setting;
-	if (TryGetSetting(context, "hdfs_list_parallelism", setting)) {
-		return static_cast<int32_t>(MinValue<uint64_t>(UBigIntValue::Get(setting), NumericLimits<int32_t>::Maximum()));
-	}
-	return static_cast<int32_t>(DEFAULT_HDFS_LIST_PARALLELISM);
-}
-
-// Resolve one walk flag: the per-call named parameter wins; unset (NULL)
-// falls back to the session setting, which shares its default with Glob().
-bool WalkFlag(ClientContext &context, const Value &override_value, const char *setting_name) {
+//! A walk flag: the per-call parameter wins; otherwise the setting, or `fallback` if it isn't set.
+bool WalkFlag(ClientContext &context, const Value &override_value, const char *setting_name, bool fallback) {
 	if (!override_value.IsNull()) {
 		return BooleanValue::Get(override_value);
 	}
 	Value setting;
-	if (TryGetSetting(context, setting_name, setting)) {
-		return BooleanValue::Get(setting);
-	}
-	return false;
+	return TryGetSetting(context, setting_name, setting) ? BooleanValue::Get(setting) : fallback;
 }
 
 unique_ptr<GlobalTableFunctionState> HdfsMetaInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<HdfsMetaBindData>();
+	auto &hdfs = bind_data.hdfs.get();
+	auto opener = ClientData::Get(context).file_opener.get();
 	auto state = make_uniq<HdfsMetaGlobalState>();
-	switch (bind_data.op) {
-	case HdfsMetaOp::LIST: {
-		HdfsWalkOptions options;
-		options.skip_permission_errors =
-		    WalkFlag(context, bind_data.skip_permission_errors, "hdfs_skip_permission_errors");
-		options.include_hidden = WalkFlag(context, bind_data.include_hidden, "hdfs_include_hidden");
-		// A path with glob characters returns the matched entries themselves
-		// (files and directories; `**` walks the subtree); a literal path
-		// lists the directory's children. Escapes don't suppress detection:
-		// like DuckDB's globber, any of these characters selects glob mode,
-		// and `\*` etc. are then matched literally by the pattern itself.
-		if (bind_data.path.find_first_of("*?[{") != string::npos) {
-			state->stream = bind_data.hdfs->OpenGlobStream(bind_data.path, ListParallelism(context), options);
-		} else {
-			state->stream = bind_data.hdfs->OpenListStream(bind_data.path, ListParallelism(context), options);
-		}
-		break;
+	state->column_ids = input.column_ids;
+	if (bind_data.op == HdfsMetaOp::STAT) {
+		state->entries.push_back(hdfs.Stat(bind_data.path, opener));
+		return std::move(state);
 	}
-	case HdfsMetaOp::STAT:
-		state->entries.push_back(bind_data.hdfs->Stat(bind_data.path));
-		break;
+	HdfsWalkOptions options;
+	options.skip_permission_errors =
+	    WalkFlag(context, bind_data.skip_permission_errors, "hdfs_skip_permission_errors", false);
+	options.include_hidden = WalkFlag(context, bind_data.include_hidden, "hdfs_include_hidden", false);
+	options.batched_listing = WalkFlag(context, Value(), "hdfs_batched_listing", true);
+	options.max_parallelism = DEFAULT_HDFS_LIST_PARALLELISM;
+	Value parallelism;
+	if (TryGetSetting(context, "hdfs_list_parallelism", parallelism)) {
+		options.max_parallelism = UBigIntValue::Get(parallelism);
+	}
+	// A path with glob characters returns the matched entries themselves; a literal path lists the directory's
+	// children. As in DuckDB's globber, escapes don't suppress glob mode (`\*` then matches a literal `*`).
+	if (bind_data.path.find_first_of("*?[{") != string::npos) {
+		state->stream = hdfs.OpenGlobStream(bind_data.path, options, opener);
+	} else {
+		state->stream = hdfs.OpenListStream(bind_data.path, options, opener);
 	}
 	return std::move(state);
 }
 
+//! Write column `column_id` of `rows` into `result`; row ids start at `first_row_id`.
+void WriteColumn(column_t column_id, const vector<HdfsEntry> &rows, idx_t first_row_id, Vector &result) {
+	auto count = rows.size();
+	if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
+		auto writer = FlatVector::Writer<int64_t>(result, count);
+		for (idx_t row_idx = 0; row_idx < count; row_idx++) {
+			writer.WriteValue(NumericCast<int64_t>(first_row_id + row_idx));
+		}
+		return;
+	}
+	switch (column_id) {
+	case COL_PATH:
+	case COL_NAME:
+	case COL_TYPE:
+	case COL_OWNER:
+	case COL_GROUP:
+	case COL_PERMISSIONS: {
+		auto writer = FlatVector::Writer<string_t>(result, count);
+		for (auto &row : rows) {
+			switch (column_id) {
+			case COL_PATH:
+				writer.WriteValue(string_t(row.url));
+				break;
+			case COL_NAME:
+				writer.WriteValue(string_t(row.name));
+				break;
+			case COL_TYPE:
+				writer.WriteValue(string_t(row.is_dir ? "directory" : "file"));
+				break;
+			case COL_OWNER:
+				writer.WriteValue(string_t(row.owner));
+				break;
+			case COL_GROUP:
+				writer.WriteValue(string_t(row.group));
+				break;
+			default: {
+				auto permissions = PermissionString(row.permission);
+				writer.WriteValue(string_t(permissions));
+				break;
+			}
+			}
+		}
+		break;
+	}
+	case COL_SIZE:
+	case COL_BLOCK_SIZE: {
+		auto writer = FlatVector::Writer<int64_t>(result, count);
+		for (auto &row : rows) {
+			auto value = column_id == COL_SIZE ? row.size : row.block_size;
+			// HDFS has no block size for directories: -1 becomes NULL.
+			if (value < 0 && column_id == COL_BLOCK_SIZE) {
+				writer.WriteNull();
+			} else {
+				writer.WriteValue(value);
+			}
+		}
+		break;
+	}
+	case COL_MODE: {
+		auto writer = FlatVector::Writer<uint16_t>(result, count);
+		for (auto &row : rows) {
+			writer.WriteValue(row.permission);
+		}
+		break;
+	}
+	case COL_REPLICATION: {
+		auto writer = FlatVector::Writer<int32_t>(result, count);
+		for (auto &row : rows) {
+			if (row.replication < 0) {
+				writer.WriteNull();
+			} else {
+				writer.WriteValue(row.replication);
+			}
+		}
+		break;
+	}
+	case COL_LAST_MODIFIED:
+	case COL_LAST_ACCESSED: {
+		auto writer = FlatVector::Writer<timestamp_t>(result, count);
+		for (auto &row : rows) {
+			writer.WriteValue(column_id == COL_LAST_MODIFIED ? row.mtime : row.atime);
+		}
+		break;
+	}
+	default:
+		throw InternalException("hdfs_ls: unexpected column id %llu", column_id);
+	}
+}
+
 void HdfsMetaExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<HdfsMetaGlobalState>();
-	// LIST pulls the next batch from the background walk (blocking until rows
-	// arrive or the walk ends); STAT emits a slice of the materialized rows.
-	vector<HdfsEntry> batch;
-	const HdfsEntry *rows;
-	idx_t count;
+	vector<HdfsEntry> rows;
 	if (state.stream) {
-		state.stream->Next(batch, STANDARD_VECTOR_SIZE);
-		rows = batch.data();
-		count = batch.size();
+		// Blocks until the walk produces rows (or ends); the wait can be interrupted.
+		state.stream->Next(rows, STANDARD_VECTOR_SIZE, &context);
 	} else {
-		count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.entries.size() - state.offset);
-		rows = state.entries.data() + state.offset;
+		auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.entries.size() - state.offset);
+		rows.assign(state.entries.begin() + NumericCast<int64_t>(state.offset),
+		            state.entries.begin() + NumericCast<int64_t>(state.offset + count));
 		state.offset += count;
 	}
-
-	auto path_data = FlatVector::GetDataMutable<string_t>(output.data[COL_PATH]);
-	auto name_data = FlatVector::GetDataMutable<string_t>(output.data[COL_NAME]);
-	auto type_data = FlatVector::GetDataMutable<string_t>(output.data[COL_TYPE]);
-	auto size_data = FlatVector::GetDataMutable<int64_t>(output.data[COL_SIZE]);
-	auto owner_data = FlatVector::GetDataMutable<string_t>(output.data[COL_OWNER]);
-	auto group_data = FlatVector::GetDataMutable<string_t>(output.data[COL_GROUP]);
-	auto perm_data = FlatVector::GetDataMutable<string_t>(output.data[COL_PERMISSIONS]);
-	auto mode_data = FlatVector::GetDataMutable<uint16_t>(output.data[COL_MODE]);
-	auto repl_data = FlatVector::GetDataMutable<int32_t>(output.data[COL_REPLICATION]);
-	auto block_data = FlatVector::GetDataMutable<int64_t>(output.data[COL_BLOCK_SIZE]);
-	auto mtime_data = FlatVector::GetDataMutable<timestamp_t>(output.data[COL_LAST_MODIFIED]);
-	auto atime_data = FlatVector::GetDataMutable<timestamp_t>(output.data[COL_LAST_ACCESSED]);
-
-	for (idx_t i = 0; i < count; i++) {
-		const auto &entry = rows[i];
-		path_data[i] = StringVector::AddString(output.data[COL_PATH], entry.url);
-		name_data[i] = StringVector::AddString(output.data[COL_NAME], entry.name);
-		type_data[i] = StringVector::AddString(output.data[COL_TYPE], entry.is_dir ? "directory" : "file");
-		size_data[i] = entry.size;
-		owner_data[i] = StringVector::AddString(output.data[COL_OWNER], entry.owner);
-		group_data[i] = StringVector::AddString(output.data[COL_GROUP], entry.group);
-		perm_data[i] = StringVector::AddString(output.data[COL_PERMISSIONS], PermissionString(entry.permission));
-		mode_data[i] = entry.permission;
-		// HDFS reports replication / block size only for files; surface NULL for
-		// directories (the bridge signals this with -1).
-		if (entry.replication < 0) {
-			FlatVector::SetNull(output.data[COL_REPLICATION], i, true);
-		} else {
-			repl_data[i] = entry.replication;
-		}
-		if (entry.block_size < 0) {
-			FlatVector::SetNull(output.data[COL_BLOCK_SIZE], i, true);
-		} else {
-			block_data[i] = entry.block_size;
-		}
-		// HDFS timestamps are epoch milliseconds.
-		mtime_data[i] = Timestamp::FromEpochMs(static_cast<int64_t>(entry.mtime));
-		atime_data[i] = Timestamp::FromEpochMs(static_cast<int64_t>(entry.atime));
+	for (idx_t output_idx = 0; output_idx < state.column_ids.size(); output_idx++) {
+		WriteColumn(state.column_ids[output_idx], rows, state.rows_emitted, output.data[output_idx]);
 	}
-	output.SetChildCardinality(count);
+	state.rows_emitted += rows.size();
+	output.SetChildCardinality(rows.size());
 }
 
 TableFunction MakeMetaFunction(const char *name) {
-	// The operation and filesystem are carried on function_info (set at
-	// registration) and read in bind; the schema/execution are shared.
-	return TableFunction(name, {LogicalType::VARCHAR}, HdfsMetaExecute, HdfsMetaBind, HdfsMetaInit);
+	TableFunction function(name, {LogicalType::VARCHAR}, HdfsMetaExecute, HdfsMetaBind, HdfsMetaInit);
+	function.GetSignature().GetParameter(0).SetName("path");
+	// Only the selected columns are built (e.g. no permission strings for `SELECT name`).
+	function.projection_pushdown = true;
+	return function;
 }
 
-// hdfs_exists(path) -> BOOLEAN
 void HdfsExistsExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	auto *hdfs = func_expr.Function().GetExtraFunctionInfo().Cast<HdfsScalarFunctionInfo>().hdfs;
+	auto &hdfs = func_expr.Function().GetExtraFunctionInfo().Cast<HdfsScalarFunctionInfo>().hdfs.get();
+	auto opener = ClientData::Get(state.GetContext()).file_opener.get();
 	UnaryExecutor::Execute<string_t, bool>(args.data[0], result, args.size(),
-	                                       [&](string_t path) { return hdfs->Exists(path.GetString()); });
+	                                       [&](string_t path) { return hdfs.Exists(path.GetString(), opener); });
+}
+
+FunctionDescription Describe(string description, vector<string> examples) {
+	FunctionDescription result;
+	result.description = std::move(description);
+	result.examples = std::move(examples);
+	return result;
 }
 
 } // namespace
 
-void RegisterHdfsFunctions(ExtensionLoader &loader, HdfsFileSystem *hdfs) {
-	// hdfs_ls(path_or_pattern, skip_permission_errors := ..., include_hidden := ...)
+void RegisterHdfsFunctions(ExtensionLoader &loader, HdfsFileSystem &hdfs) {
 	auto ls = MakeMetaFunction("hdfs_ls");
 	ls.function_info = make_shared_ptr<HdfsTableFunctionInfo>(hdfs, HdfsMetaOp::LIST);
-	// Per-call overrides of the same-named hdfs_* settings (both default false).
-	// They have no declared default: a call that leaves one out doesn't pass it,
-	// and bind falls back to the setting.
+	// Per-call overrides of the same-named hdfs_* settings. They have no default: a call that leaves one out falls
+	// back to the setting.
 	ls.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
 		options.Add("skip_permission_errors", LogicalType::BOOLEAN);
 		options.Add("include_hidden", LogicalType::BOOLEAN);
 	});
-	loader.RegisterFunction(ls);
+	CreateTableFunctionInfo ls_info(std::move(ls));
+	ls_info.descriptions.push_back(Describe(
+	    "Lists an HDFS directory's children, or the entries a glob pattern matches, with their full file status. "
+	    "Named parameters skip_permission_errors and include_hidden override the hdfs_* settings of the same name.",
+	    {"hdfs_ls('hdfs://namenode:8020/data')", "hdfs_ls('hdfs://namenode:8020/data/**/*.parquet')"}));
+	loader.RegisterFunction(std::move(ls_info));
 
-	// hdfs_stat(path)
 	auto stat = MakeMetaFunction("hdfs_stat");
 	stat.function_info = make_shared_ptr<HdfsTableFunctionInfo>(hdfs, HdfsMetaOp::STAT);
-	loader.RegisterFunction(stat);
+	CreateTableFunctionInfo stat_info(std::move(stat));
+	stat_info.descriptions.push_back(Describe("Returns the file status of one HDFS file or directory, as one row.",
+	                                          {"hdfs_stat('hdfs://namenode:8020/data/events.parquet')"}));
+	loader.RegisterFunction(std::move(stat_info));
 
-	// hdfs_exists(path) -> BOOLEAN
 	ScalarFunction exists("hdfs_exists", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, HdfsExistsExecute);
+	exists.GetSignature().GetParameter(0).SetName("path");
 	exists.SetExtraFunctionInfo(make_shared_ptr<HdfsScalarFunctionInfo>(hdfs));
-	// The HDFS lookup can fail (permission denied, NameNode unreachable). Without
-	// this, DuckDB reports any thrown error as a non-fallible-function bug.
+	// The lookup can fail (permission denied, NameNode unreachable); without this, DuckDB reports a thrown error as
+	// a bug in a function it assumed can't fail.
 	exists.SetFallible();
-	loader.RegisterFunction(exists);
+	CreateScalarFunctionInfo exists_info(std::move(exists));
+	exists_info.descriptions.push_back(
+	    Describe("Whether an HDFS file or directory exists. Errors other than \"not found\" (e.g. permission "
+	             "denied) fail the query.",
+	             {"hdfs_exists('hdfs://namenode:8020/data/_SUCCESS')"}));
+	loader.RegisterFunction(std::move(exists_info));
 }
 
 } // namespace duckdb

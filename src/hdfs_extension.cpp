@@ -5,16 +5,42 @@
 #include "duckdb.hpp"
 
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/secret/secret.hpp"
 #include "hdfs_filesystem.hpp"
 #include "hdfs_functions.hpp"
 
 namespace duckdb {
 
+//! CREATE SECRET (TYPE hdfs, ...): where to find the Hadoop configuration, and who to act as, for the URLs in its
+//! scope (default: all of hdfs://).
+static unique_ptr<BaseSecret> CreateHdfsSecretFromConfig(ClientContext &context, CreateSecretInput &input) {
+	auto scope = input.scope.empty() ? vector<string> {"hdfs://"} : input.scope;
+	auto secret = make_uniq<KeyValueSecret>(scope, input.type, input.provider, input.name);
+	secret->TrySetValue("config_dir", input);
+	secret->TrySetValue("user", input);
+	return std::move(secret);
+}
+
+static void RegisterHdfsSecret(ExtensionLoader &loader) {
+	SecretType secret_type;
+	secret_type.name = "hdfs";
+	secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
+	secret_type.default_provider = "config";
+	loader.RegisterSecretType(secret_type);
+
+	CreateSecretFunction config_function;
+	config_function.secret_type = "hdfs";
+	config_function.provider = "config";
+	config_function.function = CreateHdfsSecretFromConfig;
+	config_function.named_parameters["config_dir"] = LogicalType::VARCHAR;
+	config_function.named_parameters["user"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(config_function);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
-	// Register the hdfs:// virtual filesystem. Connection config (Hadoop config
-	// dir, effective user, Kerberos) is resolved by hdfs-native from the
-	// standard Hadoop environment (HADOOP_CONF_DIR / HADOOP_HOME, HADOOP_USER_NAME
-	// / keytab / current account), so connection details need no settings here.
+	// Connections are configured from an hdfs secret matching the URL, else from the Hadoop environment
+	// (HADOOP_CONF_DIR, HADOOP_USER_NAME, Kerberos ticket cache), as for the Hadoop CLI.
+	loader.SetDescription("Reads and writes hdfs:// URLs with a native HDFS client, and lists HDFS metadata");
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
 	config.AddExtensionOption("hdfs_list_parallelism",
@@ -33,15 +59,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "glob component names them explicitly (e.g. '_*')",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
-	auto &fs = db.GetFileSystem();
-	auto hdfs_fs = make_uniq<HdfsFileSystem>();
-	// Borrowed by the metadata SQL functions below; the VirtualFileSystem owns it
-	// for the database's lifetime, so the raw pointer stays valid.
-	auto *hdfs_ptr = hdfs_fs.get();
-	fs.RegisterSubSystem(std::move(hdfs_fs));
+	config.AddExtensionOption("hdfs_batched_listing",
+	                          "List several HDFS directories per NameNode call (getBatchedListing, Hadoop 3.3+) in "
+	                          "recursive listings and globs; NameNodes that can't are detected and listed one "
+	                          "directory per call",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
-	// Register the HDFS metadata functions (hdfs_ls / hdfs_stat / hdfs_exists).
-	RegisterHdfsFunctions(loader, hdfs_ptr);
+	auto hdfs_fs = make_uniq<HdfsFileSystem>();
+	// The VirtualFileSystem owns the filesystem for the database's lifetime; the SQL functions refer to it.
+	auto &hdfs = *hdfs_fs;
+	db.GetFileSystem().RegisterSubSystem(std::move(hdfs_fs));
+	RegisterHdfsFunctions(loader, hdfs);
+	RegisterHdfsSecret(loader);
 }
 
 void HdfsExtension::Load(ExtensionLoader &loader) {

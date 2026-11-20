@@ -85,7 +85,10 @@ Behavior notes:
   Hadoop-style `{a,b}` alternation, and also work in `read_parquet` /
   `read_csv` / `glob()`. A path with wildcards makes `hdfs_ls` return the
   matched entries themselves (like `ls -d`; no matches → empty result); a
-  plain directory path lists its children.
+  plain directory path lists its children. Names are matched by DuckDB's own
+  glob matcher, so `?` matches one byte (as for local files). In scans,
+  globbed files are read in path order, and a pattern that matches nothing is
+  tried as a literal path (a file named `data[1].csv`, say).
 - **Hidden entries** (names starting with `_` or `.`, e.g. `_SUCCESS`) are
   skipped unless the path names them explicitly (`'/data/_*'`) or you set
   `include_hidden := true` / `SET hdfs_include_hidden = true`.
@@ -113,6 +116,7 @@ scheme-only form `hdfs:///path` uses `fs.defaultFS` from your Hadoop config.
 | `hdfs_list_parallelism` | `16` | Max concurrent directory-listing RPCs for recursive listings and globs. Raise cautiously on shared clusters — it multiplies NameNode load. |
 | `hdfs_include_hidden` | `false` | Include hidden (`_`/`.`) entries in listings, globs and scans. Per-call override: `include_hidden := …`. |
 | `hdfs_skip_permission_errors` | `false` | Skip unreadable subtrees instead of failing the query. Per-call override: `skip_permission_errors := …`. |
+| `hdfs_batched_listing` | `true` | List up to 100 directories per NameNode call (`getBatchedListing`, Hadoop 3.3+). NameNodes that can't are detected automatically; turn it off only if a proxy in front of the NameNode mishandles the call. |
 
 ```sql
 SET hdfs_list_parallelism = 64;
@@ -131,10 +135,9 @@ Hadoop CLI tools:
   NameNode is addressed by a short host name (no dots), set
   `qualify_shortname = ""` in `[libdefaults]`, or krb5 asks for a service
   principal with your DNS search domain appended.
-- **Batched listing**: on by default; set
-  `duckdb.hdfs.batched-listing.enabled` to `false` in `hdfs-site.xml` to list
-  one directory per NameNode call. It's normally detected automatically;
-  turn it off only if a proxy in front of the NameNode mishandles the call.
+- **Batched listing**: use the `hdfs_batched_listing` setting. Setting
+  `duckdb.hdfs.batched-listing.enabled` to `false` in `hdfs-site.xml` still
+  turns it off too, but is deprecated.
 
 ```sh
 export HADOOP_CONF_DIR=/etc/hadoop/conf
@@ -142,7 +145,26 @@ export HADOOP_USER_NAME=analytics   # only on non-secure clusters
 ```
 
 In an embedded context (e.g. Python), set these before the first HDFS access —
-the client is created lazily.
+the client is created lazily — or use a secret.
+
+### Secrets
+
+An `hdfs` secret configures the connections to the URLs in its scope (by
+default all of `hdfs://`) instead of the environment, as DuckDB's `s3` and
+`azure` secrets do:
+
+```sql
+CREATE SECRET prod (
+    TYPE hdfs,
+    SCOPE 'hdfs://prod-nn:8020',
+    CONFIG_DIR '/etc/hadoop/prod',  -- core-site.xml / hdfs-site.xml
+    USER 'analytics'                -- simple authentication only
+);
+```
+
+Both parameters are optional; what a secret leaves out comes from the
+environment. On a Kerberos cluster the identity is always the ticket cache's
+principal, so `USER` is an error there.
 
 ## Performance
 
@@ -173,9 +195,11 @@ calls) where it made 8.
 
 Tuning:
 
-- **Repeated scans**: DuckDB's external file cache
-  (`SET enable_external_file_cache = true`, the default) keeps file contents
-  in memory across queries, validated by modification time and size.
+- **Repeated scans**: DuckDB's external file cache can keep file contents in
+  memory across queries, validated by modification time and size. DuckDB
+  only treats a fixed list of URL schemes (`s3://`, `https://`, …) as remote,
+  and `hdfs://` isn't on it, so HDFS files are cached only with
+  `SET cache_local_files = true` (which caches local files too).
 - **Short-circuit local reads**: when DuckDB runs on DataNode hosts, set
   `dfs.client.read.shortcircuit=true` and `dfs.domain.socket.path` in
   `hdfs-site.xml` (as for Hadoop clients) to read local block replicas
@@ -226,10 +250,10 @@ Tests that don't need a cluster run with:
 
 ```sh
 make test         # SQL tests (cluster tests are skipped)
-make test_unit    # unit tests: glob engine, encryption helpers, batched listing
+make test_unit    # C++ unit tests: encryption helpers, batched listing
 ```
 
-The HDFS integration tests (`test/sql/hdfs.test`) run against a real
+The HDFS integration tests (`test/sql/hdfs.test`, `test/sql/hdfs_glob.test`, …) run against a real
 single-node HDFS in Docker, gated behind `require-env HDFS_TEST_RUNNING`. To
 run them end-to-end (requires Docker):
 
@@ -257,14 +281,17 @@ reachable from the host is advertising the DataNode as `localhost` and setting
 - `src/` — DuckDB extension (C++): `hdfs_extension.cpp` registers the filesystem
   and settings; `hdfs_filesystem.cpp` implements the `FileSystem`;
   `hdfs_functions.cpp` implements the metadata SQL functions.
-- `src/hdfs_bridge.cpp` — the HDFS client layer on top of libhdfs3, behind the
-  small C API in `src/include/hdfs_bridge.h` (the only file that includes
+- `src/hdfs_client.cpp` — the HDFS client on top of libhdfs3, behind the C++
+  interface in `src/include/hdfs_client.hpp` (the only file that includes
   libhdfs3 headers): connections, reads, writes, and the parallel streaming
-  directory walk. `src/hdfs_glob.cpp` is the glob engine.
+  directory walk. `src/hdfs_glob.cpp` plans glob walks; `src/hdfs_crypto.cpp`
+  handles encryption zones.
 - `vcpkg_ports/libhdfs3/` — vcpkg port that builds libhdfs3 (pinned commit,
   our own CMake build, and small patches). `vcpkg_ports/gsasl/` builds gsasl
   from its release tarball, so CI images don't need extra autotools packages.
 - `test/` — SQL tests, Docker cluster, and helper scripts.
+- `docs/` — [UPDATING.md](docs/UPDATING.md) (moving to a new DuckDB or libhdfs3, and the patch inventory) and
+  [PLAN.md](docs/PLAN.md) (remaining work and design decisions).
 
 ## Third-party code
 

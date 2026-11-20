@@ -3,11 +3,13 @@
 
 #include "hdfs_crypto.hpp"
 
+#include "duckdb/common/exception.hpp"
+
 #include <cstdio>
 #include <string>
 #include <vector>
 
-using namespace hdfs_crypto;
+using namespace duckdb;
 
 namespace {
 
@@ -30,7 +32,7 @@ std::string Hex(const std::string &hex) {
 }
 
 std::string Transform(const std::string &key, const std::string &iv, uint64_t offset, std::string data) {
-	AesCtrTransform(key, iv, offset, reinterpret_cast<uint8_t *>(&data[0]), data.size());
+	HdfsCrypto::AesCtrTransform(key, iv, offset, reinterpret_cast<uint8_t *>(&data[0]), data.size());
 	return data;
 }
 
@@ -61,45 +63,54 @@ void NistVector() {
 void CounterCarry() {
 	// offset / 16 is added to the IV as a 128-bit big-endian number.
 	auto iv = Hex("000000000000000000000000000000ff");
-	CHECK(CounterBlock(iv, 0) == iv);
-	CHECK(CounterBlock(iv, 15) == iv);
-	CHECK(CounterBlock(iv, 16) == Hex("00000000000000000000000000000100"));
+	CHECK(HdfsCrypto::CounterBlock(iv, 0) == iv);
+	CHECK(HdfsCrypto::CounterBlock(iv, 15) == iv);
+	CHECK(HdfsCrypto::CounterBlock(iv, 16) == Hex("00000000000000000000000000000100"));
 	auto high = Hex("0000000000000000ffffffffffffffff");
-	CHECK(CounterBlock(high, 16) == Hex("00000000000000010000000000000000"));
+	CHECK(HdfsCrypto::CounterBlock(high, 16) == Hex("00000000000000010000000000000000"));
 	auto top = Hex("ffffffffffffffffffffffffffffffff");
-	CHECK(CounterBlock(top, 16) == Hex("00000000000000000000000000000000"));
+	CHECK(HdfsCrypto::CounterBlock(top, 16) == Hex("00000000000000000000000000000000"));
 }
 
 void Base64() {
-	CHECK(Base64Encode("") == "");
-	CHECK(Base64Encode("f") == "Zg==");
-	CHECK(Base64Encode("fo") == "Zm8=");
-	CHECK(Base64Encode("foo") == "Zm9v");
-	CHECK(Base64Decode("Zm9vYmE=") == "fooba");
-	CHECK(Base64Decode("Zm9vYmE") == "fooba"); // unpadded
+	CHECK(HdfsCrypto::Base64Encode("") == "");
+	CHECK(HdfsCrypto::Base64Encode("f") == "Zg==");
+	CHECK(HdfsCrypto::Base64Encode("fo") == "Zm8=");
+	CHECK(HdfsCrypto::Base64Encode("foo") == "Zm9v");
+	CHECK(HdfsCrypto::Base64Decode("Zm9vYmE=") == "fooba");
+	CHECK(HdfsCrypto::Base64Decode("Zm9vYmE") == "fooba"); // unpadded
 	std::string bytes = Hex("fbff");
-	CHECK(Base64Encode(bytes) == "+/8=");
-	CHECK(Base64Decode("-_8") == bytes); // URL-safe, as the KMS sends it
+	CHECK(HdfsCrypto::Base64Encode(bytes) == "+/8=");
+	CHECK(HdfsCrypto::Base64Decode("-_8") == bytes); // URL-safe, as the KMS sends it
 	bool threw = false;
 	try {
-		Base64Decode("not base64!");
-	} catch (const CryptoError &) {
+		HdfsCrypto::Base64Decode("not base64!");
+	} catch (const IOException &) {
 		threw = true;
 	}
 	CHECK(threw);
 }
 
 void KmsUri() {
-	CHECK(ParseKmsUri("kms://http@kms1:9600/kms") == std::vector<std::string>({"http://kms1:9600/kms"}));
-	CHECK(ParseKmsUri("kms://https@kms1;kms2:9600/kms") ==
+	CHECK(HdfsCrypto::ParseKmsUri("kms://http@kms1:9600/kms") == std::vector<std::string>({"http://kms1:9600/kms"}));
+	CHECK(HdfsCrypto::ParseKmsUri("kms://https@kms1;kms2:9600/kms") ==
 	      std::vector<std::string>({"https://kms1:9600/kms", "https://kms2:9600/kms"}));
 	bool threw = false;
 	try {
-		ParseKmsUri("jceks://file@/tmp/keystore");
-	} catch (const CryptoError &) {
+		HdfsCrypto::ParseKmsUri("jceks://file@/tmp/keystore");
+	} catch (const IOException &) {
 		threw = true;
 	}
 	CHECK(threw);
+}
+
+// The error message a KMS refusal reports, in Hadoop's JSON shape.
+void KmsErrors() {
+	CHECK(HdfsCrypto::KmsErrorMessage(
+	          R"({"RemoteException":{"message":"User:bob not allowed to do 'DECRYPT_EEK' on 'k1'",)"
+	          R"("exception":"AuthorizationException"}})") == "User:bob not allowed to do 'DECRYPT_EEK' on 'k1'");
+	CHECK(HdfsCrypto::KmsErrorMessage(R"({"message":"Key k1 not found"})") == "Key k1 not found");
+	CHECK(HdfsCrypto::KmsErrorMessage("<html>Bad Gateway</html>").empty());
 }
 
 } // namespace
@@ -109,6 +120,7 @@ int main() {
 	CounterCarry();
 	Base64();
 	KmsUri();
+	KmsErrors();
 	if (failures) {
 		std::fprintf(stderr, "%d check(s) failed\n", failures);
 		return 1;

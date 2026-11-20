@@ -1,0 +1,203 @@
+# name: test/sql/hdfs_glob.test
+# description: Glob patterns over HDFS: wildcards, classes, '**', brace alternation and hidden names.
+# group: [sql]
+
+require hdfs
+
+require-env HDFS_TEST_RUNNING
+
+# --- fixtures: a small tree under /globtest --------------------------------------
+
+statement ok
+CREATE MACRO globbed(pattern, hidden := false) AS TABLE
+SELECT replace(path, 'hdfs://localhost:9000/globtest', '') AS p
+FROM hdfs_ls('hdfs://localhost:9000/globtest' || pattern, include_hidden := hidden) ORDER BY p;
+
+foreach file data/a.csv data/b.txt data/sub/c.csv d/x.parquet d/a/y.parquet d/a/b/z.parquet m/jan/1.csv m/feb/2.csv m/mar/3.csv h/a.csv h/_SUCCESS h/.staged h/_temporary/part.csv h/sub/b.csv h/sub/_SUCCESS u/dataé.csv
+
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/globtest/{file}' (FORMAT csv);
+
+endloop
+
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/globtest/lit/file*name' (FORMAT csv);
+
+# --- wildcards and classes -----------------------------------------------------------
+
+query T
+FROM globbed('/data/*.csv');
+----
+/data/a.csv
+
+# '*' matches directories too; they are returned, not listed.
+query T
+FROM globbed('/data/*');
+----
+/data/a.csv
+/data/b.txt
+/data/sub
+
+query T
+FROM globbed('/data/[ab].*');
+----
+/data/a.csv
+/data/b.txt
+
+query T
+FROM globbed('/data/[!a].*');
+----
+/data/b.txt
+
+query T
+FROM globbed('/data/*/*.csv');
+----
+/data/sub/c.csv
+
+query T
+FROM globbed('/data/zzz*');
+----
+
+# Globs match names as DuckDB's local glob does: '?' is one byte, so a two-byte
+# UTF-8 character needs '??'.
+query T
+FROM globbed('/u/data?.csv');
+----
+
+query T
+FROM globbed('/u/data??.csv');
+----
+/u/dataé.csv
+
+# --- '**' ------------------------------------------------------------------------------
+
+# A terminal '**' returns everything at every depth, directories included.
+query T
+FROM globbed('/d/**');
+----
+/d/a
+/d/a/b
+/d/a/b/z.parquet
+/d/a/y.parquet
+/d/x.parquet
+
+# '**' also matches zero levels.
+query T
+FROM globbed('/d/**/*.parquet');
+----
+/d/a/b/z.parquet
+/d/a/y.parquet
+/d/x.parquet
+
+# A component after '**' limits what is returned, not how deep the walk goes.
+query T
+FROM globbed('/d/**/b/*.parquet');
+----
+/d/a/b/z.parquet
+
+# --- brace alternation -------------------------------------------------------------------
+
+query T
+FROM globbed('/m/{jan,feb}/*.csv');
+----
+/m/feb/2.csv
+/m/jan/1.csv
+
+# Overlapping alternatives don't return an entry twice.
+query T
+FROM globbed('/m/{jan,j*}/*.csv');
+----
+/m/jan/1.csv
+
+# Alternatives spanning several levels, and nested groups.
+query T
+FROM globbed('/{m/mar,data/sub}/*.csv');
+----
+/data/sub/c.csv
+/m/mar/3.csv
+
+query T
+FROM globbed('/m/{jan,{feb,mar}}/*.csv');
+----
+/m/feb/2.csv
+/m/jan/1.csv
+/m/mar/3.csv
+
+# --- escapes -------------------------------------------------------------------------------
+
+# An escaped wildcard is literal: the pattern names one path.
+query T
+FROM globbed('/lit/file\*name');
+----
+/lit/file*name
+
+# --- hidden names --------------------------------------------------------------------------
+
+# Wildcards and '**' skip hidden names.
+query T
+FROM globbed('/h/*');
+----
+/h/a.csv
+/h/sub
+
+query T
+FROM globbed('/h/**');
+----
+/h/a.csv
+/h/sub
+/h/sub/b.csv
+
+# include_hidden returns them.
+query T
+FROM globbed('/h/**', hidden := true);
+----
+/h/.staged
+/h/_SUCCESS
+/h/_temporary
+/h/_temporary/part.csv
+/h/a.csv
+/h/sub
+/h/sub/_SUCCESS
+/h/sub/b.csv
+
+# A component that spells the hidden character out matches hidden names,
+# escaped or not; a class or '?' as the first character doesn't.
+query T
+FROM globbed('/h/_temporary/*');
+----
+/h/_temporary/part.csv
+
+query T
+FROM globbed('/h/_*');
+----
+/h/_SUCCESS
+/h/_temporary
+
+query T
+FROM globbed('/h/\_*');
+----
+/h/_SUCCESS
+/h/_temporary
+
+query T
+FROM globbed('/h/[_a]*');
+----
+/h/a.csv
+
+query T
+FROM globbed('/h/?SUCCESS');
+----
+
+# A literal after '**' matches hidden names at any depth.
+query T
+FROM globbed('/h/**/_SUCCESS');
+----
+/h/_SUCCESS
+/h/sub/_SUCCESS
+
+# --- invalid patterns ----------------------------------------------------------------------
+
+statement error
+FROM globbed('/m/{jan,feb/*.csv');
+----
+<REGEX>:Invalid Input Error: .*Unclosed brace group.*
