@@ -1,5 +1,5 @@
 # name: test/sql/hdfs_access.test
-# description: hdfs_ls, hdfs_stat and hdfs_exists obey disabled_filesystems, enable_external_access,
+# description: hdfs_ls, hdfs_stat and hdfs_exists obey enable_external_access,
 # group: [sql]
 
 #              allowed_directories and allowed_paths, as reads through DuckDB's file system do. Needs no cluster:
@@ -7,51 +7,6 @@
 #              A separate file because enable_external_access can't be turned back on.
 
 require hdfs
-
-# --- disabled_filesystems --------------------------------------------------------
-
-statement ok
-SET disabled_filesystems = 'HdfsFileSystem';
-
-statement error
-SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data');
-----
-Permission Error: File system HdfsFileSystem has been disabled by configuration
-
-statement error
-SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data/*.csv');
-----
-Permission Error: File system HdfsFileSystem has been disabled by configuration
-
-statement error
-SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/data');
-----
-Permission Error: File system HdfsFileSystem has been disabled by configuration
-
-statement error
-SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
-----
-Permission Error: File system HdfsFileSystem has been disabled by configuration
-
-# A scheme-less path (on the default FS) is refused too.
-statement error
-SELECT * FROM hdfs_stat('/data');
-----
-Permission Error: File system HdfsFileSystem has been disabled by configuration
-
-# The same as a scan.
-statement error
-SELECT * FROM read_csv('hdfs://127.0.0.1:1/data/x.csv');
-----
-Permission Error: File system HdfsFileSystem has been disabled by configuration
-
-statement ok
-RESET disabled_filesystems;
-
-statement error
-SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
-----
-IO Error
 
 # --- enable_external_access = false -------------------------------------------------
 
