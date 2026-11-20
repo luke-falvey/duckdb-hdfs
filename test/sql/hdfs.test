@@ -14,8 +14,6 @@
 
 require hdfs
 
-require parquet
-
 require-env HDFS_TEST_RUNNING
 
 # The effective user comes from the Hadoop environment (HADOOP_USER_NAME here,
@@ -41,18 +39,6 @@ query I
 SELECT count(*) FROM read_csv('hdfs:///test/data.csv');
 ----
 3
-
-# --- reading Parquet over hdfs:// --------------------------------------------
-
-query I
-SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/data.parquet');
-----
-5
-
-query IT
-SELECT id, name FROM read_parquet('hdfs://localhost:9000/test/data.parquet') ORDER BY id LIMIT 1;
-----
-0	v0
 
 # --- globbing ----------------------------------------------------------------
 
@@ -449,6 +435,141 @@ SELECT count(*) FROM glob('hdfs://localhost:9000/hidtest/**');
 statement ok
 RESET hdfs_include_hidden;
 
+# --- hdfs secrets -------------------------------------------------------------------
+
+# A secret scoped to /permtest acts as the unprivileged user "guest" there,
+# while the rest of the cluster keeps the environment's (super)user.
+statement ok
+CREATE SECRET as_guest (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest', USER 'guest');
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
+----
+Permission denied
+
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/permtest/open');
+----
+1
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/data.csv');
+----
+3
+
+statement ok
+DROP SECRET as_guest;
+
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
+----
+1
+
+# Scopes match whole path components: a secret for /permtest/lock doesn't apply
+# to /permtest/locked (here the environment's superuser can list it).
+statement ok
+CREATE SECRET as_guest_prefix (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest/lock', USER 'guest');
+
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
+----
+1
+
+statement ok
+DROP SECRET as_guest_prefix;
+
+# Replacing a secret replaces its connection: the new USER takes effect.
+statement ok
+CREATE SECRET as_who (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest/', USER 'guest');
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
+----
+Permission denied
+
+statement ok
+CREATE OR REPLACE SECRET as_who (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest/', USER 'hadoop');
+
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
+----
+1
+
+statement ok
+DROP SECRET as_who;
+
+# hdfs_reset_connections() drops the cached connections; the next access
+# reconnects.
+query I
+SELECT connections_dropped > 0 FROM hdfs_reset_connections();
+----
+true
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/data.csv');
+----
+3
+
+query I
+SELECT connections_dropped FROM hdfs_reset_connections();
+----
+1
+
+query I
+SELECT connections_dropped FROM hdfs_reset_connections();
+----
+0
+
+# --- logging --------------------------------------------------------------------
+
+# Opens, reads, writes and closes show up in DuckDB's FileSystem log.
+statement ok
+CALL enable_logging('FileSystem');
+
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/logged.csv' (FORMAT csv);
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/logged.csv');
+----
+1
+
+query II
+SELECT DISTINCT fs, op FROM duckdb_logs_parsed('FileSystem') WHERE path = 'hdfs://localhost:9000/test/logged.csv' ORDER BY op;
+----
+HdfsFileSystem	CLOSE
+HdfsFileSystem	OPEN
+HdfsFileSystem	READ
+HdfsFileSystem	WRITE
+
+statement ok
+CALL disable_logging();
+
+# --- error handling ----------------------------------------------------------
+
+# Opening a non-existent file surfaces a clear IO error.
+statement error
+SELECT * FROM read_csv('hdfs://localhost:9000/test/does_not_exist.csv');
+----
+No files found that match the pattern "hdfs://localhost:9000/test/does_not_exist.csv"
+
+# --- everything below needs the parquet extension ------------------------
+# Kept last, so the tests above still run without it.
+
+require parquet
+
+# --- reading Parquet over hdfs:// --------------------------------------------
+
+query I
+SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/data.parquet');
+----
+5
+
+query IT
+SELECT id, name FROM read_parquet('hdfs://localhost:9000/test/data.parquet') ORDER BY id LIMIT 1;
+----
+0	v0
+
 # --- writing (COPY TO) then reading back -------------------------------------
 # Writes go under nested/ so they can't perturb the /test/*.{csv,parquet} globs.
 
@@ -524,6 +645,83 @@ query I
 SELECT hdfs_exists('hdfs://localhost:9000/test/nested/failed_part');
 ----
 false
+
+# A single-file COPY that fails partway leaves no file behind: the aborted
+# write is removed, never completed (an HDFS close publishes the file).
+statement error
+COPY (SELECT CASE WHEN range = 500000 THEN error('boom') ELSE range END AS v FROM range(1000000))
+TO 'hdfs://localhost:9000/test/nested/aborted.csv' (FORMAT csv);
+----
+boom
+
+query I
+SELECT hdfs_exists('hdfs://localhost:9000/test/nested/aborted.csv');
+----
+false
+
+statement error
+COPY (SELECT CASE WHEN range = 500000 THEN error('boom') ELSE range END AS v FROM range(1000000))
+TO 'hdfs://localhost:9000/test/nested/aborted.parquet' (FORMAT parquet);
+----
+boom
+
+query I
+SELECT hdfs_exists('hdfs://localhost:9000/test/nested/aborted.parquet');
+----
+false
+
+# A failing USE_TMP_FILE overwrite keeps the original file intact, and the
+# temporary file is gone.
+statement error
+COPY (SELECT CASE WHEN range = 50000 THEN error('boom') ELSE 3 END AS v FROM range(100000))
+TO 'hdfs://localhost:9000/test/nested/tmpfile.csv' (FORMAT csv, HEADER, USE_TMP_FILE true);
+----
+boom
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:9000/test/nested/tmpfile.csv');
+----
+2
+
+query I
+SELECT hdfs_exists('hdfs://localhost:9000/test/nested/tmp_tmpfile.csv');
+----
+false
+
+# Writing over an existing file without USE_TMP_FILE replaces it; a file that
+# didn't exist is created exclusively (DuckDB's CSV writer asks for that).
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/nested/replaced.csv' (FORMAT csv, HEADER);
+
+statement ok
+COPY (SELECT 2 AS v) TO 'hdfs://localhost:9000/test/nested/replaced.csv' (FORMAT csv, HEADER);
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:9000/test/nested/replaced.csv');
+----
+2
+
+# Partition directories are created one level at a time (CreateDirectoryExtended
+# honours SINGLE): as for local files, the output directory's parent must exist.
+statement error
+COPY (SELECT range % 2 AS a, range AS v FROM range(12))
+TO 'hdfs://localhost:9000/test/nested/no_parent/part' (FORMAT csv, PARTITION_BY (a));
+----
+Failed to create HDFS directory
+
+query I
+SELECT hdfs_exists('hdfs://localhost:9000/test/nested/no_parent');
+----
+false
+
+statement ok
+COPY (SELECT range % 2 AS a, range % 3 AS b, range AS v FROM range(12))
+TO 'hdfs://localhost:9000/test/nested/deep_part' (FORMAT csv, PARTITION_BY (a, b));
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/nested/deep_part/*/*/*.csv');
+----
+12
 
 # Concurrent positional reads: a multi-row-group Parquet file read by many
 # threads at once.
@@ -695,66 +893,3 @@ SELECT count(DISTINCT md5(content)) FROM read_blob(['hdfs://localhost:9000/test/
 
 statement ok
 RESET threads;
-
-# --- hdfs secrets -------------------------------------------------------------------
-
-# A secret scoped to /permtest acts as the unprivileged user "guest" there,
-# while the rest of the cluster keeps the environment's (super)user.
-statement ok
-CREATE SECRET as_guest (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest', USER 'guest');
-
-statement error
-SELECT * FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
-----
-Permission denied
-
-query I
-SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/permtest/open');
-----
-1
-
-query I
-SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/data.csv');
-----
-3
-
-statement ok
-DROP SECRET as_guest;
-
-query I
-SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
-----
-1
-
-# --- logging --------------------------------------------------------------------
-
-# Opens, reads, writes and closes show up in DuckDB's FileSystem log.
-statement ok
-CALL enable_logging('FileSystem');
-
-statement ok
-COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/logged.csv' (FORMAT csv);
-
-query I
-SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/logged.csv');
-----
-1
-
-query II
-SELECT DISTINCT fs, op FROM duckdb_logs_parsed('FileSystem') WHERE path = 'hdfs://localhost:9000/test/logged.csv' ORDER BY op;
-----
-HdfsFileSystem	CLOSE
-HdfsFileSystem	OPEN
-HdfsFileSystem	READ
-HdfsFileSystem	WRITE
-
-statement ok
-CALL disable_logging();
-
-# --- error handling ----------------------------------------------------------
-
-# Opening a non-existent file surfaces a clear IO error.
-statement error
-SELECT * FROM read_csv('hdfs://localhost:9000/test/does_not_exist.csv');
-----
-No files found that match the pattern "hdfs://localhost:9000/test/does_not_exist.csv"

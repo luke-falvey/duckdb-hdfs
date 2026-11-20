@@ -2,6 +2,7 @@
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/json_document.hpp"
 
 #include <curl/curl.h>
 #include <openssl/crypto.h>
@@ -11,19 +12,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <chrono>
+#include <algorithm>
+#include <cctype>
 #include <climits>
 #include <cstdlib>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <utility>
 
 namespace duckdb {
 
 namespace {
 
-// --- base64 and JSON -----------------------------------------------------------
+// --- base64, JSON and URLs--------------------------------------------------------
 
 const char *const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -46,61 +46,10 @@ int B64Value(char c) {
 	return -1;
 }
 
-string JsonEscape(const string &s) {
-	string out;
-	for (char c : s) {
-		switch (c) {
-		case '"':
-			out += "\\\"";
-			break;
-		case '\\':
-			out += "\\\\";
-			break;
-		case '\n':
-			out += "\\n";
-			break;
-		default:
-			out += c;
-		}
-	}
-	return out;
-}
-
-// The string value of `"field": "..."` in a flat JSON object, or "" if absent.
-string JsonStringField(const string &json, const string &field) {
-	auto key = json.find("\"" + field + "\"");
-	if (key == string::npos) {
-		return string();
-	}
-	auto colon = json.find(':', key + field.size() + 2);
-	auto open = colon == string::npos ? colon : json.find('"', colon + 1);
-	if (open == string::npos) {
-		return string();
-	}
-	string out;
-	for (size_t i = open + 1; i < json.size(); i++) {
-		if (json[i] == '\\' && i + 1 < json.size()) {
-			out += json[++i];
-		} else if (json[i] == '"') {
-			return out;
-		} else {
-			out += json[i];
-		}
-	}
-	return string();
-}
-
-// `"outer": {"inner": "..."}` (Hadoop's error JSON), or "" if absent.
-string JsonNestedStringField(const string &json, const string &outer, const string &inner) {
-	auto key = json.find("\"" + outer + "\"");
-	if (key == string::npos) {
-		return string();
-	}
-	auto open = json.find_first_of("{\"", json.find(':', key + outer.size() + 2));
-	if (open == string::npos || json[open] != '{') {
-		return string();
-	}
-	return JsonStringField(json.substr(open), inner);
+// The string member `key` of a JSON object, or "" if `object` isn't one or has none.
+string StringMember(const JSONValue &object, const string &key) {
+	auto member = object.GetMember(key);
+	return member.IsString() ? member.GetString() : string();
 }
 
 string UrlEncode(const string &s) {
@@ -182,6 +131,14 @@ HttpResponse HttpPostJson(const string &url, const string &payload, bool spnego)
 	curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 20L);
 	curl_easy_setopt(h, CURLOPT_TIMEOUT, 60L);
 	curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+	// Only http(s), also for redirects (which aren't followed anyway): the URL comes from the cluster config.
+#if LIBCURL_VERSION_NUM >= 0x075500
+	curl_easy_setopt(h, CURLOPT_PROTOCOLS_STR, "http,https");
+	curl_easy_setopt(h, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+	curl_easy_setopt(h, CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+	curl_easy_setopt(h, CURLOPT_REDIR_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
 	if (spnego) {
 		// SPNEGO with the Kerberos ticket cache: no user name or password.
 		curl_easy_setopt(h, CURLOPT_HTTPAUTH, CURLAUTH_NEGOTIATE);
@@ -199,33 +156,67 @@ HttpResponse HttpPostJson(const string &url, const string &payload, bool spnego)
 	return response;
 }
 
-// --- decrypted key cache -----------------------------------------------------------------
+} // namespace
 
-struct CachedKey {
-	string key;
-	std::chrono::steady_clock::time_point expiry;
-};
+constexpr std::chrono::minutes HdfsKeyCache::DEFAULT_TTL;
+constexpr idx_t HdfsKeyCache::LIMIT;
 
-struct KeyCache {
-	std::mutex mutex;
-	std::map<string, CachedKey> keys;
-	static constexpr size_t LIMIT = 4096;
-	// Bounds how long a revoked KMS permission keeps working for an open client.
-	static constexpr std::chrono::minutes TTL {10};
-};
+HdfsKeyCache::HdfsKeyCache(std::chrono::steady_clock::duration ttl_p) : ttl(ttl_p) {
+}
 
-void Wipe(string &secret) {
+HdfsKeyCache::~HdfsKeyCache() {
+	for (auto &entry : entries) {
+		HdfsCrypto::Wipe(entry.second.key);
+	}
+}
+
+string HdfsKeyCache::Get(const string &id) {
+	std::lock_guard<std::mutex> lock(mutex);
+	auto it = entries.find(id);
+	if (it == entries.end()) {
+		return string();
+	}
+	if (it->second.expiry > std::chrono::steady_clock::now()) {
+		return it->second.key;
+	}
+	HdfsCrypto::Wipe(it->second.key);
+	entries.erase(it);
+	return string();
+}
+
+void HdfsKeyCache::Put(const string &id, const string &key) {
+	auto now = std::chrono::steady_clock::now();
+	std::lock_guard<std::mutex> lock(mutex);
+	if (entries.size() >= LIMIT) {
+		// Expired entries first; if none are, start over.
+		bool all = std::none_of(entries.begin(), entries.end(), [&](const std::pair<const string, Entry> &entry) {
+			return entry.second.expiry <= now;
+		});
+		for (auto it = entries.begin(); it != entries.end();) {
+			if (all || it->second.expiry <= now) {
+				HdfsCrypto::Wipe(it->second.key);
+				it = entries.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+	auto &entry = entries[id];
+	HdfsCrypto::Wipe(entry.key);
+	entry.key = key;
+	entry.expiry = now + ttl;
+}
+
+idx_t HdfsKeyCache::Size() {
+	std::lock_guard<std::mutex> lock(mutex);
+	return entries.size();
+}
+
+void HdfsCrypto::Wipe(string &secret) {
 	if (!secret.empty()) {
 		OPENSSL_cleanse(&secret[0], secret.size());
 	}
 }
-
-KeyCache &DecryptedKeys() {
-	static KeyCache cache;
-	return cache;
-}
-
-} // namespace
 
 string HdfsCrypto::Base64Encode(const string &data) {
 	string out;
@@ -286,6 +277,10 @@ vector<string> HdfsCrypto::ParseKmsUri(const string &uri) {
 		throw IOException("invalid KMS URI '" + uri + "'");
 	}
 	string scheme = uri.substr(prefix.size(), at - prefix.size());
+	std::transform(scheme.begin(), scheme.end(), scheme.begin(), [](unsigned char c) { return std::tolower(c); });
+	if (scheme != "http" && scheme != "https") {
+		throw IOException("unsupported KMS URI '" + uri + "': the scheme must be http or https");
+	}
 	auto path_start = uri.find('/', at + 1);
 	string authority = uri.substr(at + 1, path_start == string::npos ? string::npos : path_start - at - 1);
 	string path = path_start == string::npos ? string() : uri.substr(path_start);
@@ -315,8 +310,42 @@ vector<string> HdfsCrypto::ParseKmsUri(const string &uri) {
 }
 
 string HdfsCrypto::KmsErrorMessage(const string &body) {
-	auto message = JsonNestedStringField(body, "RemoteException", "message");
-	return message.empty() ? JsonStringField(body, "message") : message;
+	JSONParseError error;
+	auto doc = JSONDocument::TryParse(body.data(), body.size(), error);
+	if (!doc) {
+		return string();
+	}
+	auto root = doc->GetRoot();
+	auto message = StringMember(root.GetMember("RemoteException"), "message");
+	return message.empty() ? StringMember(root, "message") : message;
+}
+
+string HdfsCrypto::KmsDecryptRequest(const string &key_name, const string &iv, const string &encrypted_key) {
+	JSONWriter writer;
+	auto request = writer.CreateObject();
+	request.AddString("name", key_name);
+	request.AddString("iv", Base64Encode(iv));
+	request.AddString("material", Base64Encode(encrypted_key));
+	writer.SetRoot(request);
+	return writer.ToString();
+}
+
+string HdfsCrypto::KmsDecryptedKey(const string &body) {
+	JSONParseError error;
+	auto doc = JSONDocument::TryParse(body.data(), body.size(), error);
+	if (!doc || !doc->GetRoot().GetMember("material").IsString()) {
+		throw IOException("KMS response has no decrypted key (\"material\")");
+	}
+	auto material = doc->GetRoot().GetMember("material").GetString();
+	string key;
+	try {
+		key = Base64Decode(material);
+	} catch (...) {
+		Wipe(material);
+		throw;
+	}
+	Wipe(material);
+	return key;
 }
 
 string HdfsCrypto::CurrentOsUser() {
@@ -329,26 +358,16 @@ string HdfsCrypto::CurrentOsUser() {
 	return string(result->pw_name);
 }
 
-string HdfsCrypto::DecryptEncryptedKey(const string &cache_scope, const vector<string> &kms_urls, bool kerberos,
+string HdfsCrypto::DecryptEncryptedKey(HdfsKeyCache &cache, const vector<string> &kms_urls, bool kerberos,
                                        const string &user, const string &key_name, const string &key_version_name,
                                        const string &iv, const string &encrypted_key) {
-	string cache_key = cache_scope + '\0' + key_version_name + '\0' + iv + '\0' + encrypted_key;
-	auto now = std::chrono::steady_clock::now();
-	{
-		auto &cache = DecryptedKeys();
-		std::lock_guard<std::mutex> lock(cache.mutex);
-		auto it = cache.keys.find(cache_key);
-		if (it != cache.keys.end()) {
-			if (it->second.expiry > now) {
-				return it->second.key;
-			}
-			Wipe(it->second.key);
-			cache.keys.erase(it);
-		}
+	string cache_id = key_version_name + '\0' + iv + '\0' + encrypted_key;
+	auto cached = cache.Get(cache_id);
+	if (!cached.empty()) {
+		return cached;
 	}
 	string effective_user = kerberos ? string() : user;
-	string payload = "{\"name\":\"" + JsonEscape(key_name) + "\",\"iv\":\"" + Base64Encode(iv) + "\",\"material\":\"" +
-	                 Base64Encode(encrypted_key) + "\"}";
+	string payload = KmsDecryptRequest(key_name, iv, encrypted_key);
 	string last_error = "no KMS URL configured";
 	for (auto &base : kms_urls) {
 		string url = base + "/v1/keyversion/" + UrlEncode(key_version_name) + "/_eek?eek_op=decrypt";
@@ -373,20 +392,20 @@ string HdfsCrypto::DecryptEncryptedKey(const string &cache_scope, const vector<s
 			}
 			throw IOException(error);
 		}
-		auto material = Base64Decode(JsonStringField(response.body, "material"));
-		if (material.size() != 16 && material.size() != 32) {
+		string key;
+		try {
+			key = KmsDecryptedKey(response.body);
+		} catch (...) {
+			Wipe(response.body);
+			throw;
+		}
+		Wipe(response.body);
+		if (key.size() != 16 && key.size() != 32) {
+			Wipe(key);
 			throw IOException("KMS returned an invalid data encryption key for '" + key_name + "'");
 		}
-		auto &cache = DecryptedKeys();
-		std::lock_guard<std::mutex> lock(cache.mutex);
-		if (cache.keys.size() >= KeyCache::LIMIT) {
-			for (auto &entry : cache.keys) {
-				Wipe(entry.second.key);
-			}
-			cache.keys.clear();
-		}
-		cache.keys[cache_key] = CachedKey {material, now + KeyCache::TTL};
-		return material;
+		cache.Put(cache_id, key);
+		return key;
 	}
 	throw IOException(last_error);
 }

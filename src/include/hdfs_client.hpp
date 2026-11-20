@@ -9,8 +9,11 @@
 
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/optional_ptr.hpp"
 
 namespace duckdb {
+
+class Logger;
 
 //! What kind of failure an HdfsError is, for callers that react to it (retry, "not found", ...).
 enum class HdfsErrorType {
@@ -47,6 +50,8 @@ struct HdfsFileStatus {
 	uint16_t permission = 0;
 	int32_t replication = -1;
 	int64_t block_size = -1;
+	//! The NameNode's inode id (0 if unknown). A file replaced by another one under the same path gets a new id.
+	int64_t file_id = 0;
 };
 
 //! Behavior of listings and globs that walk more than one directory.
@@ -58,8 +63,10 @@ struct HdfsWalkOptions {
 	bool include_hidden = false;
 	//! List several directories per NameNode call (getBatchedListing, Hadoop 3.3+).
 	bool batched_listing = true;
-	//! Maximum number of concurrent listing calls.
+	//! Maximum number of concurrent listing calls (worker threads of one walk), 1 to MAX_PARALLELISM.
 	idx_t max_parallelism = 1;
+	//! Upper bound of max_parallelism (and of the hdfs_list_parallelism setting): each walk starts its own threads.
+	static constexpr idx_t MAX_PARALLELISM = 64;
 };
 
 //! Where a connection's configuration comes from (an `hdfs` secret); empty fields fall back to the Hadoop
@@ -77,19 +84,30 @@ public:
 	virtual ~HdfsReader() = default;
 
 	virtual int64_t Length() const = 0;
+	//! The modification time (epoch milliseconds) of the file version this reader reads.
+	virtual uint64_t ModificationTime() const = 0;
 	//! Read exactly `nr_bytes` at `offset`; files in an encryption zone are decrypted.
 	virtual void Read(data_ptr_t buffer, idx_t nr_bytes, idx_t offset) = 0;
 };
 
-//! A file being written (HDFS files are append-only).
+//! A file being written (HDFS files are append-only). The writer created the file, so it is the writer's to
+//! remove: a writer destroyed without Close() is aborted.
 class HdfsWriter {
 public:
 	virtual ~HdfsWriter() = default;
 
 	//! Append `nr_bytes`; files in an encryption zone are encrypted.
 	virtual void Write(const_data_ptr_t buffer, idx_t nr_bytes) = 0;
-	//! Flush and complete the file; the data is durable once this returns.
+	//! Send everything written so far to the DataNodes and have them sync it to disk (hsync). The NameNode keeps
+	//! the file under construction: readers may not see the new length until Close().
+	virtual void Sync() = 0;
+	//! Flush and complete the file; the data is durable once this returns. If it throws, the file may be
+	//! incomplete; Abort() still removes it.
 	virtual void Close() = 0;
+	//! Abandon the write without completing the file: delete it on the NameNode, then release the stream. The
+	//! file is never published under its name with partial contents. Never waits for the file to complete. Throws
+	//! if the delete fails (the incomplete file may then remain, until its lease expires).
+	virtual void Abort() = 0;
 };
 
 //! A directory walk running in the background (a listing or a glob). Not thread-safe.
@@ -110,15 +128,25 @@ public:
 	//! Connect to `authority` ("hdfs://host:port"), or to fs.defaultFS if empty. On a Kerberos cluster, the identity
 	//! is the principal in the Kerberos ticket cache.
 	static shared_ptr<HdfsClient> Connect(const string &authority, const HdfsConnectionConfig &config);
+	//! Log the NameNode RPCs this thread makes from now on (HdfsLogType, one entry per call) to `logger`, or stop
+	//! logging them (nullptr). Only a weak reference is kept: once the logger is gone (its query has ended), nothing
+	//! is logged. Walks log to the logger that was current when they started, from all their threads.
+	static void SetThreadLogger(const shared_ptr<Logger> &logger);
 
 	virtual HdfsFileStatus Stat(const string &path) = 0;
-	//! Open a file for reading. A file opened again while a reader on it is still open shares that reader, unless
-	//! `expected_length` (the size a listing reported; -1 if unknown) shows the file changed since.
-	virtual shared_ptr<HdfsReader> Open(const string &path, int64_t expected_length) = 0;
-	//! Create a file (and missing parent directories) for writing.
+	//! Open a file for reading. `expected` is the file's status from a listing (length, mtime and, if known, file
+	//! id), or null: the file is then stat'ed first. A file opened again while a reader on it is still open shares
+	//! that reader only if the reader reads the same version (same file id, mtime and length); the reader's own
+	//! version is what ModificationTime() and Length() report.
+	virtual shared_ptr<HdfsReader> Open(const string &path, optional_ptr<const HdfsFileStatus> expected) = 0;
+	//! Create a file (and missing parent directories) for writing. Without `overwrite`, an existing file is an
+	//! ALREADY_EXISTS error (checked atomically by the NameNode).
 	virtual unique_ptr<HdfsWriter> Create(const string &path, bool overwrite) = 0;
 	//! Create a directory and its missing parents.
 	virtual void CreateDirectories(const string &path) = 0;
+	//! Create a directory whose parent exists (a missing parent is a NOT_FOUND error). An existing directory is
+	//! not an error.
+	virtual void CreateDirectory(const string &path) = 0;
 	//! Delete a file or directory; returns false if it doesn't exist.
 	virtual bool Delete(const string &path, bool recursive) = 0;
 	//! Atomically rename `source` to `target`; with `overwrite`, an existing file (or empty directory) is replaced.

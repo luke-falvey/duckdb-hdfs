@@ -28,7 +28,8 @@ These items were deliberately left out because they change CI.
   against MinIO. Run the Kerberos suite nightly. Today CI runs only `hdfs_no_cluster.test`.
 - **clang-tidy in CI.** Bring it back in a job that installs the vcpkg dependencies. DuckDB uses it to enforce naming
   and smart-pointer rules. It passes locally today with DuckDB's `.clang-tidy`.
-- **`make test_unit` in CI.** Run it after the build; it covers the crypto and batched-listing C++ tests.
+- **`make test_unit` in CI.** Run it after the build; it covers the glob planner, the metadata time conversion, and
+  the crypto and batched-listing C++ tests.
 - **Cost:** a few minutes per run for the Docker cluster, and one more vcpkg build for clang-tidy.
 
 ### 3. Keep the listing parallel when batched listing is on
@@ -63,16 +64,22 @@ holding back a directory's results until every directory sorting before it is do
 
 ### 6. Tests for two fixes that have none yet
 
-- **Shared readers.** Opening a file that was overwritten, deleted or renamed through this client must not reuse the
-  old reader (`HdfsClientImpl::ForgetReaders`, and the `expected_length` check). sqllogictest can't keep a handle open
-  between statements, so this needs a C++ test or a `concurrentloop` test.
-- **KMS key cache.** Keys must be scoped per connection and expire after `KeyCache::TTL`. A C++ test against a stub
-  HTTP server would cover it.
+- **Shared readers.** Opening a file that was overwritten, deleted or renamed must not reuse the old reader
+  (`HdfsClientImpl::ForgetReaders`, and the file id + mtime + length check in `HdfsClientImpl::Open`), also when
+  another client replaced it with a same-size file. sqllogictest can't keep a handle open between statements, so this
+  needs a C++ test or a `concurrentloop` test.
+- **KMS calls.** `HdfsKeyCache` itself has C++ tests (expiry, eviction); `DecryptEncryptedKey` against a stub KMS
+  (failover to the next URL on 5xx, error messages, the cache hit) has none.
 
-### 7. FileSync
+### 7. Fault-injection tests for writes and mutations
 
-`HdfsFileSystem::FileSync` does nothing: data is durable once `HdfsWriter::Close` returns. If libhdfs3's
-`OutputStream` exposes `sync()` (hflush/hsync) at the pinned commit, call it so `FileSync` means what DuckDB expects.
+The SQL tests cover aborted writes caused by query errors. These paths have no test, because they need a NameNode
+that fails at a chosen moment (e.g. a proxy that drops the connection, or a test-only `HdfsClient`):
+
+- `HdfsWriter::Abort` when the delete fails (the stream is left unclosed, so the file is not completed);
+- the connection-failure recovery of create, delete and rename (`HdfsConnection::RunMutation` callers in
+  `hdfs_filesystem.cpp`);
+- `FileSync` (core calls it only from its log storage and WAL-like writers).
 
 ### 8. Reduce the libhdfs3 patch set
 
@@ -87,14 +94,13 @@ The `hdfs` secret supports `CONFIG_DIR` and `USER`. Possible additions:
 - a Kerberos principal and keytab (keytab login isn't supported yet; see the README);
 - KMS settings.
 
-Each new parameter needs the connection key in `HdfsFileSystem::GetConnection` to include it.
+Each new parameter needs `HdfsConnectionConfig` and `SameConfig` in `hdfs_filesystem.cpp` to include it, so that a
+replaced secret replaces its connection.
 
 ### 10. Smaller follow-ups
 
 - **`std::` types.** `HdfsWalkImpl` still uses `std::vector`, `std::deque` and `std::mutex` directly; switch them to
   DuckDB's types where that doesn't fight libhdfs3's.
-- **Thread creation failure.** If starting a worker thread fails in `HdfsWalkImpl::SpawnIfNeeded`, the process
-  terminates. Report it as a walk error instead.
 - **Next DuckDB bump.** DuckDB is replacing many `ClientContext` uses with a new `Context` class (duckdb/duckdb#28314).
   Check the `FileOpener` and setting lookups when moving past v2.0.0.
 
@@ -111,7 +117,8 @@ These were taken deliberately. Revisit them only with a reason.
 | Errors map to DuckDB exception types: invalid patterns are `Invalid Input Error`, bad configuration is `Invalid Configuration Error`, everything else is `IO Error`. | It matches how DuckDB classifies errors. |
 | `hdfs_batched_listing` replaces the `duckdb.hdfs.batched-listing.enabled` key in `hdfs-site.xml`. The key still works, and batching happens only if both allow it. | DuckDB behaviour belongs in DuckDB settings, and existing configurations keep working. |
 | `hdfs` secrets are the place for per-URL configuration; the Hadoop environment is the fallback. A `USER` on a Kerberos cluster is an error. | This follows DuckDB's `s3` and `azure` secrets. On Kerberos, the identity is the ticket's principal. |
-| The KMS client stays on libcurl rather than DuckDB's `HTTPUtil`. | Core `HTTPUtil` can't do https or SPNEGO without the httpfs extension. |
+| The KMS client stays on libcurl rather than DuckDB's `HTTPUtil`, so DuckDB's proxy and CA settings don't apply to it (the README says so). | Core `HTTPUtil` can't do https or SPNEGO without the httpfs extension. |
+| libhdfs3's own log stays on stderr, at `FATAL` unless `dfs.client.log.severity` says otherwise; DuckDB's `HDFS` log type records NameNode RPCs instead. | libhdfs3 has one process-wide logger with no pluggable sink, so it can't be routed to a database's log. |
 | The directory walk keeps its own threads rather than using DuckDB's `TaskScheduler`. | The walk runs in the file-system layer, outside a pipeline. It can be cancelled through `ClientContext::BlockingInterruptCheck`. |
 | libhdfs3 fixes go in a separate `wire-encryption-fixes.patch`. | Editing `wire-encryption.patch` in place would break the three patches that apply after it. |
-| The crypto and batched-listing helpers keep C++ unit tests; glob behaviour is tested in SQL (`hdfs_glob.test`). | DuckDB prefers sqllogictest. The crypto tests check NIST test vectors, which SQL can't reach. |
+| The glob planner, crypto and batched-listing helpers keep C++ unit tests; glob matching against a real tree is also tested in SQL (`hdfs_glob.test`). | DuckDB prefers sqllogictest, but SQL tests of globs need a cluster, so CI couldn't run them. The crypto tests check NIST test vectors, which SQL can't reach. |

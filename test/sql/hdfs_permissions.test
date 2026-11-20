@@ -81,3 +81,55 @@ statement error
 SELECT hdfs_exists('hdfs://localhost:9000/permtest/locked/b.csv');
 ----
 Permission denied
+
+# --- writes without permission ----------------------------------------------------------
+# A write the NameNode refuses fails the COPY and leaves nothing behind.
+statement error
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/permtest/locked/new.csv' (FORMAT csv);
+----
+Permission denied
+
+statement error
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/permtest/open/new.csv' (FORMAT csv);
+----
+Permission denied
+
+query I
+SELECT hdfs_exists('hdfs://localhost:9000/permtest/open/new.csv');
+----
+false
+
+# --- secret scopes match whole path components --------------------------------------------
+# A secret scoped to /permtest/lock does not cover /permtest/locked: the read stays guest's.
+statement ok
+CREATE SECRET as_superuser (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest/lock', USER 'hadoop');
+
+statement error
+SELECT * FROM read_csv('hdfs://localhost:9000/permtest/locked/b.csv');
+----
+Permission denied
+
+# Scoped to the directory itself (with or without a trailing '/'), it applies.
+statement ok
+CREATE OR REPLACE SECRET as_superuser (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest/locked', USER 'hadoop');
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/permtest/locked/b.csv');
+----
+3
+
+statement ok
+CREATE OR REPLACE SECRET as_superuser (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest/locked/', USER 'hadoop');
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/permtest/locked/b.csv');
+----
+3
+
+statement ok
+DROP SECRET as_superuser;
+
+statement error
+SELECT * FROM read_csv('hdfs://localhost:9000/permtest/locked/b.csv');
+----
+Permission denied

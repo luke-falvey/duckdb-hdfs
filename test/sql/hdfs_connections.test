@@ -1,0 +1,70 @@
+# name: test/sql/hdfs_connections.test
+# description: hdfs secret scopes and the connection cache, without a cluster.
+# group: [sql]
+
+# A secret's CONFIG_DIR is checked before any network access, so a missing one tells which secret a URL resolved
+# to: no NameNode is needed.
+
+require hdfs
+
+query T
+SELECT function_name FROM duckdb_functions() WHERE function_name = 'hdfs_reset_connections';
+----
+hdfs_reset_connections
+
+statement ok
+CREATE SECRET scoped (TYPE hdfs, SCOPE 'hdfs://127.0.0.1:1/scoped', CONFIG_DIR '/nonexistent_scoped');
+
+statement ok
+CREATE SECRET catchall (TYPE hdfs, SCOPE 'hdfs://127.0.0.1:1/', CONFIG_DIR '/nonexistent_catchall');
+
+# The scope and the paths below it use the scoped secret...
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/scoped');
+----
+config_dir '/nonexistent_scoped' has no core-site.xml or hdfs-site.xml
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/scoped/a.csv');
+----
+config_dir '/nonexistent_scoped' has no core-site.xml or hdfs-site.xml
+
+# ...but a sibling that merely starts with the same characters does not: scopes match whole path components.
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/scoped2/a.csv');
+----
+config_dir '/nonexistent_catchall' has no core-site.xml or hdfs-site.xml
+
+statement error
+SELECT * FROM read_csv('hdfs://127.0.0.1:1/scopedx.csv');
+----
+config_dir '/nonexistent_catchall' has no core-site.xml or hdfs-site.xml
+
+# Replacing a secret replaces its connection.
+statement ok
+CREATE OR REPLACE SECRET scoped (TYPE hdfs, SCOPE 'hdfs://127.0.0.1:1/scoped', CONFIG_DIR '/nonexistent_replaced');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/scoped/a.csv');
+----
+config_dir '/nonexistent_replaced' has no core-site.xml or hdfs-site.xml
+
+# hdfs_reset_connections() drops every cached connection (one per NameNode and secret) and returns how many.
+query I
+SELECT connections_dropped FROM hdfs_reset_connections();
+----
+2
+
+query I
+SELECT connections_dropped FROM hdfs_reset_connections();
+----
+0
+
+statement ok
+CALL hdfs_reset_connections();
+
+statement ok
+DROP SECRET scoped;
+
+statement ok
+DROP SECRET catchall;

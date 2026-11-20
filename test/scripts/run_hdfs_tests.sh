@@ -40,6 +40,10 @@ HDFS_TEST_RUNNING=1 \
 HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
 HADOOP_USER_NAME=hadoop \
     "${UNITTEST}" test/sql/hdfs_glob.test
+HDFS_TEST_RUNNING=1 \
+HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
+HADOOP_USER_NAME=hadoop \
+    "${UNITTEST}" test/sql/hdfs_edge.test
 
 echo "==> Running HDFS permission tests (as a non-superuser)..."
 # A separate run as a plain user: the superuser above bypasses HDFS permission
@@ -95,6 +99,32 @@ expected="$(docker exec duckdb-hdfs-test bash -c "printf 'v\\n2\\n' | md5sum" | 
 actual="$(docker exec duckdb-hdfs-test bash -lc 'rm -f /tmp/ez_check.csv && hdfs dfs -get /ez/tmp.csv /tmp/ez_check.csv >/dev/null 2>&1 && md5sum /tmp/ez_check.csv' | cut -d' ' -f1)"
 if [ "${actual}" != "${expected}" ]; then
     echo "ERROR: the Java client decrypted /ez/tmp.csv differently (md5 ${actual}, expected ${expected})" >&2
+    exit 1
+fi
+echo "OK"
+
+echo "==> Checking the Java client reads DuckDB's multi-block encrypted writes..."
+# hdfs_edge.test writes the same bytes in and outside the zone, across 1 MiB blocks.
+# Compared through files: `hdfs dfs -cat` on a zone file can print the Java client's crypto-library warnings
+# on stdout, which would end up in a checksum of its output.
+multi_block_failed=0
+for f in rows.csv 2097153.bin 1048576.bin 0.bin; do
+    if ! docker exec duckdb-hdfs-test bash -lc "
+            set -e
+            rm -f /tmp/mb_plain /tmp/mb_enc
+            hdfs dfs -get /edge/duck/${f} /tmp/mb_plain >/dev/null 2>&1
+            hdfs dfs -get /ez/edge/duck/${f} /tmp/mb_enc >/dev/null 2>&1
+            cmp /tmp/mb_plain /tmp/mb_enc"; then
+        echo "ERROR: the Java client decrypted /ez/edge/duck/${f} differently from the plain copy" >&2
+        docker exec duckdb-hdfs-test bash -lc "
+            echo \"  sizes read by Java: \$(stat -c %s /tmp/mb_plain 2>/dev/null) (plain), \$(stat -c %s /tmp/mb_enc 2>/dev/null) (zone)\"
+            echo \"  first differing bytes (offset, plain, zone):\"
+            cmp -l /tmp/mb_plain /tmp/mb_enc 2>&1 | head -5
+        " >&2 || true
+        multi_block_failed=1
+    fi
+done
+if [ "${multi_block_failed}" -ne 0 ]; then
     exit 1
 fi
 echo "OK"

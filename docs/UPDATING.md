@@ -11,6 +11,10 @@ When a new DuckDB is released, update the extension to target it as follows:
     `ci_tools_version` inputs at the same `extension-ci-tools` branch.
   - Do **not** pass `duckdb_version`: with a `duckdb` submodule present, CI uses the commit it pins. That keeps local
     and CI builds on the same DuckDB.
+- Bump `./.github/workflows/Integration.yml`
+  - Set `VCPKG_COMMIT` to the `vcpkg_commit` default of the new `extension-ci-tools` branch
+    (`.github/workflows/_extension_distribution.yml`), so the integration build uses the same vcpkg ports as the
+    distribution build.
 
 # Updating libhdfs3
 The HDFS client is built by the vcpkg overlay port in `vcpkg_ports/libhdfs3/`, pinned to a ClickHouse/libhdfs3 commit.
@@ -21,7 +25,8 @@ To move to a newer commit:
 - Check that the patches in that directory still apply, and drop any that upstream has absorbed.
 - Check `vcpkg_ports/libhdfs3/cmake/CMakeLists.txt` against upstream's source list (ClickHouse's
   `contrib/libhdfs3-cmake/CMakeLists.txt` is a good reference).
-- Rebuild from scratch and run `make test`, `make test_unit` and `test/scripts/run_hdfs_tests.sh`.
+- Rebuild from scratch and run `make test`, `make test_unit`, `test/scripts/run_hdfs_tests.sh` and
+  `test/scripts/run_kerberos_tests.sh` (the Integration Tests workflow runs all four).
 
 ## Patch inventory
 

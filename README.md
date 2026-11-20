@@ -14,16 +14,59 @@ SELECT * FROM read_csv('hdfs://namenode:8020/data/users.csv');
 COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORMAT parquet);
 ```
 
+## Installing and loading
+
+The extension isn't in DuckDB's core or community extension repositories, so
+it is unsigned. Build it (see [Building](#building)), or take
+`hdfs.duckdb_extension` for your platform from a CI run's artifacts. It must
+match your DuckDB version and platform. Then allow unsigned extensions and
+load it:
+
+```sh
+duckdb -unsigned        # sets the allow_unsigned_extensions option at startup
+```
+
+```sql
+LOAD '/path/to/hdfs.duckdb_extension';
+
+-- Or install it once, then load it by name in later sessions:
+INSTALL '/path/to/hdfs.duckdb_extension';
+LOAD hdfs;
+```
+
+From Python: `duckdb.connect(config={'allow_unsigned_extensions': 'true'})`,
+then `LOAD`. The shell built by `make` (`build/release/duckdb`) has the
+extension linked in and needs no `LOAD`.
+
+**Load it before the first `hdfs://` path.** DuckDB autoloads extensions only
+for a fixed list of URL prefixes (`s3://`, `https://`, …), and `hdfs://` isn't
+on it. Without `LOAD hdfs`, DuckDB treats an `hdfs://` URL as a local file name,
+so a read fails with a misleading `No files found that match the pattern`, and
+`hdfs_ls` doesn't exist.
+
+For the same reason DuckDB treats `hdfs://` paths as local in other places.
+The one to know about is the external file cache, which keeps HDFS reads only
+with `SET cache_local_files = true` (see [Performance](#performance)).
+
+## Platforms
+
+Linux and macOS. CI builds the extension for DuckDB's Linux and macOS
+platforms (`.github/workflows/MainDistributionPipeline.yml`). The cluster and
+Kerberos tests run on Linux amd64 only (`.github/workflows/Integration.yml`).
+Windows and WebAssembly aren't supported: libhdfs3 needs POSIX sockets, and its
+vcpkg port excludes Windows.
+
 ## What works
 
 - Reading any file format DuckDB supports (Parquet, CSV, JSON, …) over `hdfs://`.
-- Writing via `COPY ... TO`, including `PARTITION_BY` (HDFS is append-only;
-  random writes are not supported).
+- Writing via `COPY ... TO`, including `PARTITION_BY`. See [Writing](#writing)
+  for what happens when a write fails.
 - Globbing, directory listing, file metadata, and directory/file management
   (create/remove directories, remove files, rename).
 - Concurrent positional reads (DuckDB's parallel Parquet reader).
 - NameNode HA (`dfs.nameservices`, e.g. `hdfs://mycluster/path`) and
-  erasure-coded files.
+  erasure-coded files. *Experimental: no test covers either yet (the test
+  cluster has one NameNode and replicated files).*
 - Kerberos-secured clusters (`hadoop.security.authentication=kerberos`): the
   identity is the principal in your Kerberos ticket cache (`kinit` first;
   `KRB5CCNAME` or `hadoop.security.kerberos.ticket.cache.path` pick a cache),
@@ -36,15 +79,25 @@ COPY (SELECT * FROM big_table) TO 'hdfs://namenode:8020/out/table.parquet' (FORM
   `dfs.encrypt.data.transfer`. RPC protection is negotiated automatically
   (restrict it with `hadoop.rpc.protection`); for DataNode protection set
   `dfs.data.transfer.protection` (or `dfs.encrypt.data.transfer`) in the client
-  config, as for Hadoop.
+  config, as for Hadoop. *Experimental: this code (SASL wrapping, the
+  DIGEST-MD5 client and AES/CTR transfer encryption) is patched into libhdfs3
+  here and is new. CI runs the Kerberos suite against a single-node Docker
+  cluster in each protection mode (`test/scripts/run_kerberos_tests.sh`), but
+  it hasn't been verified on production clusters.*
 - HDFS encryption zones (Transparent Data Encryption): files are decrypted and
   encrypted client-side with AES-CTR, after the Hadoop KMS unwraps each file's
   key. Configure the key provider as for Hadoop
   (`hadoop.security.key.provider.path`, or `dfs.encryption.key.provider.uri`,
   e.g. `kms://https@kms1;kms2:9600/kms`). The KMS is called with SPNEGO on
   Kerberos clusters, else with simple authentication as the effective user.
-  For an `https` KMS, the CA bundle comes from `CURL_CA_BUNDLE` /
-  `SSL_CERT_FILE` or the usual system locations.
+  Only `http` and `https` KMS URLs are accepted. The KMS is called with
+  libcurl rather than DuckDB's HTTP client (which can't do SPNEGO), so
+  DuckDB's `http_proxy` and CA settings don't apply to it: for an `https` KMS,
+  the CA bundle comes from `CURL_CA_BUNDLE` / `SSL_CERT_FILE` or the usual
+  system locations, and a proxy from libcurl's `https_proxy` / `http_proxy` /
+  `no_proxy` environment variables. Decrypted file keys are cached per
+  connection for up to 10 minutes, and wiped from memory when they expire or
+  the connection closes (at the latest, with the database).
 
 ## Not supported yet
 
@@ -73,11 +126,31 @@ SELECT * FROM hdfs_stat('hdfs://namenode:8020/data');
 SELECT hdfs_exists('hdfs://namenode:8020/data/events');
 ```
 
-`hdfs_ls` and `hdfs_stat` return the same columns: `path`, `name`, `type`
-(`'file'`/`'directory'`), `size`, `owner`, `group`, `permissions`
-(`rwxr-xr-x`), `mode`, `replication`, `block_size`, `last_modified`,
-`last_accessed`. Row order is not guaranteed — add `ORDER BY path` if it
-matters.
+`hdfs_ls` and `hdfs_stat` return the same columns. Row order is not
+guaranteed — add `ORDER BY path` if it matters.
+
+| Column | Type | Description |
+|---|---|---|
+| `path` | `VARCHAR` | Full URL, `hdfs://host:port/a/b` |
+| `name` | `VARCHAR` | Last path component |
+| `type` | `VARCHAR` | `'file'` or `'directory'` |
+| `size` | `BIGINT` | Length in bytes (0 for directories) |
+| `owner`, `group` | `VARCHAR` | |
+| `permissions` | `VARCHAR` | `rwxr-xr-x`, as `hdfs dfs -ls` shows it |
+| `mode` | `USMALLINT` | The permission bits as a number (`rwxr-xr-x` = 493) |
+| `replication` | `INTEGER` | `NULL` for directories |
+| `block_size` | `BIGINT` | `NULL` for directories |
+| `last_modified` | `TIMESTAMP WITH TIME ZONE` | Modification time (an instant, as `read_blob`'s `last_modified`) |
+| `last_accessed` | `TIMESTAMP WITH TIME ZONE` | Access time; `NULL` when HDFS doesn't track it (directories, or `dfs.namenode.accesstime.precision = 0`) |
+
+`hdfs_exists` asks the NameNode each time it runs, so a prepared statement
+sees files that appeared or disappeared since `PREPARE`. Errors other than
+"not found" (permission denied, NameNode unreachable) fail the query.
+
+All three functions obey the same access controls as reads:
+`disabled_filesystems = 'HdfsFileSystem'` disables them, and with
+`enable_external_access = false` only paths under `allowed_directories` /
+in `allowed_paths` are allowed.
 
 Behavior notes:
 
@@ -87,8 +160,15 @@ Behavior notes:
   matched entries themselves (like `ls -d`; no matches → empty result); a
   plain directory path lists its children. Names are matched by DuckDB's own
   glob matcher, so `?` matches one byte (as for local files). In scans,
-  globbed files are read in path order, and a pattern that matches nothing is
-  tried as a literal path (a file named `data[1].csv`, say).
+  globbed files are read in path order.
+- **Literal names with glob characters**: a path containing `*`, `?`, `[` or
+  `{` is a pattern, in scans and `hdfs_ls` alike. One that matches nothing is
+  tried as a literal path, so a file named `data[1].csv` or `a{b}.csv` can be
+  read and listed by its name (a literal directory lists its children).
+- **Braces**: `{a,b}` groups nest, and a `{` or `,` inside a character class
+  (`[{,]`) or escaped (`\{`) is literal. An unclosed group is an error. Each
+  group multiplies the number of patterns, and a pattern that expands to more
+  than 10,000 is an error.
 - **Hidden entries** (names starting with `_` or `.`, e.g. `_SUCCESS`) are
   skipped unless the path names them explicitly (`'/data/_*'`) or you set
   `include_hidden := true` / `SET hdfs_include_hidden = true`.
@@ -101,6 +181,39 @@ Behavior notes:
   whole subtree. On Hadoop 3.3+ NameNodes, up to 100 directories are listed
   per NameNode call (batched listing); older NameNodes and Routers get one
   call per directory. Up to `hdfs_list_parallelism` calls run in parallel.
+  Directories are processed a page (1,000 entries) at a time, so `LIMIT` or a
+  cancelled query stops a walk after the current page.
+
+## Writing
+
+- **Sequential only.** HDFS files are append-only: each write must start where
+  the previous one ended (a write after a seek elsewhere is an error), a file
+  can't be opened for reading and writing at once, and appending to an existing
+  file is not supported.
+- **A failed write leaves no file.** HDFS publishes a file under its name when
+  the writer closes it, so a write that fails (an error in the query, a failed
+  write or close) is *aborted*: the file is deleted on the NameNode without
+  being completed. If that delete fails too (the NameNode is unreachable), the
+  error says so; the file then stays under construction, and HDFS recovers it
+  (with what was written) once its lease expires. A writer that is dropped
+  without an error commits, as for local files.
+- **Existing files.** DuckDB asks for an exclusive create when it expects a new
+  file; the NameNode then refuses to replace a file that appeared meanwhile.
+  Otherwise an existing file is replaced.
+- **Durability.** A file's data is durable once the write completes. DuckDB's
+  `FileSync` (used e.g. by its log storage) does an hsync: what was written so
+  far is on the DataNodes' disks, while the file stays open.
+- **Directories.** A partitioned `COPY` creates its output directory and the
+  partition directories one level at a time, so, as for local files, the
+  output directory's parent must exist. Removing a directory that should be
+  empty (e.g. after a failed partitioned `COPY`) is one non-recursive delete,
+  which the NameNode refuses for a non-empty directory.
+- **Connection failures.** Reads are retried once on a new connection. Creates,
+  deletes and renames are not simply sent again (the first attempt may have
+  taken effect): after reconnecting, the extension checks whether it did (a
+  deleted path is gone; a renamed source is gone and the target has its
+  length). Where it can't tell, as for a create whose file now exists, the
+  error says the outcome is unknown.
 
 ## URLs
 
@@ -113,14 +226,25 @@ scheme-only form `hdfs:///path` uses `fs.defaultFS` from your Hadoop config.
 
 | Setting | Default | Description |
 |---|---|---|
-| `hdfs_list_parallelism` | `16` | Max concurrent directory-listing RPCs for recursive listings and globs. Raise cautiously on shared clusters — it multiplies NameNode load. |
-| `hdfs_include_hidden` | `false` | Include hidden (`_`/`.`) entries in listings, globs and scans. Per-call override: `include_hidden := …`. |
-| `hdfs_skip_permission_errors` | `false` | Skip unreadable subtrees instead of failing the query. Per-call override: `skip_permission_errors := …`. |
-| `hdfs_batched_listing` | `true` | List up to 100 directories per NameNode call (`getBatchedListing`, Hadoop 3.3+). NameNodes that can't are detected automatically; turn it off only if a proxy in front of the NameNode mishandles the call. |
+| `hdfs_list_parallelism` | `16` | Maximum number of concurrent directory-listing calls (threads) in each recursive listing or glob, from 1 to 64. |
+| `hdfs_include_hidden` | `false` | Whether listings, globs and scans include hidden entries. |
+| `hdfs_skip_permission_errors` | `false` | Whether to skip unreadable subtrees instead of failing the query. |
+| `hdfs_batched_listing` | `true` | Whether to list several directories per NameNode call. |
 
 ```sql
 SET hdfs_list_parallelism = 64;
 ```
+
+- `hdfs_list_parallelism` multiplies the load on the NameNode: raise it
+  cautiously on shared clusters. Each listing or glob starts its own threads,
+  so the setting is capped at 64 (0 is an error; 1 lists one directory at a
+  time).
+- Hidden entries are names starting with `_` or `.`. `hdfs_ls` takes the
+  per-call override `include_hidden := …`, and `skip_permission_errors := …`
+  for `hdfs_skip_permission_errors`.
+- Batched listing (`getBatchedListing`, Hadoop 3.3+) lists up to 100
+  directories per call. NameNodes without it are detected on the first call,
+  so turn it off only if a proxy in front of the NameNode mishandles the call.
 
 ### Connection configuration
 
@@ -166,17 +290,40 @@ Both parameters are optional; what a secret leaves out comes from the
 environment. On a Kerberos cluster the identity is always the ticket cache's
 principal, so `USER` is an error there.
 
+- **Scopes match whole path components**: a secret scoped to
+  `hdfs://nn:8020/data` covers `hdfs://nn:8020/data` and everything below it,
+  but not `hdfs://nn:8020/data2`. The longest matching scope wins, as for other
+  DuckDB secrets.
+- **Each path resolves its own secret.** A rename (`COPY ... USE_TMP_FILE`)
+  needs its source and target to resolve to the same configuration.
+- **Connections are cached** per NameNode and secret, for the database's
+  lifetime. Replacing a secret (`CREATE OR REPLACE SECRET`) with a new
+  configuration replaces its connection. To pick up other changes (an edited
+  `core-site.xml` / `hdfs-site.xml`, a new Kerberos ticket cache, environment
+  variables) or to release the connections of dropped secrets, call
+  `hdfs_reset_connections()`; it returns how many connections it dropped.
+  Files that are open keep their connection until they are closed.
+
+```sql
+CALL hdfs_reset_connections();
+```
+
 ## Performance
 
 On a real cluster each NameNode or DataNode round trip costs 0.5–5 ms, so
 scans of many small files are dominated by round trips, not bandwidth. The
 extension keeps them down:
 
-- **Opening a file is one NameNode RPC** (its block locations, which also carry
-  the length and any encryption info). Sizes and modification times found by a
-  glob are reused instead of asking again. A file opened again while it is
-  still open (DuckDB's Parquet reader does this) shares the open file, and
-  extra streams for parallel reads of one file cost no RPC.
+- **Opening a file takes one NameNode RPC once its status is known**: its
+  block locations, which also carry the length and any encryption info. The
+  status (size, modification time) of a file found by a glob or listing is
+  reused; otherwise it costs one more RPC. So reading a single file, e.g.
+  `read_parquet('hdfs://nn/f.parquet')`, is two RPCs: DuckDB expands even a
+  literal path as a glob, which stats it, then the open fetches the block
+  locations. A file opened again while it is still open (DuckDB's Parquet
+  reader does this) shares the open file if it is still the same version (file
+  id, modification time and length), and extra streams for parallel reads of
+  one file cost no RPC.
 - **DataNode connections are reused** across reads and files: up to
   `dfs.client.socketcache.capacity` idle connections (default 64 here, 16 in
   Hadoop; DuckDB reads on many threads at once) are kept for
@@ -191,7 +338,33 @@ extension keeps them down:
 
 A scan of 2,000 small Parquet files, one per partition directory, makes about
 one NameNode RPC per file (opening it; the 2,000 directories are listed in 22
-calls) where it made 8.
+calls) where it made 8. `test/sql/hdfs_rpc_log.test` pins the RPC counts of a
+single-file read and of listings.
+
+### Logging NameNode RPCs
+
+The `HDFS` log type records one entry per NameNode RPC the extension makes:
+the operation (`getFileInfo`, `getBlockLocations`, `listDirectory`,
+`getBatchedListing`, `create`, `mkdirs`, `delete`, `rename2`), the HDFS path,
+`duration_us` and whether it succeeded (`ok`).
+
+```sql
+CALL enable_logging('HDFS');
+SELECT count(*) FROM read_parquet('hdfs://namenode:8020/data/events/*.parquet');
+SELECT op, count(*), sum(duration_us) / 1000 AS ms
+FROM duckdb_logs_parsed('HDFS') GROUP BY op;
+```
+
+- A `listDirectory` entry covers a whole directory: one directory of more than
+  1,000 entries (the NameNode's `dfs.ls.limit`) takes one call per 1,000, and
+  `duration_us` is their sum. A `getBatchedListing` entry is one call (its
+  `path` names the first of its directories).
+- Calls libhdfs3 makes on its own are not logged: further block locations
+  while reading a large file, completing a written file, lease renewals and
+  KMS calls.
+- libhdfs3's own log is process-wide and goes to stderr, so it is kept at
+  `FATAL`. To see it while debugging (retries, failovers), set
+  `dfs.client.log.severity` (e.g. `INFO`) in `hdfs-site.xml`.
 
 Tuning:
 
@@ -250,7 +423,7 @@ Tests that don't need a cluster run with:
 
 ```sh
 make test         # SQL tests (cluster tests are skipped)
-make test_unit    # C++ unit tests: encryption helpers, batched listing
+make test_unit    # C++ unit tests (after make)
 ```
 
 The HDFS integration tests (`test/sql/hdfs.test`, `test/sql/hdfs_glob.test`, …) run against a real
@@ -270,6 +443,15 @@ HDFS_TEST_RUNNING=1 HADOOP_CONF_DIR="$(pwd)/test/hdfs-conf" HADOOP_USER_NAME=had
     build/release/test/unittest test/sql/hdfs.test
 test/scripts/hdfs_down.sh
 ```
+
+The Kerberos suite runs the same way with `test/scripts/run_kerberos_tests.sh`.
+CI runs all of these on Linux (`.github/workflows/Integration.yml`); see
+[test/README.md](test/README.md) for what each test file covers and
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute.
+
+The test cluster uses 1 MiB blocks, and the client fetches the locations of
+only 2 blocks on open, so modest test files cross block boundaries and the
+prefetched locations (`test/sql/hdfs_edge.test`).
 
 See `test/docker/` for the cluster definition. The one detail that makes HDFS
 reachable from the host is advertising the DataNode as `localhost` and setting

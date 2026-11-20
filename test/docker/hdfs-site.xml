@@ -13,6 +13,21 @@
         <name>dfs.replication</name>
         <value>1</value>
     </property>
+    <!--
+      Small blocks, so modest test files span several blocks (the NameNode's
+      minimum, dfs.namenode.fs-limits.min-block-size, is also 1 MiB). This is the
+      block size of files the Java client in the container writes (hdfs_up.sh's
+      fixtures); DuckDB's writes take theirs from the client config
+      (test/hdfs-conf/hdfs-site.xml), which sets the same size.
+    -->
+    <property>
+        <name>dfs.blocksize</name>
+        <value>1048576</value>
+    </property>
+    <property>
+        <name>dfs.namenode.fs-limits.min-block-size</name>
+        <value>1048576</value>
+    </property>
     <property>
         <name>dfs.namenode.name.dir</name>
         <value>file:///tmp/hdfs/name</value>

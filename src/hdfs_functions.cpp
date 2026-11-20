@@ -1,7 +1,9 @@
 #include "hdfs_functions.hpp"
 
 #include "hdfs_filesystem.hpp"
+#include "hdfs_glob.hpp"
 
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
@@ -11,6 +13,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -52,9 +55,9 @@ constexpr idx_t COL_LAST_MODIFIED = 10;
 constexpr idx_t COL_LAST_ACCESSED = 11;
 
 void DefineMetadataSchema(vector<LogicalType> &types, vector<Identifier> &names) {
-	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::BIGINT,
-	         LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::USMALLINT,
-	         LogicalType::INTEGER, LogicalType::BIGINT,  LogicalType::TIMESTAMP, LogicalType::TIMESTAMP};
+	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,      LogicalType::BIGINT,
+	         LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,      LogicalType::USMALLINT,
+	         LogicalType::INTEGER, LogicalType::BIGINT,  LogicalType::TIMESTAMP_TZ, LogicalType::TIMESTAMP_TZ};
 	names = {"path",        "name", "type",        "size",       "owner",         "group",
 	         "permissions", "mode", "replication", "block_size", "last_modified", "last_accessed"};
 }
@@ -63,6 +66,24 @@ void DefineMetadataSchema(vector<LogicalType> &types, vector<Identifier> &names)
 string PermissionString(uint16_t mode) {
 	static const char *const RWX[] = {"---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"};
 	return string(RWX[(mode >> 6) & 0x7]) + RWX[(mode >> 3) & 0x7] + RWX[mode & 0x7];
+}
+
+//! The checks DuckDB's OpenerFileSystem makes before every file system call: the file system isn't in
+//! `disabled_filesystems`, and with `enable_external_access = false` the path is in `allowed_directories` /
+//! `allowed_paths`. The functions call HdfsFileSystem directly, so they must make them themselves.
+void VerifyCanAccess(ClientContext &context, HdfsFileSystem &hdfs, const string &path) {
+	// By name rather than by path: a scheme-less path (the default FS) would otherwise resolve to the local FS.
+	if (FileSystem::GetFileSystem(context).SubSystemIsDisabled(hdfs.GetName())) {
+		throw PermissionException("File system %s has been disabled by configuration", hdfs.GetName());
+	}
+	auto &config = DBConfig::GetConfig(context);
+	auto opener = ClientData::Get(context).file_opener.get();
+	// The path may name a file or a directory (an allowed directory "hdfs://nn/d/" allows "hdfs://nn/d" itself).
+	if (!config.CanAccessFile(path, FileType::FILE_TYPE_REGULAR, opener) &&
+	    !config.CanAccessFile(path, FileType::FILE_TYPE_DIR, opener)) {
+		throw PermissionException("Cannot access path \"%s\" - file system operations are disabled by configuration",
+		                          path);
+	}
 }
 
 struct HdfsMetaBindData : public TableFunctionData {
@@ -100,6 +121,9 @@ unique_ptr<FunctionData> HdfsMetaBind(ClientContext &context, TableFunctionBindI
 struct HdfsMetaGlobalState : public GlobalTableFunctionState {
 	vector<column_t> column_ids;
 	unique_ptr<HdfsListStream> stream;
+	//! A glob that has matched nothing yet; if it ends that way, the path is tried as a literal path.
+	bool literal_fallback = false;
+	HdfsWalkOptions options;
 	vector<HdfsEntry> entries;
 	idx_t offset = 0;
 	//! Rows emitted so far (the next row id).
@@ -126,13 +150,15 @@ unique_ptr<GlobalTableFunctionState> HdfsMetaInit(ClientContext &context, TableF
 	auto &bind_data = input.bind_data->Cast<HdfsMetaBindData>();
 	auto &hdfs = bind_data.hdfs.get();
 	auto opener = ClientData::Get(context).file_opener.get();
+	// In Init rather than bind, so a prepared statement is checked again when the settings change.
+	VerifyCanAccess(context, hdfs, bind_data.path);
 	auto state = make_uniq<HdfsMetaGlobalState>();
 	state->column_ids = input.column_ids;
 	if (bind_data.op == HdfsMetaOp::STAT) {
 		state->entries.push_back(hdfs.Stat(bind_data.path, opener));
 		return std::move(state);
 	}
-	HdfsWalkOptions options;
+	auto &options = state->options;
 	options.skip_permission_errors =
 	    WalkFlag(context, bind_data.skip_permission_errors, "hdfs_skip_permission_errors", false);
 	options.include_hidden = WalkFlag(context, bind_data.include_hidden, "hdfs_include_hidden", false);
@@ -144,8 +170,9 @@ unique_ptr<GlobalTableFunctionState> HdfsMetaInit(ClientContext &context, TableF
 	}
 	// A path with glob characters returns the matched entries themselves; a literal path lists the directory's
 	// children. As in DuckDB's globber, escapes don't suppress glob mode (`\*` then matches a literal `*`).
-	if (bind_data.path.find_first_of("*?[{") != string::npos) {
+	if (IsHdfsGlob(bind_data.path)) {
 		state->stream = hdfs.OpenGlobStream(bind_data.path, options, opener);
+		state->literal_fallback = true;
 	} else {
 		state->stream = hdfs.OpenListStream(bind_data.path, options, opener);
 	}
@@ -230,9 +257,17 @@ void WriteColumn(column_t column_id, const vector<HdfsEntry> &rows, idx_t first_
 	}
 	case COL_LAST_MODIFIED:
 	case COL_LAST_ACCESSED: {
-		auto writer = FlatVector::Writer<timestamp_t>(result, count);
+		// HDFS times are UTC instants, so TIMESTAMP WITH TIME ZONE (as core's read_blob/read_text).
+		auto writer = FlatVector::Writer<timestamp_tz_t>(result, count);
 		for (auto &row : rows) {
-			writer.WriteValue(column_id == COL_LAST_MODIFIED ? row.mtime : row.atime);
+			auto time = column_id == COL_LAST_MODIFIED ? row.mtime : row.atime;
+			// An access time of 0 means "not tracked": always for directories, and for files on clusters with
+			// dfs.namenode.accesstime.precision = 0.
+			if (column_id == COL_LAST_ACCESSED && time == timestamp_t(0)) {
+				writer.WriteNull();
+			} else {
+				writer.WriteValue(timestamp_tz_t(time.value));
+			}
 		}
 		break;
 	}
@@ -241,12 +276,31 @@ void WriteColumn(column_t column_id, const vector<HdfsEntry> &rows, idx_t first_
 	}
 }
 
+//! The next non-empty batch of `stream`, or an empty one at its end. Blocks until the walk produces rows (or ends);
+//! the wait can be interrupted.
+void NextBatch(ClientContext &context, HdfsListStream &stream, vector<HdfsEntry> &rows) {
+	while (stream.Next(rows, STANDARD_VECTOR_SIZE, &context) && rows.empty()) {
+	}
+}
+
 void HdfsMetaExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &state = data_p.global_state->Cast<HdfsMetaGlobalState>();
 	vector<HdfsEntry> rows;
 	if (state.stream) {
-		// Blocks until the walk produces rows (or ends); the wait can be interrupted.
-		state.stream->Next(rows, STANDARD_VECTOR_SIZE, &context);
+		NextBatch(context, *state.stream, rows);
+		state.literal_fallback &= rows.empty();
+		if (state.literal_fallback) {
+			// As in scans (and DuckDB's local glob): a pattern that matches nothing may be a path whose name contains
+			// glob characters (`data[1].csv`, `a{b}.csv`). It is then listed as a literal path.
+			state.literal_fallback = false;
+			auto &bind_data = data_p.bind_data->Cast<HdfsMetaBindData>();
+			auto &hdfs = bind_data.hdfs.get();
+			auto opener = ClientData::Get(context).file_opener.get();
+			if (hdfs.Exists(bind_data.path, opener)) {
+				state.stream = hdfs.OpenListStream(bind_data.path, state.options, opener);
+				NextBatch(context, *state.stream, rows);
+			}
+		}
 	} else {
 		auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.entries.size() - state.offset);
 		rows.assign(state.entries.begin() + NumericCast<int64_t>(state.offset),
@@ -271,9 +325,13 @@ TableFunction MakeMetaFunction(const char *name) {
 void HdfsExistsExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &hdfs = func_expr.Function().GetExtraFunctionInfo().Cast<HdfsScalarFunctionInfo>().hdfs.get();
-	auto opener = ClientData::Get(state.GetContext()).file_opener.get();
-	UnaryExecutor::Execute<string_t, bool>(args.data[0], result, args.size(),
-	                                       [&](string_t path) { return hdfs.Exists(path.GetString(), opener); });
+	auto &context = state.GetContext();
+	auto opener = ClientData::Get(context).file_opener.get();
+	UnaryExecutor::Execute<string_t, bool>(args.data[0], result, args.size(), [&](string_t path) {
+		auto url = path.GetString();
+		VerifyCanAccess(context, hdfs, url);
+		return hdfs.Exists(url, opener);
+	});
 }
 
 FunctionDescription Describe(string description, vector<string> examples) {
@@ -314,6 +372,9 @@ void RegisterHdfsFunctions(ExtensionLoader &loader, HdfsFileSystem &hdfs) {
 	// The lookup can fail (permission denied, NameNode unreachable); without this, DuckDB reports a thrown error as
 	// a bug in a function it assumed can't fail.
 	exists.SetFallible();
+	// The answer changes as files come and go, so it must not be constant-folded or kept in a prepared statement's
+	// plan (as the default, CONSISTENT, allows). Within one query it is one answer per row, as for now().
+	exists.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
 	CreateScalarFunctionInfo exists_info(std::move(exists));
 	exists_info.descriptions.push_back(
 	    Describe("Whether an HDFS file or directory exists. Errors other than \"not found\" (e.g. permission "

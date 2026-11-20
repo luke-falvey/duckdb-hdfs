@@ -15,7 +15,15 @@ test/bench/run_bench.sh --latency 1          # +1 ms each way (2 ms round trips)
 test/bench/run_bench.sh --save mine          # save results/mine.json
 test/bench/run_bench.sh --compare baseline   # side by side with results/baseline.json
 test/bench/run_bench.sh --only "glob scan"   # one query
+test/bench/run_bench.sh --check              # fail on an RPC regression
 ```
+
+The script exits non-zero if a query fails. With `--check` it also fails when
+a query makes more NameNode RPCs than its ceiling in `bench.py`. The ceilings
+are loose: they catch an extra RPC per file or per directory, not small
+changes, and assume the default client config (batched listing on). With
+`--compare` it fails when a result differs from the baseline, or when a query
+makes more than 10% more RPCs than it did. Wall times never fail the run.
 
 `--latency MS` routes NameNode and DataNode traffic through
 [toxiproxy](https://github.com/Shopify/toxiproxy), which models a real network.
@@ -24,7 +32,16 @@ real clusters are 0.5–5 ms.
 
 Environment: `BENCH_REUSE=1` reuses a running cluster and its seeded data,
 `BENCH_KEEP=1` leaves the cluster running, `BENCH_QUICK=1` seeds a smaller
-data set. `results/` is ignored by git.
+data set, and `BENCH_HADOOP_CONF_DIR` replaces the client config. By default
+the client config is `test/hdfs-conf` without its small test block size and
+prefetch (1 MiB and 2 blocks), so files get Hadoop's default blocks.
+`results/` is ignored by git.
+
+The last query, "same small-file scan twice (external file cache)", sets
+`enable_external_file_cache` and `cache_local_files`, so the second scan can
+be served from DuckDB's cache (DuckDB counts `hdfs://` as a local scheme and
+caches it only with `cache_local_files`). The "same small-file scan twice"
+rows below were measured before it set them, so they show two uncached scans.
 
 Data set: 2,000 small Parquet files (`/bench/small/p=*/`), one 20M-row
 Parquet file, one 8M-row CSV file, and a three-level partitioned tree of
