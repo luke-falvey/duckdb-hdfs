@@ -208,6 +208,32 @@ void BraceExpansionCap() {
 	CHECK(Throws([&] { HdfsGlobPlan::ExpandBraces(alternatives + "{x,y}"); }, "expands to more than 10000"));
 }
 
+std::string Repeat(const std::string &text, int count) {
+	std::string result;
+	for (int copy = 0; copy < count; copy++) {
+		result += text;
+	}
+	return result;
+}
+
+void BraceRecursionBound() {
+	// Groups with one alternative never raise the pattern count, but each is one recursion level that copies the
+	// pattern: the group count is capped, so these fail cleanly instead of overflowing the stack.
+	CHECK_EQ(HdfsGlobPlan::ExpandBraces("/d/" + Repeat("{a}", 128)), Strings({"/d/" + Repeat("a", 128)}));
+	CHECK(Throws([&] { HdfsGlobPlan::ExpandBraces("/d/" + Repeat("{a}", 129)); }, "more than 128 brace groups"));
+	CHECK(Throws([&] { HdfsGlobPlan::Parse("/d/" + Repeat("{}", 20000), false); }, "more than 128 brace groups"));
+	// Nested groups count too.
+	auto nested = "/d/" + Repeat("{", 129) + "a" + Repeat("}", 129);
+	CHECK(Throws([&] { HdfsGlobPlan::Parse(nested, false); }, "more than 128 brace groups"));
+	CHECK_EQ(HdfsGlobPlan::ExpandBraces("/d/" + Repeat("{", 100) + "a" + Repeat("}", 100)), Strings({"/d/a"}));
+	// Braces that are escaped or inside a character class are literal and don't count.
+	CHECK_EQ(HdfsGlobPlan::ExpandBraces("/d/" + Repeat("\\{", 200)).size(), size_t(1));
+	CHECK_EQ(HdfsGlobPlan::ExpandBraces("/d/" + Repeat("[{]", 200)).size(), size_t(1));
+	// Overlong patterns are refused up front, and a run of unclosed '[' (no class) is linear, not quadratic.
+	CHECK(Throws([&] { HdfsGlobPlan::Parse("/d/" + Repeat("a", 70000), false); }, "Glob pattern is too long"));
+	CHECK_EQ(HdfsGlobPlan::ExpandBraces("/d/" + Repeat("[", 60000)).size(), size_t(1));
+}
+
 void ManyPatternsDedupe() {
 	// 1000 alternatives that all match the same directory: the child gets each state once, and the walk emits each
 	// file once.
@@ -334,6 +360,7 @@ int main() {
 	BraceExpansion();
 	BraceCharacterClasses();
 	BraceExpansionCap();
+	BraceRecursionBound();
 	ManyPatternsDedupe();
 	PlanRoots();
 	WalkStarAndClasses();
