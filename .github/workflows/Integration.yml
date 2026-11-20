@@ -5,8 +5,13 @@
 #
 name: Integration Tests
 on:
+  # Pushes to the long-lived branches only: a push to a pull request's branch already runs as pull_request, and
+  # running both doubles a multi-hour job. Docs-only changes don't run it.
   push:
+    branches: [main, duckdb-review]
+    paths-ignore: ['**.md', 'docs/**']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**']
   workflow_dispatch:
 
 concurrency:
