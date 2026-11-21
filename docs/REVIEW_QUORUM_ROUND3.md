@@ -244,6 +244,12 @@ Declined:
   all of them.
 - **A docs link in the `CONFIG_DIR` error** (szarnyasg). There is no stable anchor yet.
 
+### Outcome
+
+The loop stopped after iteration 2, because neither iteration had a request for changes. CI was green on the head
+of each one (cd61dd0 before the loop, 95d6262 after iteration 1, 23f8f2d after iteration 2), including the cluster,
+Kerberos and benchmark jobs. The quorum has not re-reviewed iteration 2's fixes; they were all nits, each with a test.
+
 ### Still in dispute
 
 - `PRAGMA enable_verification` in `hdfs_edge.test`: taniabogatsch would restore it; round 3's consensus removed it.
