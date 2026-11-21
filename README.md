@@ -227,10 +227,12 @@ Paths are `hdfs://host:port/path`; `host:port` selects the NameNode. The
 scheme-only form `hdfs:///path` uses `fs.defaultFS` from your Hadoop config.
 `hdfs_ls`, `hdfs_stat` and `hdfs_exists` take these URLs only (a bare `/path`
 is an error, not a path on the default FS). Paths with a `.` or `..`
-component are refused, as HDFS forbids them.
+component are refused, as HDFS forbids them; in a glob pattern that includes
+one spelled with braces or escapes (`{..}`, `\.\.`).
 
 Glob patterns may have at most 128 brace groups and 64 KiB, and expand to at
-most 10,000 patterns.
+most 10,000 patterns and 16 MiB of patterns in all. An invalid pattern is
+refused before connecting.
 
 ## Configuration
 
@@ -300,7 +302,12 @@ CREATE SECRET prod (
 ```
 
 Both parameters are optional; what a secret leaves out comes from the
-environment. On a Kerberos cluster the identity is always the ticket cache's
+environment. The client reads `CONFIG_DIR` itself, outside DuckDB's file
+system, so with `enable_external_access = false` the directory must be in
+`allowed_directories` (or `allowed_paths`), as for any local read. A
+directory without `core-site.xml` or `hdfs-site.xml` is an error.
+`HADOOP_CONF_DIR` and `HADOOP_HOME` are the operator's environment and are
+not checked. On a Kerberos cluster the identity is always the ticket cache's
 principal, so `USER` is an error there.
 
 - **Scopes match whole path components**: a secret scoped to

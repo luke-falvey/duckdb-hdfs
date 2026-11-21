@@ -104,6 +104,63 @@ SELECT * FROM read_csv('hdfs://127.0.0.1:1/allowed/../secret.csv');
 ----
 <REGEX>:.*Invalid Input Error.*has a '\.\.' component.*
 
+# A '.' or '..' spelled through a brace group or escapes appears only once the pattern is expanded: refused then,
+# still before connecting (the NameNode at 127.0.0.1:1 would give an IO Error). Neither the listing nor a
+# metadata-only scan (answered from the listing) may reach /secret.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/{..}/secret');
+----
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern 'hdfs://127\.0\.0\.1:1/allowed/\{\.\.\}/secret'.*has a '\.\.' component.*cannot contain '\.' or '\.\.'.*
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/\.\./secret/*');
+----
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern .*has a '\.\.' component.*
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/{.}{.}/secret/*');
+----
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern .*has a '\.\.' component.*
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/{x,.}/secret');
+----
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern .*has a '\.' component.*
+
+statement error
+SELECT size FROM read_blob('hdfs://127.0.0.1:1/allowed/{..}/secret/x');
+----
+<REGEX>:.*Invalid Input Error.*has a '\.\.' component.*
+
+statement error
+SELECT * FROM glob('hdfs://127.0.0.1:1/allowed/\.\./secret/*');
+----
+<REGEX>:.*Invalid Input Error.*has a '\.\.' component.*
+
+# A secret's CONFIG_DIR is read by the HDFS client itself, outside DuckDB's file system: it must be allowed like any
+# local read. '/data/' is allowed above; '/etc' is not.
+statement ok
+CREATE SECRET outside_conf (TYPE hdfs, CONFIG_DIR '/etc', SCOPE 'hdfs://127.0.0.1:1/allowed/conf');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf/x');
+----
+Permission Error: Cannot use HDFS secret 'outside_conf': its CONFIG_DIR '/etc' is not in allowed_directories (enable_external_access is false)
+
+statement error
+SELECT * FROM read_csv('hdfs://127.0.0.1:1/allowed/conf/x.csv');
+----
+<REGEX>:.*Permission Error: Cannot use HDFS secret 'outside_conf'.*
+
+# An allowed one passes the check and gets as far as reading its (missing) configuration.
+statement ok
+CREATE SECRET inside_conf (TYPE hdfs, CONFIG_DIR '/data/hadoop', SCOPE 'hdfs://127.0.0.1:1/allowed/conf2');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf2/x');
+----
+<REGEX>:.*config_dir '/data/hadoop' has no core-site.xml or hdfs-site.xml.*
+
 # An allowed directory is a whole path component: a sibling with the same prefix is refused.
 statement error
 SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed2');

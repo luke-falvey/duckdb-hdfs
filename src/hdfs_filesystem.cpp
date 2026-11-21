@@ -17,6 +17,7 @@
 #include "duckdb/logging/log_type.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/secret/secret.hpp"
@@ -353,6 +354,14 @@ HdfsSecretMatch LookupSecret(const string &url, optional_ptr<FileOpener> opener)
 			Value value;
 			if (kv_secret.TryGetValue("config_dir", value) && !value.IsNull()) {
 				result.config.config_dir = value.ToString();
+				// libhdfs3 reads the XML there itself, outside DuckDB's file system: check it as a local read, so
+				// that with enable_external_access = false a secret can't point the client (NameNodes, KMS URL,
+				// ticket cache) at a directory allowed_directories doesn't cover.
+				if (!DBConfig::GetConfig(*db).CanAccessFile(result.config.config_dir, FileType::FILE_TYPE_DIR)) {
+					throw PermissionException("Cannot use HDFS secret '%s': its CONFIG_DIR '%s' is not in "
+					                          "allowed_directories (enable_external_access is false)",
+					                          secret.GetName(), result.config.config_dir);
+				}
 			}
 			if (kv_secret.TryGetValue("user", value) && !value.IsNull()) {
 				result.config.user = value.ToString();
@@ -1117,6 +1126,13 @@ unique_ptr<HdfsListStream> HdfsFileSystem::OpenGlobStream(const string &url, Hdf
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(url, authority, hdfs_path);
+	// Check the pattern before connecting: an invalid one (including a "." or ".." component that only appears
+	// after brace expansion or unescaping) is refused without a NameNode, and without waiting on an unreachable one.
+	try {
+		(void)HdfsGlobPlan::Parse(hdfs_path, options.include_hidden);
+	} catch (const InvalidInputException &error) {
+		throw InvalidInputException("Failed to glob HDFS pattern '%s': %s", url, ErrorData(error).RawMessage());
+	}
 	return make_uniq<HdfsListStream>(GetConnection(url, authority, opener), url, true, options);
 }
 

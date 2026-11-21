@@ -229,9 +229,46 @@ void BraceRecursionBound() {
 	// Braces that are escaped or inside a character class are literal and don't count.
 	CHECK_EQ(HdfsGlobPlan::ExpandBraces("/d/" + Repeat("\\{", 200)).size(), size_t(1));
 	CHECK_EQ(HdfsGlobPlan::ExpandBraces("/d/" + Repeat("[{]", 200)).size(), size_t(1));
-	// Overlong patterns are refused up front, and a run of unclosed '[' (no class) is linear, not quadratic.
+	// Overlong patterns are refused up front, and a run of unclosed '[' (no class) stays cheap.
 	CHECK(Throws([&] { HdfsGlobPlan::Parse("/d/" + Repeat("a", 70000), false); }, "Glob pattern is too long"));
 	CHECK_EQ(HdfsGlobPlan::ExpandBraces("/d/" + Repeat("[", 60000)).size(), size_t(1));
+}
+
+void BraceExpansionBytes() {
+	// Under every count cap (64 KiB, 13 groups, 8,192 results), yet about 0.5 GB of patterns: refused by the byte
+	// budget before it is built.
+	auto padding = Repeat("x", 60000);
+	CHECK(Throws([&] { HdfsGlobPlan::Parse("/d/" + padding + Repeat("{a,b}", 13), false); }, "too large to expand"));
+	// Groups with one alternative copy the whole pattern once per group and leaf.
+	CHECK(Throws([&] { HdfsGlobPlan::Parse("/d/" + Repeat("{a,b}", 8) + Repeat("{a}", 100) + padding, false); },
+	             "too large to expand"));
+	// Ordinary patterns stay well inside it: 10,000 results of about 100 bytes.
+	CHECK_EQ(HdfsGlobPlan::ExpandBraces("/d/" + Repeat("y", 80) + Repeat("{0,1,2,3,4,5,6,7,8,9}", 4)).size(),
+	         size_t(10000));
+	// A list of 1,000 long alternatives (a 50 KB pattern) too.
+	std::string names = "/d/{";
+	for (int name_idx = 0; name_idx < 1000; name_idx++) {
+		names += (name_idx ? "," : "") + Repeat("n", 40) + std::to_string(name_idx);
+	}
+	names += "}.csv";
+	CHECK_EQ(HdfsGlobPlan::ExpandBraces(names).size(), size_t(1000));
+}
+
+void DotComponentsAfterExpansion() {
+	// "." and ".." can only reach the walk through braces or escapes: refused once expanded and unescaped.
+	const char *const refused[] = {"/allowed/{..}/secret/*",   "/allowed/{..,x}/secret", "/allowed/\\.\\./secret/*",
+	                               "/allowed/{.}{.}/secret/*", "/allowed/.{.}/secret",   "/allowed/{.}/x",
+	                               "/allowed/x/{..}"};
+	for (auto pattern : refused) {
+		if (!Throws([&] { HdfsGlobPlan::Parse(pattern, false); }, "cannot contain '.' or '..'")) {
+			std::fprintf(stderr, "  not refused: %s\n", pattern);
+			failures++;
+		}
+	}
+	// Names that merely contain dots, and patterns (which only match real names), are fine.
+	CHECK_EQ(HdfsGlobPlan::Parse("/a/{...,.x,x.}/*", false).Initial().size(), size_t(3));
+	CHECK_EQ(HdfsGlobPlan::Parse("/a/[.][.]/*", false).Root(), std::string("/a"));
+	CHECK_EQ(HdfsGlobPlan::Parse("/a/.?/*", false).Root(), std::string("/a"));
 }
 
 void ManyPatternsDedupe() {
@@ -361,6 +398,8 @@ int main() {
 	BraceCharacterClasses();
 	BraceExpansionCap();
 	BraceRecursionBound();
+	BraceExpansionBytes();
+	DotComponentsAfterExpansion();
 	ManyPatternsDedupe();
 	PlanRoots();
 	WalkStarAndClasses();

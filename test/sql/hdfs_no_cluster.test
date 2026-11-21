@@ -204,6 +204,24 @@ SELECT * FROM read_csv('hdfs://127.0.0.1:1/d/' || repeat('{a,b}', 40) || '.csv')
 ----
 <REGEX>:Invalid Input Error: .*expands to more than 10000 patterns.*
 
+# The other caps on brace expansion: they are checked before connecting, so an unreachable NameNode doesn't hide
+# them behind a connection error.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/' || repeat('{a}', 100000));
+----
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern .*Glob pattern is too long.*
+
+statement error
+SELECT * FROM read_csv('hdfs://127.0.0.1:1/' || repeat('{a}', 1000) || '.csv');
+----
+<REGEX>:Invalid Input Error: .*more than 128 brace groups.*
+
+# Under the length, group and count caps, but about 0.5 GB of expanded patterns: refused by the byte budget.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/d/' || repeat('x', 60000) || repeat('{a,b}', 13));
+----
+<REGEX>:Invalid Input Error: .*too large to expand.*
+
 # A brace inside a character class is a class member, not a group: the pattern is valid, and fails only for want
 # of a NameNode.
 statement error
