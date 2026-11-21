@@ -252,6 +252,11 @@ void BraceExpansionBytes() {
 	}
 	CHECK_EQ(HdfsGlobPlan::Excerpt("/short"), std::string("/short"));
 	CHECK_EQ(HdfsGlobPlan::Excerpt(Repeat("y", 300)), Repeat("y", 200) + "...");
+	// The cut never splits a UTF-8 character: a 2-byte one across byte 200, and a 3-byte one ending past it.
+	CHECK_EQ(HdfsGlobPlan::Excerpt(Repeat("x", 199) + "\xC3\xA9" + Repeat("y", 50)), Repeat("x", 199) + "...");
+	CHECK_EQ(HdfsGlobPlan::Excerpt(Repeat("x", 198) + "\xE8\xA1\xA8" + Repeat("y", 50)), Repeat("x", 198) + "...");
+	CHECK_EQ(HdfsGlobPlan::Excerpt(Repeat("x", 197) + "\xE8\xA1\xA8" + Repeat("y", 50)),
+	         Repeat("x", 197) + "\xE8\xA1\xA8...");
 	// Ordinary patterns stay well inside it: 10,000 results of about 100 bytes.
 	CHECK_EQ(HdfsGlobPlan::ExpandBraces("/d/" + Repeat("y", 80) + Repeat("{0,1,2,3,4,5,6,7,8,9}", 4)).size(),
 	         size_t(10000));

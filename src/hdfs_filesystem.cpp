@@ -18,6 +18,7 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/secret/secret.hpp"
@@ -65,7 +66,7 @@ void CheckNoDotComponents(const string &url, const string &hdfs_path) {
 		auto length = slash - start;
 		if ((length == 1 || length == 2) && hdfs_path.compare(start, length, string(length, '.')) == 0) {
 			throw InvalidInputException("HDFS path '%s' has a '%s' component; HDFS paths cannot contain '.' or '..'",
-			                            url, hdfs_path.substr(start, length));
+			                            HdfsGlobPlan::Excerpt(url), hdfs_path.substr(start, length));
 		}
 		start = slash + 1;
 	}
@@ -342,12 +343,11 @@ struct HdfsSecretMatch {
 //! on every lookup, so a connection cached while external access was on is refused too.
 void CheckConfigDirAccess(DatabaseInstance &db, optional_ptr<FileOpener> opener, const string &secret_name,
                           const string &config_dir) {
-	Value external_access;
-	bool restricted = FileOpener::TryGetCurrentSetting(opener, "enable_external_access", external_access) &&
-	                  !external_access.IsNull() && !BooleanValue::Get(external_access);
+	auto &config = DBConfig::GetConfig(db);
+	// The same setting CanAccessFile reads.
+	bool restricted = !Settings::Get<EnableExternalAccessSetting>(config);
 	bool absolute = !config_dir.empty() && config_dir[0] == '/';
-	if ((restricted && !absolute) ||
-	    !DBConfig::GetConfig(db).CanAccessFile(config_dir, FileType::FILE_TYPE_DIR, opener)) {
+	if ((restricted && !absolute) || !config.CanAccessFile(config_dir, FileType::FILE_TYPE_DIR, opener)) {
 		throw PermissionException(
 		    "Cannot use HDFS secret '%s': with enable_external_access = false, its CONFIG_DIR '%s' must be an "
 		    "absolute path in allowed_directories or allowed_paths (set them before disabling external access), or "
@@ -1093,16 +1093,21 @@ HdfsListStream::HdfsListStream(shared_ptr<HdfsConnection> connection_p, string u
 	Open();
 }
 
+string HdfsListStream::DisplayUrl() const {
+	// A glob pattern may be 64 KiB; a listed path is bounded by the NameNode and is quoted whole.
+	return plan ? HdfsGlobPlan::Excerpt(url) : url;
+}
+
 void HdfsListStream::Open() {
 	// A walk logs to the thread's logger when it starts; a retry runs on the thread that called Next().
 	HdfsRpcLoggerScope log_scope(rpc_logger.lock());
 	client = connection->Get();
 	try {
-		walk = plan ? client->Glob(hdfs_path, plan, options) : client->List(hdfs_path, false, options);
+		walk = plan ? client->Glob(plan, options) : client->List(hdfs_path, false, options);
 	} catch (const HdfsError &error) {
 		// Cluster errors surface in Next(); this covers a failure to start the walk.
 		ThrowHdfsError(StringUtil::Format(plan ? "Failed to glob HDFS pattern '%s'" : "Failed to list HDFS path '%s'",
-		                                  HdfsGlobPlan::Excerpt(url)),
+		                                  DisplayUrl()),
 		               error);
 	}
 }
@@ -1128,7 +1133,7 @@ bool HdfsListStream::Next(vector<HdfsEntry> &out, idx_t max_entries, optional_pt
 			}
 			ThrowHdfsError(
 			    StringUtil::Format(plan ? "Failed to glob HDFS pattern '%s'" : "Failed to list HDFS path '%s'",
-			                       HdfsGlobPlan::Excerpt(url)),
+			                       DisplayUrl()),
 			    error);
 		}
 		if (pending) {

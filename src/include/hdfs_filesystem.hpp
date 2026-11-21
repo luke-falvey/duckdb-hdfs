@@ -90,6 +90,8 @@ public:
 
 private:
 	void Open();
+	//! The URL as error messages quote it.
+	string DisplayUrl() const;
 
 	shared_ptr<HdfsConnection> connection;
 	const string url;

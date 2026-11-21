@@ -65,6 +65,10 @@ public:
 	//! more than MAX_EXPANSION_BYTES expanded, or a literal `.` or `..` component after expansion and unescaping).
 	static HdfsGlobPlan Parse(const string &pattern, bool include_hidden);
 
+	//! The pattern this plan was parsed from.
+	const string &Pattern() const {
+		return pattern;
+	}
 	//! The literal directory the walk starts from (for an all-literal pattern: the path itself).
 	const string &Root() const {
 		return root;
@@ -80,7 +84,8 @@ public:
 	//! Match a child (of a directory holding `states`) by name.
 	Step Match(const vector<State> &states, const string &name, bool is_dir) const;
 
-	//! At most the first 200 bytes of `pattern` (with "..." if cut), for error messages: a pattern may be 64 KiB.
+	//! At most the first 200 bytes of `pattern` (with "..." if cut, at a UTF-8 character boundary), for error
+	//! messages: a pattern may be 64 KiB.
 	static string Excerpt(const string &pattern);
 	//! Hadoop's hidden-name convention: a leading `.` or `_`.
 	static bool IsHidden(const string &name);
@@ -111,6 +116,7 @@ private:
 	vector<State> initial;
 	bool emit_root = false;
 	bool include_hidden = false;
+	string pattern;
 };
 
 } // namespace duckdb

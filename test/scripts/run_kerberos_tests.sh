@@ -62,12 +62,13 @@ client_settings() {
 
 # As in run_hdfs_tests.sh: a reported skip fails the run, and every test file
 # that needs the Kerberos cluster must be run (checked at the end).
+SKIP_MARKER="Skipped tests for the following reasons"
 RAN_TESTS=""
 run_kerberos_test() { # test file; the environment comes from the caller
     local test_file="$1" output status=0
     output="$(mktemp)"
     "${UNITTEST}" "${test_file}" 2>&1 | tee "${output}" || status=$?
-    if [ "${status}" -eq 0 ] && grep -q "Skipped tests for the following reasons" "${output}"; then
+    if [ "${status}" -eq 0 ] && grep -q "${SKIP_MARKER}" "${output}"; then
         echo "ERROR: ${test_file} was skipped (in whole or in part); see the reasons above" >&2
         status=1
     fi
@@ -77,6 +78,13 @@ run_kerberos_test() { # test file; the environment comes from the caller
     fi
     RAN_TESTS="${RAN_TESTS} ${test_file}"
 }
+
+# The skip check must be able to fail: a file whose require-env isn't set has to produce the marker.
+skip_check="$(cd "${REPO_ROOT}" && env -u HDFS_KERBEROS_NO_TICKET "${UNITTEST}" test/sql/hdfs_kerberos_no_ticket.test 2>&1 || true)"
+if ! grep -q "${SKIP_MARKER}" <<< "${skip_check}"; then
+    echo "ERROR: unittest no longer reports a skipped test as '${SKIP_MARKER}'; update the skip check" >&2
+    exit 1
+fi
 
 probe() { # conf_dir -> succeeds if a write works
     KRB5CCNAME="FILE:${WORK_DIR}/krb5cc" HADOOP_CONF_DIR="$1" "${DUCKDB}" -c \

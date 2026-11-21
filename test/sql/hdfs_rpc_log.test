@@ -149,16 +149,20 @@ CALL truncate_duckdb_logs();
 # The fallback's row for a file is the row a listing of its directory gives (from a stat rather than a listing).
 query I
 SELECT count(*) FROM (
-    SELECT * FROM hdfs_ls('hdfs://localhost:9000/test/rpc[1].parquet')
-    EXCEPT SELECT * FROM hdfs_ls('hdfs://localhost:9000/test') WHERE name = 'rpc[1].parquet');
+    (SELECT * FROM hdfs_ls('hdfs://localhost:9000/test/rpc[1].parquet')
+     EXCEPT ALL SELECT * FROM hdfs_ls('hdfs://localhost:9000/test') WHERE name = 'rpc[1].parquet')
+    UNION ALL
+    (SELECT * FROM hdfs_ls('hdfs://localhost:9000/test') WHERE name = 'rpc[1].parquet'
+     EXCEPT ALL SELECT * FROM hdfs_ls('hdfs://localhost:9000/test/rpc[1].parquet')));
 ----
 0
 
 statement ok
 CALL truncate_duckdb_logs();
 
-# A directory whose name has glob characters is listed: its children, not itself. One stat, then its listing (and
-# the directory can still vanish between the two; that race needs fault injection to test).
+# A directory whose name has glob characters is listed: its children, not itself. The glob's listing of /test
+# (no match), one stat, then the directory's listing: two listDirectory. (The directory can still vanish between
+# the stat and its listing; that race needs fault injection to test.)
 statement ok
 COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/rpcdir[1]/x.csv' (FORMAT csv);
 
@@ -245,14 +249,24 @@ SELECT count(*) FROM duckdb_logs_parsed('HDFS') WHERE op = 'getBlockLocations' A
 ----
 0
 
-# A replaced file has a new id, so its tag no longer matches the cached footer's, which isn't trusted.
+# A replaced file's tag changes (here a new id and mtime, with as many rows), so its cached footer isn't trusted:
+# the file is opened again and the new values read. A same-size replacement that keeps the mtime, where only the id
+# differs, is checked in run_hdfs_tests.sh.
 statement ok
-COPY (SELECT range AS v FROM range(500)) TO 'hdfs://localhost:9000/test/etag_b.parquet' (FORMAT parquet);
+COPY (SELECT range + 1000 AS v FROM range(1000)) TO 'hdfs://localhost:9000/test/etag_b.parquet' (FORMAT parquet);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(v) FROM read_parquet('hdfs://localhost:9000/test/etag_*.parquet');
+----
+2000	1999000
 
 query I
-SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/etag_*.parquet');
+SELECT count(*) > 0 FROM duckdb_logs_parsed('HDFS') WHERE op = 'getBlockLocations' AND path = '/test/etag_b.parquet';
 ----
-1500
+true
 
 statement ok
 RESET parquet_metadata_cache;

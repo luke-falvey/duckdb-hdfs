@@ -17,6 +17,10 @@ SET allowed_directories = ['hdfs://127.0.0.1:1/allowed', '/data/'];
 statement ok
 SET allowed_paths = ['hdfs://127.0.0.1:1/one.csv'];
 
+# '~' expands to an allowed directory, so only the CONFIG_DIR absolute-path rule (below) can refuse '~/hadoop'.
+statement ok
+SET home_directory = '/data';
+
 statement ok
 PREPARE ls_data AS SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data');
 
@@ -157,14 +161,15 @@ SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf/x');
 <REGEX>:Permission Error: Cannot use HDFS secret 'outside_conf': with enable_external_access = false, its CONFIG_DIR '/data/\.\./etc' must be.*
 
 # The client is handed the string as given, so it must be the path that was checked: a '~' or 'file://' spelling
-# (which the check would expand or strip, and libhdfs3 wouldn't) is refused, even under an allowed directory.
+# (which the check would expand or strip, and libhdfs3 wouldn't) is refused. Both name the allowed /data/hadoop
+# once expanded or stripped, so only the absolute-path rule refuses them.
 statement ok
-CREATE OR REPLACE SECRET outside_conf (TYPE hdfs, CONFIG_DIR '~/conf', SCOPE 'hdfs://127.0.0.1:1/allowed/conf');
+CREATE OR REPLACE SECRET outside_conf (TYPE hdfs, CONFIG_DIR '~/hadoop', SCOPE 'hdfs://127.0.0.1:1/allowed/conf');
 
 statement error
 SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf/x');
 ----
-<REGEX>:Permission Error: Cannot use HDFS secret 'outside_conf': with enable_external_access = false, its CONFIG_DIR '~/conf' must be an absolute path.*
+<REGEX>:Permission Error: Cannot use HDFS secret 'outside_conf': with enable_external_access = false, its CONFIG_DIR '~/hadoop' must be an absolute path.*
 
 statement ok
 CREATE OR REPLACE SECRET outside_conf (TYPE hdfs, CONFIG_DIR 'file:///data/hadoop', SCOPE 'hdfs://127.0.0.1:1/allowed/conf');

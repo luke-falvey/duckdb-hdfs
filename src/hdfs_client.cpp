@@ -1197,9 +1197,10 @@ public:
 		return std::move(walk);
 	}
 
-	unique_ptr<HdfsWalk> Glob(const string &pattern, shared_ptr<const HdfsGlobPlan> plan,
-	                          const HdfsWalkOptions &options) override {
-		auto walk = NewWalk(pattern, options);
+	unique_ptr<HdfsWalk> Glob(shared_ptr<const HdfsGlobPlan> plan, const HdfsWalkOptions &options) override {
+		D_ASSERT(plan);
+		// The walk's errors name the pattern; it may be 64 KiB.
+		auto walk = NewWalk(HdfsGlobPlan::Excerpt(plan->Pattern()), options);
 		walk->glob = true;
 		auto root = plan->Root();
 		bool emit_root = plan->EmitRoot();

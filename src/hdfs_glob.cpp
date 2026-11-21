@@ -84,7 +84,15 @@ vector<string> SplitComponents(const string &path) {
 
 string HdfsGlobPlan::Excerpt(const string &pattern) {
 	static constexpr idx_t MAX_EXCERPT = 200;
-	return pattern.size() <= MAX_EXCERPT ? pattern : pattern.substr(0, MAX_EXCERPT) + "...";
+	if (pattern.size() <= MAX_EXCERPT) {
+		return pattern;
+	}
+	// Cut at a character boundary, so the message stays valid UTF-8.
+	idx_t cut = MAX_EXCERPT;
+	while (cut > 0 && (static_cast<unsigned char>(pattern[cut]) & 0xC0) == 0x80) {
+		cut--;
+	}
+	return pattern.substr(0, cut) + "...";
 }
 
 bool HdfsGlobPlan::IsHidden(const string &name) {
@@ -191,6 +199,7 @@ void HdfsGlobPlan::ExpandBraces(const string &pattern, const string &original, v
 
 HdfsGlobPlan HdfsGlobPlan::Parse(const string &pattern, bool include_hidden) {
 	HdfsGlobPlan plan;
+	plan.pattern = pattern;
 	plan.include_hidden = include_hidden;
 	for (auto &expanded : ExpandBraces(pattern)) {
 		vector<Component> components;
