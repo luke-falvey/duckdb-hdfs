@@ -51,8 +51,10 @@ with `SET cache_local_files = true` (see [Performance](#performance)).
 ## Platforms
 
 Linux and macOS. CI builds the extension for DuckDB's Linux and macOS
-platforms (`.github/workflows/MainDistributionPipeline.yml`). The cluster and
-Kerberos tests run on Linux amd64 only (`.github/workflows/Integration.yml`).
+platforms (`.github/workflows/MainDistributionPipeline.yml`); of those, the
+no-cluster SQL tests run where DuckDB's extension CI runs tests (not on
+linux_arm64 or osx_amd64). The cluster and Kerberos tests run on Linux amd64
+only (`.github/workflows/Integration.yml`).
 Windows and WebAssembly aren't supported: libhdfs3 needs POSIX sockets, and its
 vcpkg port excludes Windows.
 
@@ -137,7 +139,7 @@ guaranteed — add `ORDER BY path` if it matters.
 | `size` | `BIGINT` | Length in bytes (0 for directories) |
 | `owner`, `group` | `VARCHAR` | |
 | `permissions` | `VARCHAR` | `rwxr-xr-x`, as `hdfs dfs -ls` shows it (the sticky bit as `t`/`T`: `rwxrwxrwt`) |
-| `mode` | `USMALLINT` | The permission bits as a number, sticky bit included (`rwxr-xr-x` = 493, `rwxrwxrwt` = 1023) |
+| `mode` | `USMALLINT` | The permission bits as a number, sticky bit included (`rwxr-xr-x` = 493, `rwxrwxrwt` = 1023); HDFS's ACL, encryption and erasure-coding flag bits are left out |
 | `replication` | `INTEGER` | `NULL` for directories |
 | `block_size` | `BIGINT` | `NULL` for directories |
 | `last_modified` | `TIMESTAMP WITH TIME ZONE` | Modification time (an instant, as `read_blob`'s `last_modified`) |
@@ -198,8 +200,9 @@ Behavior notes:
   wrote it disconnects (`CALL hdfs_reset_connections()`, or the process
   exiting) and its lease expires, when HDFS recovers it with what was written.
   A writer that is dropped without an error commits, as for local files; if
-  that commit fails, the file is removed and the error goes to DuckDB's log
-  (`duckdb_logs`), since the caller didn't ask for it.
+  that commit fails, the file is aborted as above and the error can only be
+  logged (`duckdb_logs`, when logging is enabled), since the caller didn't ask
+  for it. Core does this for `EXPORT DATABASE`'s `schema.sql` and `load.sql`.
 - **Existing files.** DuckDB asks for an exclusive create when it expects a new
   file; the NameNode then refuses to replace a file that appeared meanwhile.
   Otherwise an existing file is replaced.

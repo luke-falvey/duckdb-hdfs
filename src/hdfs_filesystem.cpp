@@ -244,13 +244,13 @@ HdfsFileHandle::~HdfsFileHandle() {
 			Close();
 			return;
 		} catch (std::exception &error) {
-			// Close() already aborted (removed) the file. The caller dropped the handle without Close(), so the error
-			// has nowhere to go but the log.
+			// Close() already aborted the write (the error says if removing the file failed too). The caller dropped
+			// the handle without Close(), so the error has nowhere to go but the log.
 			try {
 				if (logger) {
 					auto message =
 					    StringUtil::Format("Failed to complete HDFS file '%s' (handle dropped without Close; "
-					                       "the file was removed): %s",
+					                       "the write was aborted): %s",
 					                       path, ErrorData(error).RawMessage());
 					DUCKDB_LOG_ERROR(logger, message);
 				}
