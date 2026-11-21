@@ -169,10 +169,11 @@ The largest concerns left are unchanged from round 2:
 - **Not run locally:** the full extension build. As in round 2, vcpkg's download of a dependency's GitHub archive
   (openssl) was refused with 403. CI runs the build, `make test`, the Docker cluster tests (including the new
   `hdfs_rpc_log.test` pins, the etag test and the rewritten cache check), the Kerberos suite and the benchmark
-  ceilings. The SQL expectations written this round that only CI can confirm:
+  ceilings. The SQL expectations written this round that only CI could confirm all passed there:
   - the pinned 2 `getBlockLocations`;
-  - zero `READ` entries on the cached `count(*)`;
-  - the stale control read.
+  - the stale control read;
+  - the etag test (in its PR-review-loop form: no `getBlockLocations` for the second file of a cached glob).
+    Its first form, zero `READ` entries on a cached single-file `count(*)`, was replaced.
 
 ## PR review loop
 
@@ -206,6 +207,42 @@ Declined:
 - **Also checking `CONFIG_DIR` at `CREATE SECRET`** (pdet). The use-time check is needed anyway, for persistent
   secrets created before external access was disabled, so a second site would only duplicate it.
 - **Building osx_amd64 and musl in CI** (carlopi, `opt_in_archs`). A CI addition for its own PR.
+
+### Iteration 2 (on 95d6262)
+
+**0 request changes, 15 approve with nits, 0 approve.** The iteration-1 fixes were confirmed by every lens; what
+was raised is smaller, mostly in the new code.
+
+Raised, and fixed:
+
+| Finding | Lenses | Fix |
+|---|---|---|
+| `Excerpt` cut at byte 200 and could split a multi-byte UTF-8 character, putting invalid UTF-8 into error text that clients decode strictly. | all 15 | The cut backs off to a character boundary. Unit tests with a 2-byte and a 3-byte character across the cut. |
+| The excerpt didn't reach two places that quote the pattern: the literal `.`/`..` check (run before the glob parse) and the walk's own errors (`list '<pattern>' failed`). | tmonster, hawkfish, kryonix, maxxen | Both use the excerpt. A no-cluster test pins the literal `..` case. |
+| Iteration 1 also cut plain listing paths at 200 bytes, which can hide which deep directory failed. | carlopi | Only glob patterns are excerpted; a listed path, bounded by the NameNode, is quoted whole. |
+| `HdfsClient::Glob(pattern, plan, options)` took the pattern and its parse separately, so they could disagree; `plan` could be null. | samansmink, maxxen, mytherin, taniabogatsch | `Glob(plan, options)`: the plan keeps its pattern, and a null plan is asserted against. |
+| The absolute-path rule read `enable_external_access` through the opener, `CanAccessFile` from the config. | hannes, maxxen, taniabogatsch, mytherin, dtenwolde | Both read the config's setting. |
+| The `~/conf` case couldn't fail: `~` expanded outside the allowed directories anyway. | taniabogatsch, dtenwolde, carlopi, hawkfish, pdet | `home_directory` is set to the allowed `/data`, and the case is `~/hadoop`, so only the absolute-path rule can refuse it. |
+| The replaced-file case changed the row count, and its comment credited the file id. | samansmink, lnkuiper, taniabogatsch, tishj, mytherin, dtenwolde, dentiny, pdet | The replacement has as many rows with new values; the test checks `sum(v)` and that the file is opened again. The comment says what changes, and points to the CLI check for the id-only case. |
+| The bounded-error regex ended in `.*`, so a long tail would pass. | lnkuiper | The tail is bounded (`.{0,1000}`). |
+| The fallback-row check was a one-way `EXCEPT`. The `listDirectory 2` pin wasn't explained. | tmonster, kryonix, lnkuiper, dtenwolde | Symmetric `EXCEPT ALL`; the comment names both listings. |
+| `run_kerberos_tests.sh` hard-coded the skip marker and had no self-check. | samansmink, maxxen, lnkuiper, dentiny, mytherin, pdet | It has the same marker variable and self-check as `run_hdfs_tests.sh`. |
+| README wording: the `CONFIG_DIR` paragraph order and wrap, the platform sentence, "without opening the files", the single-file aside, a long line; what an `allowed_paths` entry grants. The round-3 testing notes still named the removed single-file etag test. | szarnyasg, tishj, dentiny, dtenwolde, mytherin, hawkfish, carlopi | Rewritten. |
+
+Declined:
+
+- **Refusing `.`/`..` in `CONFIG_DIR`** (hannes: a symlink plus `..` is resolved physically by the kernel but
+  lexically by the check). Core's `LocalFileSystem::CanonicalizePath` resolves existing paths with realpath
+  (`TryCanonicalizeExistingPath`), so the check already sees the physical directory (pdet traced the same).
+- **The etag test depends on file age** (tishj: without an etag the cache falls back to the mtime and its 10 s
+  margin). It doesn't: `ExternalFileCache::IsValid` compares tags whenever either side has one, and the cached
+  handle always has one, so a missing etag never matches, however old the file.
+- **Pinning the full RPC budget of the cached and control runs** (tmonster). The exact counts (for the bind's file)
+  aren't known without a run, and the discriminating pin, the second file, is in place.
+- **Moving the new fixtures out of `/test`** (kryonix: local re-runs of `hdfs.test` on the same cluster see extra
+  files). The existing `rpc[1].parquet` fixture already does this; CI starts from a clean cluster. A follow-up for
+  all of them.
+- **A docs link in the `CONFIG_DIR` error** (szarnyasg). There is no stable anchor yet.
 
 ### Still in dispute
 
