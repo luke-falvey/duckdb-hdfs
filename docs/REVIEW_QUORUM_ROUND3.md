@@ -57,7 +57,7 @@ These items were raised by 3 or more lenses, or by 2 with high severity that tra
 | R5 | **The two version tags disagree when the file id is unknown.** `GetVersionTag` returns `0:mtime:len`, which the caches trust without a margin. `GetStatsIfExists` returns no tag. | hawkfish, lnkuiper, carlopi, taniabogatsch, tmonster, maxxen, mytherin, pdet (8) | **Fixed.** `HdfsVersionTag` is the one rule: no tag without a file id. The caches then fall back to the mtime and its margin. |
 | R6 | The `GetVersionTag` comment still says `<mtime>:<length>`. | 8 lenses | **Fixed.** |
 | R7 | **The concurrency group is inverted.** It appends the sha on every ref except `main`. Pushes to a PR never cancel the run they supersede, so multi-hour Integration runs stack up, while runs on `main` cancel each other. Round 2's C8 removed only the double trigger. | lnkuiper, samansmink, carlopi, maxxen, mytherin, pdet (6; taniabogatsch noted it) | **Fixed.** Both workflows use extension-ci-tools' form, `github.ref != 'refs/heads/main' \|\| github.sha`. |
-| R8 | **`hdfs_ls`'s own literal fallback still does `Exists` and then a listing.** C7 fixed only the scan's fallback. That is two RPCs, with a race between them: a path deleted in between fails instead of returning no rows. | hawkfish, kryonix, dtenwolde, maxxen, mytherin (5) | **Fixed.** One stat. A file is its own row, and only a directory is listed. Pinned in `hdfs_rpc_log.test` for a match and for a miss. |
+| R8 | **`hdfs_ls`'s own literal fallback still does `Exists` and then a listing.** C7 fixed only the scan's fallback. That is two RPCs, with a race between them: a path deleted in between fails instead of returning no rows. | hawkfish, kryonix, dtenwolde, maxxen, mytherin (5) | **Fixed for files.** One stat; a file is its own row. A directory is still a stat and then its listing, so the race remains for directories (a NOT_FOUND from that listing would have to mean no rows, the C11 groundwork). Pinned in `hdfs_rpc_log.test` for a file, a directory and a miss. |
 | R9 | **The rest of C3: the listing retry logs to the wrong query.** A listing retried after a connection error starts its walk on whichever thread calls `Next()`. The walk then logs to that thread's last query. | lnkuiper, tishj, mytherin (3) | **Fixed.** The stream keeps the opening query's logger and scopes the retry to it. **No test:** it needs a connection failure in the middle of a listing, i.e. the fault-injection harness (PLAN item 7). |
 | R10 | **Invalid patterns are found only after connecting.** An unclosed `{`, two `**` or the caps above surface as a connect timeout behind an unreachable NameNode. | pdet, tishj, maxxen, dtenwolde (4) | **Fixed** with R1. The cap cases now also run without a cluster (`hdfs_no_cluster.test`). |
 | R11 | **The literal-fallback RPC pin filters out `getBlockLocations`,** the one op round 2's CI found doubled. | lnkuiper, tmonster (2, medium); pdet and mytherin want a pin | **Pinned** at 2, with a note. Tracing the cause is still open (below). |
@@ -81,7 +81,10 @@ Implemented, because three or more lenses called the answer clear:
     listing's `etag`. With a tag on one side only, it never matched, so cached row-group statistics were never
     trusted on HDFS.
   - Change: the listing now emits the same `HdfsVersionTag`.
-  - Test: `hdfs.test`. With `parquet_metadata_cache` on, a repeated `count(*)` reads no bytes (FileSystem log).
+  - Test: `hdfs_rpc_log.test`. With `parquet_metadata_cache` on, a repeated `count(*)` over a glob of two files
+    never opens the second one (no `getBlockLocations`); the control without the cache does; a replaced file is
+    counted again. A single file doesn't need the etag: its cached footer is checked through the open handle's tag.
+    (Round 3 first tested a single file, which passed without the etag; see the PR review loop.)
 - **`PRAGMA enable_verification` removed from `hdfs_edge.test`** (taniabogatsch, mytherin, pdet). DuckDB's test
   guidelines no longer allow it.
 
@@ -95,9 +98,9 @@ Still open:
 | `HdfsSecret` overriding `MatchScore` (and trailing-`/` scopes) | samansmink, maxxen (implement); tishj, dtenwolde (needs a decision) | A design change to secret matching. It depends on `BaseSecret::MatchScore` in v2.0 and on persistent-secret compatibility. |
 | C6, the abort-failure lease | All who mentioned it: keep open | Two fixes are proposed: invalidate the client and retry the delete (carlopi), or write under a hidden temporary name and rename on close (taniabogatsch). Either needs the fault-injection harness (PLAN item 7). |
 | Load the shipped `.duckdb_extension` in CI | carlopi, samansmink | A CI addition: a stock v2.0.0 CLI with `-unsigned`, and a `readelf` check for runtime dependencies. Its own PR. |
-| An unclosed `{` blocks the literal fallback | kryonix, dtenwolde (clear: treat it as literal, or fall back on the parse error) | Now that patterns are checked before connecting, the fallback would have to come before that check. That is a choice of which invalid patterns become literal names. |
+| An unclosed `{` blocks the literal fallback | kryonix, dtenwolde (clear: treat it as literal, or fall back on the parse error) | Now that patterns are checked before connecting, the fallback would have to come before that check. That is a choice of which invalid patterns become literal names. The same goes for a file literally named `{..}` or `{.}` (legal in HDFS): R1 refuses that pattern, and the file is reached as `\{..\}`. |
 | Parquet opens a literal-fallback file twice (2 `getBlockLocations`) | lnkuiper, tmonster, dentiny, pdet, mytherin | Pinned (R11), not traced. The leading theory: `open_readers` holds weak pointers, so a reader is shared only while the bind-time handle is still open. The FileSystem log's OPEN/CLOSE order would settle it. |
-| Pre-1970 mtimes | hawkfish | Round 2 described this wrongly: the listing path keeps negative times (the `uint64_t` round trip preserves the bits). The only clamp is `OpenFileExtended`'s `MaxValue(..., 0)`. Changing it needs a 1969 fixture to test, and it is unclear whether the NameNode accepts that. |
+| Pre-1970 mtimes | hawkfish | Round 2 described this wrongly: the listing path keeps negative times (the `uint64_t` round trip preserves the bits). The only clamp is `OpenFileExtended`'s `MaxValue(..., 0)`. Changing it needs a 1969 fixture to test, and it is unclear whether the NameNode accepts that. With the listing etag, such a file's etag (negative mtime) never matches its handle's tag (clamped): a Parquet metadata cache miss, never a stale read. |
 | `HdfsConnection::Get()` holds its lock across `Connect` | dentiny (shared future) | Needs a latency-injecting test. |
 | Smaller test gaps | kryonix, tmonster, mytherin | Four gaps: no test shows that `LIMIT 1` stops a walk early; no hive-partitioning, `filename` or `union_by_name` combinations on HDFS globs; `bench.py --compare` drops baseline queries that didn't run; no TSan job for `make test_unit`. |
 | Smaller design nits | lnkuiper, dentiny, mytherin | Encrypted writes copy the whole buffer. `GetStatsIfExists` stats directories that the listing already described. `OpenFileExtended` and `GetStatsIfExists` parse `extended_info` twice. Pass the RPC logger explicitly instead of through a thread-local. |
@@ -134,7 +137,9 @@ Each was cheap and clearly right:
   - A dropped writer's failed commit is logged only when logging is on, and the README now says so.
   - The log message no longer claims the file was removed when the abort also failed.
   - The README notes that `mode` leaves out HDFS's ACL, encryption and erasure-coding flag bits.
-- **The README says which platforms run tests** (carlopi). linux_arm64 and osx_amd64 are only built.
+- **The README says which platforms run tests** (carlopi). The first version was wrong (the PR review loop fixed it):
+  CI builds linux_amd64, linux_arm64 and osx_arm64, and tests linux_amd64 and osx_arm64; osx_amd64 and musl are
+  opt-in in extension-ci-tools and aren't built.
 - **`ClassEnd`'s comment** (pdet). The comment and the unit test called a run of unclosed `[` linear. It is one scan
   per `[`, bounded by the 64 KiB cap.
 
@@ -168,3 +173,41 @@ The largest concerns left are unchanged from round 2:
   - the pinned 2 `getBlockLocations`;
   - zero `READ` entries on the cached `count(*)`;
   - the stale control read.
+
+## PR review loop
+
+After the round, the quorum reviewed PR #5 itself (`git diff b98f47b HEAD`), each persona as its own read-only
+subagent, in up to 5 iterations: fix what is raised, get CI green, review again, until no persona requests changes.
+
+### Iteration 1 (on cd61dd0)
+
+**0 request changes, 15 approve with nits, 0 approve.**
+
+Raised, and fixed:
+
+| Finding | Lenses | Fix |
+|---|---|---|
+| The etag test read a single file, whose cached footer is checked through the open handle's tag. It would have passed without the etag. (mytherin, maxxen, carlopi, pdet and dtenwolde judged that it could fail; hawkfish, tmonster, samansmink, lnkuiper, taniabogatsch and tishj traced the single-file path and found it couldn't.) | 11 lenses | The test now globs two files. On the repeated `count(*)` the second file is never opened (no `getBlockLocations`). The control without the cache shows it is opened, and a replaced file is counted again (kryonix, dtenwolde: the negative case). It moved to `hdfs_rpc_log.test`. The README says what the etag adds. |
+| The pattern was parsed twice per glob, three times on a retry. Each parse may build up to 16 MiB, and two parse sites can drift apart. | 11 lenses | Parsed once, in `OpenGlobStream`. `HdfsClient::Glob` takes the `shared_ptr<const HdfsGlobPlan>`, and the stream keeps it for its retry. |
+| The new pre-connect wrapper put the whole URL (up to 300 KB) back into the error. The dot error printed the whole pattern. | szarnyasg, pdet, dentiny, carlopi | `HdfsGlobPlan::Excerpt` (200 bytes and "...") in every pattern error and in the wrapper. Unit test, plus an exact-message no-cluster test. |
+| The `CONFIG_DIR` check approved one string and handed libhdfs3 another: `~` and `file://` are expanded or stripped for the check only. It also ran without the opener. | hannes, maxxen, mytherin, tishj, kryonix, lnkuiper | With `enable_external_access = false`, `CONFIG_DIR` must be absolute. The check passes the opener. The message says what to do, and names `allowed_paths` too (szarnyasg, dtenwolde). Tests: `~/conf`, `file:///…` and `/data/../etc` are refused. |
+| The `hdfs_ls` fallback's directory branch had no test, and R8 claimed the race fixed for directories too. | tmonster, dentiny, mytherin, tishj, maxxen, hannes, dtenwolde | A directory case is pinned (getFileInfo 1, listDirectory 2, children listed). R8 and the code comment now say the race remains for directories. A file's fallback row is checked against the listing's row (hawkfish). |
+| The README's platform claim was wrong: osx_amd64 and musl aren't built at all. | carlopi | Corrected. |
+| Pushes to `duckdb-review` shared one concurrency group, so a second merge cancelled the first one's run. | maxxen | `duckdb-review` keeps one run per commit, like `main`. |
+| The test scripts leaked their temp file on a failure. The skip guard greps a core string that could change. | taniabogatsch, lnkuiper, samansmink | Both helpers clean up before exiting. `run_hdfs_tests.sh` first checks that an unmet `require-env` still produces the skip marker. |
+| Doc wording: the rename fallback without file ids, the glob and budget sentences, the etag sentence, the CONTRIBUTING wrap, the pre-1970 etag miss, files named `{..}`, `CONFIG_DIR` as trusted configuration. | szarnyasg, taniabogatsch, maxxen, tishj, tmonster, mytherin, hawkfish, samansmink, dtenwolde, hannes | Fixed in the README, CONTRIBUTING, the comments at the clamp and in the fallback, and the open-items table above. |
+
+Declined:
+
+- **Restoring `PRAGMA enable_verification` in `hdfs_edge.test`** (taniabogatsch: the guideline bans it only in
+  new tests, and the file was the only verified coverage). This is in dispute: round 3 removed it on the consensus
+  of taniabogatsch, mytherin and pdet, and this iteration mytherin, samansmink, tishj, pdet and others checked the
+  removal as right. Left removed, and listed for the owner below.
+- **Also checking `CONFIG_DIR` at `CREATE SECRET`** (pdet). The use-time check is needed anyway, for persistent
+  secrets created before external access was disabled, so a second site would only duplicate it.
+- **Building osx_amd64 and musl in CI** (carlopi, `opt_in_archs`). A CI addition for its own PR.
+
+### Still in dispute
+
+- `PRAGMA enable_verification` in `hdfs_edge.test`: taniabogatsch would restore it; round 3's consensus removed it.
+  The owner decides.

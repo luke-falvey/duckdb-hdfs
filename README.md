@@ -51,10 +51,11 @@ with `SET cache_local_files = true` (see [Performance](#performance)).
 ## Platforms
 
 Linux and macOS. CI builds the extension for DuckDB's Linux and macOS
-platforms (`.github/workflows/MainDistributionPipeline.yml`); of those, the
-no-cluster SQL tests run where DuckDB's extension CI runs tests (not on
-linux_arm64 or osx_amd64). The cluster and Kerberos tests run on Linux amd64
-only (`.github/workflows/Integration.yml`).
+platforms (`.github/workflows/MainDistributionPipeline.yml`): CI builds
+linux_amd64, linux_arm64 and osx_arm64, and runs the no-cluster SQL tests on
+linux_amd64 and osx_arm64 (DuckDB's extension CI only builds linux_arm64).
+osx_amd64 and the musl builds are opt-in there and aren't built. The cluster
+and Kerberos tests run on Linux amd64 only (`.github/workflows/Integration.yml`).
 Windows and WebAssembly aren't supported: libhdfs3 needs POSIX sockets, and its
 vcpkg port excludes Windows.
 
@@ -221,7 +222,7 @@ Behavior notes:
   deletes and renames are not simply sent again (the first attempt may have
   taken effect): after reconnecting, the extension checks whether it did (a
   deleted path is gone; a renamed source is gone and the target is the same
-  file, by its file id). Where it can't tell, as for a create whose file now exists, the
+  file, by its file id, or by its length without one). Where it can't tell, as for a create whose file now exists, the
   error says the outcome is unknown.
 
 ## URLs
@@ -230,12 +231,14 @@ Paths are `hdfs://host:port/path`; `host:port` selects the NameNode. The
 scheme-only form `hdfs:///path` uses `fs.defaultFS` from your Hadoop config.
 `hdfs_ls`, `hdfs_stat` and `hdfs_exists` take these URLs only (a bare `/path`
 is an error, not a path on the default FS). Paths with a `.` or `..`
-component are refused, as HDFS forbids them; in a glob pattern that includes
-one spelled with braces or escapes (`{..}`, `\.\.`).
+component are refused, as HDFS forbids them. In a glob pattern this applies
+after brace expansion and escapes too: `{..}` and `\.\.` are refused (so a
+file literally named `{..}` is reached as `\{..\}`).
 
 Glob patterns may have at most 128 brace groups and 64 KiB, and expand to at
-most 10,000 patterns and 16 MiB of patterns in all. An invalid pattern is
-refused before connecting.
+most 10,000 patterns; expanding one may build at most 16 MiB of patterns,
+counting the intermediate ones. An invalid pattern is refused before
+connecting.
 
 ## Configuration
 
@@ -309,8 +312,12 @@ environment. The client reads `CONFIG_DIR` itself, outside DuckDB's file
 system, so with `enable_external_access = false` the directory must be in
 `allowed_directories` (or `allowed_paths`), as for any local read. A
 directory without `core-site.xml` or `hdfs-site.xml` is an error.
-`HADOOP_CONF_DIR` and `HADOOP_HOME` are the operator's environment and are
-not checked. On a Kerberos cluster the identity is always the ticket cache's
+It must then be an absolute path (not `~/...` or `file://...`), since the
+client reads the path as given. `HADOOP_CONF_DIR` and `HADOOP_HOME` are the
+operator's environment and are not checked. A `CONFIG_DIR` is trusted
+configuration: it names NameNodes, the KMS and the ticket cache, so allow only
+directories whose files you trust (a query that can write to an allowed
+directory can also write a `core-site.xml` there). On a Kerberos cluster the identity is always the ticket cache's
 principal, so `USER` is an error there.
 
 - **Scopes match whole path components**: a secret scoped to
@@ -398,9 +405,10 @@ Tuning:
   `SET cache_local_files = true` (which caches local files too), and
   `validate_external_file_cache = 'VALIDATE_REMOTE'` doesn't validate them.
   With `SET parquet_metadata_cache = true`, listings carry the same version
-  as an etag, so a repeated `count(*)` or metadata-only Parquet query is
-  answered from the cached footers. Without a file id (an old NameNode) there
-  is no version tag, and both caches fall back to the modification time.
+  as an etag, so a repeated `count(*)` over a glob is answered from the
+  cached footers without opening the files (a single file already was,
+  through its open handle). Without a file id (an old NameNode) there is no
+  version tag, and both caches fall back to the modification time.
 - **Short-circuit local reads**: when DuckDB runs on DataNode hosts, set
   `dfs.client.read.shortcircuit=true` and `dfs.domain.socket.path` in
   `hdfs-site.xml` (as for Hadoop clients) to read local block replicas
