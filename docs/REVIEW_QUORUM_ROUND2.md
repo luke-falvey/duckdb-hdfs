@@ -109,6 +109,7 @@ Open, for the owner to weigh:
 | `HADOOP_CONF_DIR` pointing at a missing directory is silently ignored. | szarnyasg | Behaviour change for environments that set it loosely; needs a CLI test. |
 | A secret scope with a trailing `/` doesn't cover the directory itself. | samansmink | Scope semantics; goes with the `MatchScore` question above. |
 | No TSan job; no test loads the shipped `.duckdb_extension`; no https/SPNEGO KMS test; no hive-partitioning scans of HDFS globs; the cache benchmark can't fail; `bench.py --compare` drops missing queries silently. | mytherin, carlopi, tmonster, lnkuiper | CI and test additions, each its own PR. |
+| Found by this round's CI: Parquet opened a file found by the glob literal fallback twice without sharing the reader (2 `getBlockLocations`). For a plain single-file read it shares the reader (1). | CI | Not yet traced. `hdfs_rpc_log.test` counts only the fallback's own calls. |
 | Smaller nits: `rowid` branch dead code; `hdfs_stat` has no cardinality; walk options built twice; `require parquet` placement skips CSV-only tests; a Router's one `UNSUPPORTED` disables batching until reconnect; deprecated hdfs-site key has no warning; encrypted writes copy the whole buffer. | kryonix, hawkfish, dtenwolde, mytherin, pdet, taniabogatsch, lnkuiper | Low severity. |
 
 ## Recommendation

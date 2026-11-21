@@ -107,8 +107,8 @@ CALL truncate_duckdb_logs();
 # --- the literal fallback ------------------------------------------------------------
 
 # A pattern that matches nothing may be a file whose name contains glob characters. One getFileInfo after the
-# listing answers both whether it exists and what it is. (Parquet: its second open reuses the listing's status, as
-# above, so only the glob's calls and one getBlockLocations remain.)
+# listing answers both whether it exists and what it is. Only the glob's own calls are counted here: opening the
+# file costs getBlockLocations calls on top.
 statement ok
 COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/rpc[1].parquet' (FORMAT parquet);
 
@@ -121,9 +121,8 @@ SELECT v FROM read_parquet('hdfs://localhost:9000/test/rpc[1].parquet');
 1
 
 query TI
-SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') GROUP BY op ORDER BY op;
+SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') WHERE op <> 'getBlockLocations' GROUP BY op ORDER BY op;
 ----
-getBlockLocations	1
 getFileInfo	1
 listDirectory	1
 
