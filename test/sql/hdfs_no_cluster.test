@@ -221,7 +221,7 @@ SELECT * FROM read_csv('hdfs://127.0.0.1:1/' || repeat('{a}', 1000) || '.csv');
 statement error
 SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/d/' || repeat('x', 60000) || repeat('{a,b}', 13));
 ----
-<REGEX>:Invalid Input Error: Failed to glob HDFS pattern 'hdfs://127\.0\.0\.1:1/d/x{179}\.\.\.': Glob pattern '/d/x{197}\.\.\.' is too large to expand: its brace groups would build more than 16777216 bytes of patterns\. Use fewer brace groups or a shorter pattern
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern 'hdfs://127\.0\.0\.1:1/d/x{179}\.\.\.': Glob pattern '/d/x{197}\.\.\.' is too large to expand: its brace groups would build more than 16777216 bytes of patterns\. Use fewer brace groups or a shorter pattern.*
 
 # A brace inside a character class is a class member, not a group: the pattern is valid, and fails only for want
 # of a NameNode.
