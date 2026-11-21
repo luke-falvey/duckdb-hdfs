@@ -217,8 +217,8 @@ Behavior notes:
 - **Connection failures.** Reads are retried once on a new connection. Creates,
   deletes and renames are not simply sent again (the first attempt may have
   taken effect): after reconnecting, the extension checks whether it did (a
-  deleted path is gone; a renamed source is gone and the target has its
-  length). Where it can't tell, as for a create whose file now exists, the
+  deleted path is gone; a renamed source is gone and the target is the same
+  file, by its file id). Where it can't tell, as for a create whose file now exists, the
   error says the outcome is unknown.
 
 ## URLs
@@ -394,6 +394,10 @@ Tuning:
   …) as remote, and `hdfs://` isn't on it, so HDFS files are cached only with
   `SET cache_local_files = true` (which caches local files too), and
   `validate_external_file_cache = 'VALIDATE_REMOTE'` doesn't validate them.
+  With `SET parquet_metadata_cache = true`, listings carry the same version
+  as an etag, so a repeated `count(*)` or metadata-only Parquet query is
+  answered from the cached footers. Without a file id (an old NameNode) there
+  is no version tag, and both caches fall back to the modification time.
 - **Short-circuit local reads**: when DuckDB runs on DataNode hosts, set
   `dfs.client.read.shortcircuit=true` and `dfs.domain.socket.path` in
   `hdfs-site.xml` (as for Hadoop clients) to read local block replicas

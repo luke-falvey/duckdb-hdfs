@@ -100,6 +100,9 @@ private:
 	vector<HdfsFileStatus> batch;
 	bool emitted_any = false;
 	bool retried = false;
+	//! The RPC logger of the query that opened the stream (HDFS log type), for the walk a retry starts from
+	//! whichever thread calls Next().
+	weak_ptr<Logger> rpc_logger;
 };
 
 class HdfsFileSystem : public FileSystem {
@@ -131,7 +134,8 @@ public:
 
 	int64_t GetFileSize(FileHandle &handle) override;
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override;
-	//! "<mtime>:<length>", so the external file cache validates without another RPC.
+	//! "<file id>:<mtime>:<length>" (empty if the file id is unknown), so DuckDB's caches validate without another
+	//! RPC.
 	string GetVersionTag(FileHandle &handle) override;
 	//! Open handles are always files.
 	FileType GetFileType(FileHandle &handle) override;

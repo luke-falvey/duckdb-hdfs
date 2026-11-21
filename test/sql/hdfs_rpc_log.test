@@ -107,8 +107,9 @@ CALL truncate_duckdb_logs();
 # --- the literal fallback ------------------------------------------------------------
 
 # A pattern that matches nothing may be a file whose name contains glob characters. One getFileInfo after the
-# listing answers both whether it exists and what it is. Only the glob's own calls are counted here: opening the
-# file costs getBlockLocations calls on top.
+# listing answers both whether it exists and what it is. Opening the file costs getBlockLocations on top: two
+# here, against one for a plain read (Parquet's second open doesn't share the first reader on this path; not yet
+# traced, docs/REVIEW_QUORUM_ROUND3.md). Pinned, so a change in either direction shows.
 statement ok
 COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/rpc[1].parquet' (FORMAT parquet);
 
@@ -121,7 +122,38 @@ SELECT v FROM read_parquet('hdfs://localhost:9000/test/rpc[1].parquet');
 1
 
 query TI
-SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') WHERE op <> 'getBlockLocations' GROUP BY op ORDER BY op;
+SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') GROUP BY op ORDER BY op;
+----
+getBlockLocations	2
+getFileInfo	1
+listDirectory	1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# hdfs_ls's own fallback: the same single getFileInfo, and a file is its own row (no second listing).
+query TT
+SELECT name, type FROM hdfs_ls('hdfs://localhost:9000/test/rpc[1].parquet');
+----
+rpc[1].parquet	file
+
+query TI
+SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') GROUP BY op ORDER BY op;
+----
+getFileInfo	1
+listDirectory	1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# A name with glob characters that doesn't exist: no rows, and nothing after the stat.
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/test/rpc[9].parquet');
+----
+0
+
+query TI
+SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') GROUP BY op ORDER BY op;
 ----
 getFileInfo	1
 listDirectory	1
@@ -150,6 +182,12 @@ query I
 SELECT count(DISTINCT query_id) FROM duckdb_logs_parsed('HDFS') WHERE path = '/test/rpc_abort.csv';
 ----
 1
+
+# count(DISTINCT) ignores NULL: none of them may be logged without a query either.
+query I
+SELECT count(*) FROM duckdb_logs_parsed('HDFS') WHERE path = '/test/rpc_abort.csv' AND query_id IS NULL;
+----
+0
 
 statement ok
 CALL truncate_duckdb_logs();

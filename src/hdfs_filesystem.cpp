@@ -104,6 +104,17 @@ HdfsEntry MakeHdfsEntry(const string &authority, const HdfsFileStatus &status) {
 	return entry;
 }
 
+//! The version tag of a file: the same identity reader sharing uses (file id, mtime, length). A file replaced by
+//! one of the same length with its mtime kept (`hdfs dfs -cp -p`, `distcp -pt`) has a new inode id. With a tag,
+//! DuckDB's caches trust it alone (no recently-modified margin), so it must tell those versions apart: without a
+//! file id (0, unknown) there is no tag, and the caches fall back to the modification time and its margin.
+string HdfsVersionTag(int64_t file_id, timestamp_t mtime, int64_t length) {
+	if (file_id <= 0) {
+		return string();
+	}
+	return std::to_string(file_id) + ":" + std::to_string(Timestamp::GetEpochMs(mtime)) + ":" + std::to_string(length);
+}
+
 //! DuckDB's extended file info from a listing, so opening the file costs no extra stat.
 shared_ptr<ExtendedOpenFileInfo> MakeExtendedInfo(const HdfsEntry &entry) {
 	auto info = make_shared_ptr<ExtendedOpenFileInfo>();
@@ -114,6 +125,11 @@ shared_ptr<ExtendedOpenFileInfo> MakeExtendedInfo(const HdfsEntry &entry) {
 		// Lets OpenFileExtended share an open reader only with the same file, not one that replaced it.
 		// UBIGINT: core exports ExtendedOpenFileInfo::TryGetOption for idx_t, not for int64_t.
 		info->options.emplace("hdfs_file_id", Value::UBIGINT(static_cast<uint64_t>(entry.file_id)));
+		if (!entry.is_dir) {
+			// The same tag GetVersionTag gives an open handle: the Parquet metadata cache compares the two, and
+			// without it never trusts a cached footer for an hdfs:// file.
+			info->options.emplace("etag", Value(HdfsVersionTag(entry.file_id, entry.mtime, entry.size)));
+		}
 	}
 	return info;
 }
@@ -674,17 +690,6 @@ timestamp_t HdfsFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	return hdfs_handle.mtime;
 }
 
-namespace {
-
-//! The version tag of a file: the same identity reader sharing uses (file id, mtime, length). A file replaced by
-//! one of the same length with its mtime kept (`hdfs dfs -cp -p`, `distcp -pt`) has a new inode id. With a tag,
-//! DuckDB's external file cache trusts it alone (no recently-modified margin), so it must tell those versions apart.
-string HdfsVersionTag(int64_t file_id, timestamp_t mtime, int64_t length) {
-	return std::to_string(file_id) + ":" + std::to_string(Timestamp::GetEpochMs(mtime)) + ":" + std::to_string(length);
-}
-
-} // namespace
-
 string HdfsFileSystem::GetVersionTag(FileHandle &handle) {
 	auto &hdfs_handle = handle.Cast<HdfsFileHandle>();
 	if (!hdfs_handle.reader) {
@@ -710,7 +715,7 @@ optional<FileMetadata> HdfsFileSystem::GetStatsIfExists(const OpenFileInfo &file
 		metadata.last_modification_time = last_modified;
 		metadata.file_type = FileType::FILE_TYPE_REGULAR;
 		idx_t file_id;
-		if (file.extended_info->TryGetOption("hdfs_file_id", file_id)) {
+		if (file.extended_info->TryGetOption("hdfs_file_id", file_id) && file_id > 0) {
 			metadata.file_id = file_id;
 			metadata.version_tag = HdfsVersionTag(NumericCast<int64_t>(file_id), last_modified, metadata.file_size);
 		}
@@ -933,7 +938,8 @@ void HdfsFileSystem::MoveFile(const string &source, const string &target, option
 		    target);
 	}
 	try {
-		// The source's length, to recognise a rename that took effect before a connection failure.
+		// The source's identity (file id, else length), to recognise a rename that took effect before a connection
+		// failure.
 		auto source_status =
 		    connection->Run([&](const shared_ptr<HdfsClient> &client) { return client->Stat(source_path); });
 		connection->RunMutation(
@@ -958,7 +964,11 @@ void HdfsFileSystem::MoveFile(const string &source, const string &target, option
 				    }
 				    status.is_dir = true; // no target: not a match below
 			    }
-			    if (status.is_dir || status.length != source_status.length) {
+			    // A rename keeps the inode: with file ids, only the source's own id is a match (an old target of the
+			    // same length, e.g. from re-running the same COPY, is not); without them, fall back to the length.
+			    bool same_file = source_status.file_id > 0 ? status.file_id == source_status.file_id
+			                                               : status.length == source_status.length;
+			    if (status.is_dir || !same_file) {
 				    throw HdfsError(HdfsErrorType::IO,
 				                    failure.message + "; after reconnecting, the source is gone but the target doesn't "
 				                                      "match it: the outcome is unknown");
@@ -1061,12 +1071,15 @@ unique_ptr<MultiFileList> HdfsFileSystem::GlobFilesExtended(const string &path, 
 
 HdfsListStream::HdfsListStream(shared_ptr<HdfsConnection> connection_p, string url_p, bool glob,
                                HdfsWalkOptions options)
-    : connection(std::move(connection_p)), url(std::move(url_p)), glob(glob), options(options) {
+    : connection(std::move(connection_p)), url(std::move(url_p)), glob(glob), options(options),
+      rpc_logger(HdfsClient::GetThreadLogger()) {
 	ParseHdfsPath(url, authority, hdfs_path);
 	Open();
 }
 
 void HdfsListStream::Open() {
+	// A walk logs to the thread's logger when it starts; a retry runs on the thread that called Next().
+	HdfsRpcLoggerScope log_scope(rpc_logger.lock());
 	client = connection->Get();
 	try {
 		walk = glob ? client->Glob(hdfs_path, options) : client->List(hdfs_path, false, options);

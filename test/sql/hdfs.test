@@ -853,6 +853,38 @@ SELECT v FROM read_parquet('hdfs://localhost:9000/test/cache.parquet');
 statement ok
 RESET cache_local_files;
 
+# Listings carry the same version tag as an etag, so the Parquet metadata cache can trust a cached footer without
+# opening the file: a repeated count(*) is answered from the cached row-group statistics, reading no bytes.
+statement ok
+SET parquet_metadata_cache = true;
+
+statement ok
+COPY (SELECT range AS v FROM range(1000)) TO 'hdfs://localhost:9000/test/etag.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/etag.parquet');
+----
+1000
+
+statement ok
+CALL enable_logging('FileSystem');
+
+query I
+SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/etag.parquet');
+----
+1000
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('FileSystem') WHERE path = 'hdfs://localhost:9000/test/etag.parquet' AND op = 'READ';
+----
+0
+
+statement ok
+CALL disable_logging();
+
+statement ok
+RESET parquet_metadata_cache;
+
 # A CSV larger than DuckDB's read buffer: one thread reads it front to back,
 # several threads read it at scattered offsets on shared streams; both must
 # see the same bytes. Also inside an encryption zone, where decryption depends
