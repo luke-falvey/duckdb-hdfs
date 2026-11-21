@@ -376,7 +376,7 @@ HdfsSecretMatch LookupSecret(const string &url, optional_ptr<FileOpener> opener)
 				if (!DBConfig::GetConfig(*db).CanAccessFile(result.config.config_dir, FileType::FILE_TYPE_DIR)) {
 					throw PermissionException("Cannot use HDFS secret '%s': its CONFIG_DIR '%s' is not in "
 					                          "allowed_directories (enable_external_access is false)",
-					                          secret.GetName(), result.config.config_dir);
+					                          secret.GetName().GetIdentifierName(), result.config.config_dir);
 				}
 			}
 			if (kv_secret.TryGetValue("user", value) && !value.IsNull()) {
