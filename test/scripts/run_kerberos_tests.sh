@@ -60,6 +60,22 @@ client_settings() {
     esac
 }
 
+# As in run_hdfs_tests.sh: a reported skip fails the run, and every test file
+# that needs the Kerberos cluster must be run (checked at the end).
+RAN_TESTS=""
+run_kerberos_test() { # test file; the environment comes from the caller
+    local test_file="$1" output
+    output="$(mktemp)"
+    "${UNITTEST}" "${test_file}" 2>&1 | tee "${output}"
+    if grep -q "Skipped tests for the following reasons" "${output}"; then
+        rm -f "${output}"
+        echo "ERROR: ${test_file} was skipped (in whole or in part); see the reasons above" >&2
+        exit 1
+    fi
+    rm -f "${output}"
+    RAN_TESTS="${RAN_TESTS} ${test_file}"
+}
+
 probe() { # conf_dir -> succeeds if a write works
     KRB5CCNAME="FILE:${WORK_DIR}/krb5cc" HADOOP_CONF_DIR="$1" "${DUCKDB}" -c \
         "COPY (SELECT 1 AS x) TO 'hdfs://localhost:19000/ready/probe.csv'" >/dev/null 2>&1
@@ -114,7 +130,7 @@ for mode in "${MODES[@]}"; do
     cd "${REPO_ROOT}"
     echo "==> [${mode}] Running Kerberos integration tests..."
     HDFS_KERBEROS_TEST_RUNNING=1 KRB5CCNAME="FILE:${WORK_DIR}/krb5cc" HADOOP_CONF_DIR="${CONF}" \
-        "${UNITTEST}" test/sql/hdfs_kerberos.test
+        run_kerberos_test test/sql/hdfs_kerberos.test
 
     # The protection is enforced, not just negotiated.
     case "${mode}" in
@@ -136,4 +152,19 @@ done
 echo "==> Running Kerberos tests without a ticket..."
 HDFS_KERBEROS_NO_TICKET=1 KRB5CCNAME="FILE:${WORK_DIR}/no-such-ccache" \
     HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf-kerberos" \
-    "${UNITTEST}" test/sql/hdfs_kerberos_no_ticket.test
+    run_kerberos_test test/sql/hdfs_kerberos_no_ticket.test
+
+echo "==> Checking every Kerberos test file ran..."
+cd "${REPO_ROOT}"
+missing=""
+for test_file in $(grep -l '^require-env HDFS_KERBEROS' test/sql/*.test); do
+    case " ${RAN_TESTS} " in
+    *" ${test_file} "*) ;;
+    *) missing="${missing} ${test_file}" ;;
+    esac
+done
+if [ -n "${missing}" ]; then
+    echo "ERROR: these need the Kerberos cluster (require-env HDFS_KERBEROS_*) but this script doesn't run them:${missing}" >&2
+    exit 1
+fi
+echo "OK"
