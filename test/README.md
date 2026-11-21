@@ -86,10 +86,14 @@ This builds the HDFS image, starts the cluster, seeds fixtures under `/test`,
 served from the external file cache; batched and unbatched listings agree;
 the Java client decrypts what DuckDB encrypted) and
 `hdfs_ez_no_provider.test`, and tears everything down. It fails if a
-`test/sql` file that requires `HDFS_TEST_RUNNING` wasn't run, so a new cluster
-test can't be skipped silently: add it to the script.
+`test/sql` file that requires `HDFS_TEST_RUNNING` wasn't run, or if unittest
+reports a skipped test (an unmet `require` or `require-env`), so a cluster
+test can't be skipped silently: add new ones to the script. The cache check
+asserts its own preconditions (same size and mtime, a filled cache) and a
+control read with validation off, so it can't pass without the cache.
 
-The Kerberos suite: `test/scripts/run_kerberos_tests.sh [mode...]`.
+The Kerberos suite: `test/scripts/run_kerberos_tests.sh [mode...]`. It makes
+the same two checks for the files that require `HDFS_KERBEROS_*`.
 
 CI (`.github/workflows/Integration.yml`, Linux amd64) runs `make test_unit`,
 `make test`, both scripts, and `test/bench/run_bench.sh --check` for every pull

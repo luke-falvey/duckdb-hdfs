@@ -427,7 +427,7 @@ public:
 	bool include_hidden = false;
 	bool batched_listing = true;
 	size_t max_parallelism = 1;
-	unique_ptr<HdfsGlobPlan> plan;
+	shared_ptr<const HdfsGlobPlan> plan;
 	std::shared_ptr<std::atomic<size_t>> batch_limit; // see HdfsClientImpl
 	// Where the workers log their RPCs: the logger of the thread that started the walk.
 	shared_ptr<Logger> logger;
@@ -1068,7 +1068,7 @@ public:
 			// The NameNode is unreachable, or refused: releasing the stream now would try to complete the file
 			// (and block on the same NameNode). Leave the stream unclosed instead: the file stays under construction,
 			// not complete, and its lease lapses once this client disconnects. Connections are cached, so that can be
-			// as late as hdfs_reset_connections() or the process exiting (docs/REVIEW_QUORUM_ROUND2.md, open item).
+			// as late as hdfs_reset_connections() or the process exiting (docs/PLAN.md item 7).
 			(void)out.release(); // NOLINT: deliberately leaked, see above
 			throw HdfsError(failure.type, "delete incomplete file '" + path + "' failed: " + failure.message);
 		}
@@ -1197,11 +1197,10 @@ public:
 		return std::move(walk);
 	}
 
-	unique_ptr<HdfsWalk> Glob(const string &pattern, const HdfsWalkOptions &options) override {
-		auto plan = Guard("invalid glob pattern", [&] {
-			return make_uniq<HdfsGlobPlan>(HdfsGlobPlan::Parse(pattern, options.include_hidden));
-		});
-		auto walk = NewWalk(pattern, options);
+	unique_ptr<HdfsWalk> Glob(shared_ptr<const HdfsGlobPlan> plan, const HdfsWalkOptions &options) override {
+		D_ASSERT(plan);
+		// The walk's errors name the pattern; it may be 64 KiB.
+		auto walk = NewWalk(HdfsGlobPlan::Excerpt(plan->Pattern()), options);
 		walk->glob = true;
 		auto root = plan->Root();
 		bool emit_root = plan->EmitRoot();

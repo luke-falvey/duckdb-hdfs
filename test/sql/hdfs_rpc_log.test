@@ -107,8 +107,9 @@ CALL truncate_duckdb_logs();
 # --- the literal fallback ------------------------------------------------------------
 
 # A pattern that matches nothing may be a file whose name contains glob characters. One getFileInfo after the
-# listing answers both whether it exists and what it is. Only the glob's own calls are counted here: opening the
-# file costs getBlockLocations calls on top.
+# listing answers both whether it exists and what it is. Opening the file costs getBlockLocations on top: two
+# here, against one for a plain read (Parquet's second open doesn't share the first reader on this path; not yet
+# traced, docs/REVIEW_QUORUM_ROUND3.md). Pinned, so a change in either direction shows.
 statement ok
 COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/rpc[1].parquet' (FORMAT parquet);
 
@@ -121,10 +122,154 @@ SELECT v FROM read_parquet('hdfs://localhost:9000/test/rpc[1].parquet');
 1
 
 query TI
-SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') WHERE op <> 'getBlockLocations' GROUP BY op ORDER BY op;
+SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') GROUP BY op ORDER BY op;
+----
+getBlockLocations	2
+getFileInfo	1
+listDirectory	1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# hdfs_ls's own fallback: the same single getFileInfo, and a file is its own row (no second listing).
+query TT
+SELECT name, type FROM hdfs_ls('hdfs://localhost:9000/test/rpc[1].parquet');
+----
+rpc[1].parquet	file
+
+query TI
+SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') GROUP BY op ORDER BY op;
 ----
 getFileInfo	1
 listDirectory	1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# The fallback's row for a file is the row a listing of its directory gives (from a stat rather than a listing).
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM hdfs_ls('hdfs://localhost:9000/test/rpc[1].parquet')
+     EXCEPT ALL SELECT * FROM hdfs_ls('hdfs://localhost:9000/test') WHERE name = 'rpc[1].parquet')
+    UNION ALL
+    (SELECT * FROM hdfs_ls('hdfs://localhost:9000/test') WHERE name = 'rpc[1].parquet'
+     EXCEPT ALL SELECT * FROM hdfs_ls('hdfs://localhost:9000/test/rpc[1].parquet')));
+----
+0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# A directory whose name has glob characters is listed: its children, not itself. The glob's listing of /test
+# (no match), one stat, then the directory's listing: two listDirectory. (The directory can still vanish between
+# the stat and its listing; that race needs fault injection to test.)
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/rpcdir[1]/x.csv' (FORMAT csv);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query TT
+SELECT name, type FROM hdfs_ls('hdfs://localhost:9000/test/rpcdir[1]');
+----
+x.csv	file
+
+query TI
+SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') GROUP BY op ORDER BY op;
+----
+getFileInfo	1
+listDirectory	2
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# A name with glob characters that doesn't exist: no rows, and nothing after the stat.
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/test/rpc[9].parquet');
+----
+0
+
+query TI
+SELECT op, count(*) FROM duckdb_logs_parsed('HDFS') GROUP BY op ORDER BY op;
+----
+getFileInfo	1
+listDirectory	1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# --- the Parquet metadata cache over a glob --------------------------------------------
+
+# Listings carry each file's version tag as its etag. With parquet_metadata_cache, a repeated count(*) over a glob
+# is then answered from the cached footers: the files the bind doesn't read are never opened. (A single-file scan
+# validates its cached footer through the open handle's tag instead, so it needs no etag.)
+statement ok
+COPY (SELECT range AS v FROM range(1000)) TO 'hdfs://localhost:9000/test/etag_a.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT range AS v FROM range(1000)) TO 'hdfs://localhost:9000/test/etag_b.parquet' (FORMAT parquet);
+
+# The control: without the cache, the scan opens the second file (its block locations).
+query I
+SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/etag_*.parquet');
+----
+2000
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/etag_*.parquet');
+----
+2000
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs_parsed('HDFS') WHERE op = 'getBlockLocations' AND path = '/test/etag_b.parquet';
+----
+true
+
+statement ok
+SET parquet_metadata_cache = true;
+
+query I
+SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/etag_*.parquet');
+----
+2000
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/etag_*.parquet');
+----
+2000
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('HDFS') WHERE op = 'getBlockLocations' AND path = '/test/etag_b.parquet';
+----
+0
+
+# A replaced file's tag changes (here a new id and mtime, with as many rows), so its cached footer isn't trusted:
+# the file is opened again and the new values read. A same-size replacement that keeps the mtime, where only the id
+# differs, is checked in run_hdfs_tests.sh.
+statement ok
+COPY (SELECT range + 1000 AS v FROM range(1000)) TO 'hdfs://localhost:9000/test/etag_b.parquet' (FORMAT parquet);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(v) FROM read_parquet('hdfs://localhost:9000/test/etag_*.parquet');
+----
+2000	1999000
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs_parsed('HDFS') WHERE op = 'getBlockLocations' AND path = '/test/etag_b.parquet';
+----
+true
+
+statement ok
+RESET parquet_metadata_cache;
 
 statement ok
 CALL truncate_duckdb_logs();
@@ -150,6 +295,12 @@ query I
 SELECT count(DISTINCT query_id) FROM duckdb_logs_parsed('HDFS') WHERE path = '/test/rpc_abort.csv';
 ----
 1
+
+# count(DISTINCT) ignores NULL: none of them may be logged without a query either.
+query I
+SELECT count(*) FROM duckdb_logs_parsed('HDFS') WHERE path = '/test/rpc_abort.csv' AND query_id IS NULL;
+----
+0
 
 statement ok
 CALL truncate_duckdb_logs();

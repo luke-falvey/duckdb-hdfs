@@ -19,9 +19,10 @@ test/scripts/run_hdfs_tests.sh      # Docker HDFS cluster tests
 test/scripts/run_kerberos_tests.sh  # Kerberos cluster, every wire-protection mode
 ```
 
-The Integration Tests workflow (`.github/workflows/Integration.yml`) runs all four on Linux for every push and pull
-request. For changes that add or remove NameNode round trips, also run `test/bench/run_bench.sh --check` and
-include its numbers (see [test/bench/README.md](test/bench/README.md)).
+The Integration Tests workflow (`.github/workflows/Integration.yml`) runs all four on Linux for every pull request
+and every push to `main` and `duckdb-review`; changes that touch only docs skip it, and a new push to a pull
+request cancels its previous run. For changes that add or remove NameNode round trips, also run
+`test/bench/run_bench.sh --check` and include its numbers (see [test/bench/README.md](test/bench/README.md)).
 
 Format C++ with the repository's `.clang-format` (`make format-fix`, or `clang-format -i` on the files you
 changed), and Python with `black -l 120`.

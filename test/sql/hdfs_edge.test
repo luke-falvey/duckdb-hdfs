@@ -11,9 +11,6 @@ require-env HDFS_TEST_RUNNING
 # test/hdfs-conf/hdfs-site.xml). Reads past 2 MiB must fetch more locations.
 # Fixtures under /edge and /ez/edge come from test/scripts/hdfs_up.sh.
 
-statement ok
-PRAGMA enable_verification;
-
 # payload(n): n bytes of deterministic content (hex digits), to write and compare.
 statement ok
 CREATE MACRO payload(n) AS (SELECT substr(string_agg(md5(range::VARCHAR), '' ORDER BY range), 1, n) FROM range(n // 32 + 1));

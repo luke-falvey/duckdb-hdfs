@@ -23,7 +23,8 @@ bool ExplicitHiddenPrefix(const string &pattern) {
 //! Mirrors the bracket parsing of DuckDB's Glob(): an optional `!`, a `]` right after that is literal, `a-z`
 //! ranges, and no escapes inside the class. A `[` without a closing `]` is not a class.
 idx_t ClassEnd(const string &pattern, idx_t open) {
-	// Without any ']' after it, no '[' starts a class; checked first, so a run of unclosed '[' stays cheap.
+	// Without any ']' after it, no '[' starts a class; checked first, so a run of unclosed '[' costs one scan per
+	// '[' (bounded by MAX_PATTERN_LENGTH), not a class parse each.
 	if (pattern.find(']', open + 1) == string::npos) {
 		return string::npos;
 	}
@@ -81,6 +82,19 @@ vector<string> SplitComponents(const string &path) {
 
 } // namespace
 
+string HdfsGlobPlan::Excerpt(const string &pattern) {
+	static constexpr idx_t MAX_EXCERPT = 200;
+	if (pattern.size() <= MAX_EXCERPT) {
+		return pattern;
+	}
+	// Cut at a character boundary, so the message stays valid UTF-8.
+	idx_t cut = MAX_EXCERPT;
+	while (cut > 0 && (static_cast<unsigned char>(pattern[cut]) & 0xC0) == 0x80) {
+		cut--;
+	}
+	return pattern.substr(0, cut) + "...";
+}
+
 bool HdfsGlobPlan::IsHidden(const string &name) {
 	return !name.empty() && (name[0] == '.' || name[0] == '_');
 }
@@ -108,11 +122,12 @@ vector<string> HdfsGlobPlan::ExpandBraces(const string &pattern) {
 		char_idx += VerbatimLength(pattern, char_idx);
 	}
 	vector<string> result;
-	ExpandBraces(pattern, pattern, result);
+	idx_t budget = MAX_EXPANSION_BYTES;
+	ExpandBraces(pattern, pattern, result, budget);
 	return result;
 }
 
-void HdfsGlobPlan::ExpandBraces(const string &pattern, const string &original, vector<string> &result) {
+void HdfsGlobPlan::ExpandBraces(const string &pattern, const string &original, vector<string> &result, idx_t &budget) {
 	// The first '{' that isn't escaped or inside a character class.
 	auto start = string::npos;
 	for (idx_t char_idx = 0; char_idx < pattern.size();) {
@@ -126,7 +141,7 @@ void HdfsGlobPlan::ExpandBraces(const string &pattern, const string &original, v
 		if (result.size() >= MAX_EXPANDED_PATTERNS) {
 			throw InvalidInputException("Glob pattern '%s' expands to more than %llu patterns: each {a,b} group "
 			                            "multiplies the count. Use fewer brace groups or several queries",
-			                            original, MAX_EXPANDED_PATTERNS);
+			                            Excerpt(original), MAX_EXPANDED_PATTERNS);
 		}
 		result.push_back(pattern);
 		return;
@@ -163,19 +178,28 @@ void HdfsGlobPlan::ExpandBraces(const string &pattern, const string &original, v
 		}
 	}
 	if (close == string::npos) {
-		throw InvalidInputException("Unclosed brace group in glob pattern '%s'", original);
+		throw InvalidInputException("Unclosed brace group in glob pattern '%s'", Excerpt(original));
 	}
 	auto prefix = pattern.substr(0, start);
 	auto suffix = pattern.substr(close + 1);
 	for (auto &alternative : alternatives) {
 		// Each level removes one brace pair, so the recursion is at most MAX_BRACE_GROUPS deep; the count check above
-		// bounds the number of leaves.
-		ExpandBraces(prefix + alternative + suffix, original, result);
+		// bounds the number of leaves, and the byte budget the copying: every pattern built on the way counts, as a
+		// long pattern with many groups copies itself once per group and leaf.
+		auto size = prefix.size() + alternative.size() + suffix.size();
+		if (size > budget) {
+			throw InvalidInputException("Glob pattern '%s' is too large to expand: its brace groups would build more "
+			                            "than %llu bytes of patterns. Use fewer brace groups or a shorter pattern",
+			                            Excerpt(original), MAX_EXPANSION_BYTES);
+		}
+		budget -= size;
+		ExpandBraces(prefix + alternative + suffix, original, result, budget);
 	}
 }
 
 HdfsGlobPlan HdfsGlobPlan::Parse(const string &pattern, bool include_hidden) {
 	HdfsGlobPlan plan;
+	plan.pattern = pattern;
 	plan.include_hidden = include_hidden;
 	for (auto &expanded : ExpandBraces(pattern)) {
 		vector<Component> components;
@@ -199,12 +223,19 @@ HdfsGlobPlan HdfsGlobPlan::Parse(const string &pattern, bool include_hidden) {
 						component.text.push_back(c);
 					}
 				}
+				// HDFS forbids "." and ".." as names, and DuckDB's allowed_directories check only sees the raw
+				// pattern: "{..}" or "\.\." would otherwise become a ".." in the walk root after expansion.
+				if (component.kind == ComponentKind::LITERAL && (component.text == "." || component.text == "..")) {
+					throw InvalidInputException("Glob pattern '%s' has a '%s' component (after brace expansion and "
+					                            "escapes); HDFS paths cannot contain '.' or '..'",
+					                            Excerpt(pattern), component.text);
+				}
 			}
 			components.push_back(std::move(component));
 		}
 		if (crawls > 1) {
 			// The same restriction (and message) as DuckDB's globber.
-			throw InvalidInputException("Cannot use multiple '**' in one path: '%s'", pattern);
+			throw InvalidInputException("Cannot use multiple '**' in one path: '%s'", Excerpt(pattern));
 		}
 		plan.patterns.push_back(std::move(components));
 	}

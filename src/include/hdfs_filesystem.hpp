@@ -79,7 +79,9 @@ public:
 //! continues, in no particular order. Not thread-safe.
 class HdfsListStream {
 public:
-	HdfsListStream(shared_ptr<HdfsConnection> connection, string url, bool glob, HdfsWalkOptions options);
+	//! Lists `url`, or with a `plan` (HdfsGlobPlan::Parse of its path) the entries that glob matches.
+	HdfsListStream(shared_ptr<HdfsConnection> connection, string url, shared_ptr<const HdfsGlobPlan> plan,
+	               HdfsWalkOptions options);
 
 	//! Replace `out` with the next batch (at most `max_entries`), blocking until one arrives. Returns false at the
 	//! end. A connection failure is retried once while no entries have been handed out yet. With a `context`, the
@@ -88,18 +90,24 @@ public:
 
 private:
 	void Open();
+	//! The URL as error messages quote it.
+	string DisplayUrl() const;
 
 	shared_ptr<HdfsConnection> connection;
 	const string url;
 	string authority;
 	string hdfs_path;
-	const bool glob;
+	//! The glob's plan, parsed once for the walk and any retry; null for a listing.
+	const shared_ptr<const HdfsGlobPlan> plan;
 	const HdfsWalkOptions options;
 	shared_ptr<HdfsClient> client;
 	unique_ptr<HdfsWalk> walk;
 	vector<HdfsFileStatus> batch;
 	bool emitted_any = false;
 	bool retried = false;
+	//! The RPC logger of the query that opened the stream (HDFS log type), for the walk a retry starts from
+	//! whichever thread calls Next().
+	weak_ptr<Logger> rpc_logger;
 };
 
 class HdfsFileSystem : public FileSystem {
@@ -131,7 +139,8 @@ public:
 
 	int64_t GetFileSize(FileHandle &handle) override;
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override;
-	//! "<mtime>:<length>", so the external file cache validates without another RPC.
+	//! "<file id>:<mtime>:<length>" (empty if the file id is unknown), so DuckDB's caches validate without another
+	//! RPC.
 	string GetVersionTag(FileHandle &handle) override;
 	//! Open handles are always files.
 	FileType GetFileType(FileHandle &handle) override;

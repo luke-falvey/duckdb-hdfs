@@ -17,6 +17,8 @@
 #include "duckdb/logging/log_type.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/secret/secret.hpp"
@@ -64,7 +66,7 @@ void CheckNoDotComponents(const string &url, const string &hdfs_path) {
 		auto length = slash - start;
 		if ((length == 1 || length == 2) && hdfs_path.compare(start, length, string(length, '.')) == 0) {
 			throw InvalidInputException("HDFS path '%s' has a '%s' component; HDFS paths cannot contain '.' or '..'",
-			                            url, hdfs_path.substr(start, length));
+			                            HdfsGlobPlan::Excerpt(url), hdfs_path.substr(start, length));
 		}
 		start = slash + 1;
 	}
@@ -103,6 +105,17 @@ HdfsEntry MakeHdfsEntry(const string &authority, const HdfsFileStatus &status) {
 	return entry;
 }
 
+//! The version tag of a file: the same identity reader sharing uses (file id, mtime, length). A file replaced by
+//! one of the same length with its mtime kept (`hdfs dfs -cp -p`, `distcp -pt`) has a new inode id. With a tag,
+//! DuckDB's caches trust it alone (no recently-modified margin), so it must tell those versions apart: without a
+//! file id (0, unknown) there is no tag, and the caches fall back to the modification time and its margin.
+string HdfsVersionTag(int64_t file_id, timestamp_t mtime, int64_t length) {
+	if (file_id <= 0) {
+		return string();
+	}
+	return std::to_string(file_id) + ":" + std::to_string(Timestamp::GetEpochMs(mtime)) + ":" + std::to_string(length);
+}
+
 //! DuckDB's extended file info from a listing, so opening the file costs no extra stat.
 shared_ptr<ExtendedOpenFileInfo> MakeExtendedInfo(const HdfsEntry &entry) {
 	auto info = make_shared_ptr<ExtendedOpenFileInfo>();
@@ -113,6 +126,11 @@ shared_ptr<ExtendedOpenFileInfo> MakeExtendedInfo(const HdfsEntry &entry) {
 		// Lets OpenFileExtended share an open reader only with the same file, not one that replaced it.
 		// UBIGINT: core exports ExtendedOpenFileInfo::TryGetOption for idx_t, not for int64_t.
 		info->options.emplace("hdfs_file_id", Value::UBIGINT(static_cast<uint64_t>(entry.file_id)));
+		if (!entry.is_dir) {
+			// The same tag GetVersionTag gives an open handle: the Parquet metadata cache compares the two, and
+			// without it never trusts a cached footer for an hdfs:// file.
+			info->options.emplace("etag", Value(HdfsVersionTag(entry.file_id, entry.mtime, entry.size)));
+		}
 	}
 	return info;
 }
@@ -227,13 +245,13 @@ HdfsFileHandle::~HdfsFileHandle() {
 			Close();
 			return;
 		} catch (std::exception &error) {
-			// Close() already aborted (removed) the file. The caller dropped the handle without Close(), so the error
-			// has nowhere to go but the log.
+			// Close() already aborted the write (the error says if removing the file failed too). The caller dropped
+			// the handle without Close(), so the error has nowhere to go but the log.
 			try {
 				if (logger) {
 					auto message =
 					    StringUtil::Format("Failed to complete HDFS file '%s' (handle dropped without Close; "
-					                       "the file was removed): %s",
+					                       "the write was aborted): %s",
 					                       path, ErrorData(error).RawMessage());
 					DUCKDB_LOG_ERROR(logger, message);
 				}
@@ -318,6 +336,26 @@ struct HdfsSecretMatch {
 	string secret;
 };
 
+//! libhdfs3 reads a secret's CONFIG_DIR itself, outside DuckDB's file system, so with enable_external_access =
+//! false it is checked as a local read: otherwise a secret could point the client (NameNodes, KMS URL, ticket
+//! cache) at a directory allowed_directories doesn't cover. The client gets the string as given, so it must be an
+//! absolute path: CanAccessFile would check "~/x" or "file:///x" as another path than libhdfs3 then reads. Checked
+//! on every lookup, so a connection cached while external access was on is refused too.
+void CheckConfigDirAccess(DatabaseInstance &db, optional_ptr<FileOpener> opener, const string &secret_name,
+                          const string &config_dir) {
+	auto &config = DBConfig::GetConfig(db);
+	// The same setting CanAccessFile reads.
+	bool restricted = !Settings::Get<EnableExternalAccessSetting>(config);
+	bool absolute = !config_dir.empty() && config_dir[0] == '/';
+	if ((restricted && !absolute) || !config.CanAccessFile(config_dir, FileType::FILE_TYPE_DIR, opener)) {
+		throw PermissionException(
+		    "Cannot use HDFS secret '%s': with enable_external_access = false, its CONFIG_DIR '%s' must be an "
+		    "absolute path in allowed_directories or allowed_paths (set them before disabling external access), or "
+		    "leave CONFIG_DIR out to use HADOOP_CONF_DIR",
+		    secret_name, config_dir);
+	}
+}
+
 HdfsSecretMatch LookupSecret(const string &url, optional_ptr<FileOpener> opener) {
 	HdfsSecretMatch result;
 	if (!opener) {
@@ -353,6 +391,7 @@ HdfsSecretMatch LookupSecret(const string &url, optional_ptr<FileOpener> opener)
 			Value value;
 			if (kv_secret.TryGetValue("config_dir", value) && !value.IsNull()) {
 				result.config.config_dir = value.ToString();
+				CheckConfigDirAccess(*db, opener, secret.GetName().GetIdentifierName(), result.config.config_dir);
 			}
 			if (kv_secret.TryGetValue("user", value) && !value.IsNull()) {
 				result.config.user = value.ToString();
@@ -429,6 +468,8 @@ unique_ptr<FileHandle> HdfsFileSystem::OpenFileExtended(const OpenFileInfo &file
 	}
 	HdfsFileStatus expected;
 	expected.length = NumericCast<int64_t>(file_size);
+	// Clamped for the reader-version match only; a pre-1970 file then never matches its listing's etag, which costs
+	// a Parquet metadata cache miss, not a stale read (docs/REVIEW_QUORUM_ROUND3.md, pre-1970 mtimes).
 	expected.mtime = NumericCast<uint64_t>(MaxValue<int64_t>(Timestamp::GetEpochMs(last_modified), 0));
 	idx_t file_id;
 	if (file.extended_info->TryGetOption("hdfs_file_id", file_id)) {
@@ -665,17 +706,6 @@ timestamp_t HdfsFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	return hdfs_handle.mtime;
 }
 
-namespace {
-
-//! The version tag of a file: the same identity reader sharing uses (file id, mtime, length). A file replaced by
-//! one of the same length with its mtime kept (`hdfs dfs -cp -p`, `distcp -pt`) has a new inode id. With a tag,
-//! DuckDB's external file cache trusts it alone (no recently-modified margin), so it must tell those versions apart.
-string HdfsVersionTag(int64_t file_id, timestamp_t mtime, int64_t length) {
-	return std::to_string(file_id) + ":" + std::to_string(Timestamp::GetEpochMs(mtime)) + ":" + std::to_string(length);
-}
-
-} // namespace
-
 string HdfsFileSystem::GetVersionTag(FileHandle &handle) {
 	auto &hdfs_handle = handle.Cast<HdfsFileHandle>();
 	if (!hdfs_handle.reader) {
@@ -701,7 +731,7 @@ optional<FileMetadata> HdfsFileSystem::GetStatsIfExists(const OpenFileInfo &file
 		metadata.last_modification_time = last_modified;
 		metadata.file_type = FileType::FILE_TYPE_REGULAR;
 		idx_t file_id;
-		if (file.extended_info->TryGetOption("hdfs_file_id", file_id)) {
+		if (file.extended_info->TryGetOption("hdfs_file_id", file_id) && file_id > 0) {
 			metadata.file_id = file_id;
 			metadata.version_tag = HdfsVersionTag(NumericCast<int64_t>(file_id), last_modified, metadata.file_size);
 		}
@@ -924,7 +954,8 @@ void HdfsFileSystem::MoveFile(const string &source, const string &target, option
 		    target);
 	}
 	try {
-		// The source's length, to recognise a rename that took effect before a connection failure.
+		// The source's identity (file id, else length), to recognise a rename that took effect before a connection
+		// failure.
 		auto source_status =
 		    connection->Run([&](const shared_ptr<HdfsClient> &client) { return client->Stat(source_path); });
 		connection->RunMutation(
@@ -949,7 +980,11 @@ void HdfsFileSystem::MoveFile(const string &source, const string &target, option
 				    }
 				    status.is_dir = true; // no target: not a match below
 			    }
-			    if (status.is_dir || status.length != source_status.length) {
+			    // A rename keeps the inode: with file ids, only the source's own id is a match (an old target of the
+			    // same length, e.g. from re-running the same COPY, is not); without them, fall back to the length.
+			    bool same_file = source_status.file_id > 0 ? status.file_id == source_status.file_id
+			                                               : status.length == source_status.length;
+			    if (status.is_dir || !same_file) {
 				    throw HdfsError(HdfsErrorType::IO,
 				                    failure.message + "; after reconnecting, the source is gone but the target doesn't "
 				                                      "match it: the outcome is unknown");
@@ -1050,20 +1085,30 @@ unique_ptr<MultiFileList> HdfsFileSystem::GlobFilesExtended(const string &path, 
 	return make_uniq<HdfsGlobResult>(*this, path, options, opener);
 }
 
-HdfsListStream::HdfsListStream(shared_ptr<HdfsConnection> connection_p, string url_p, bool glob,
-                               HdfsWalkOptions options)
-    : connection(std::move(connection_p)), url(std::move(url_p)), glob(glob), options(options) {
+HdfsListStream::HdfsListStream(shared_ptr<HdfsConnection> connection_p, string url_p,
+                               shared_ptr<const HdfsGlobPlan> plan_p, HdfsWalkOptions options)
+    : connection(std::move(connection_p)), url(std::move(url_p)), plan(std::move(plan_p)), options(options),
+      rpc_logger(HdfsClient::GetThreadLogger()) {
 	ParseHdfsPath(url, authority, hdfs_path);
 	Open();
 }
 
+string HdfsListStream::DisplayUrl() const {
+	// A glob pattern may be 64 KiB; a listed path is bounded by the NameNode and is quoted whole.
+	return plan ? HdfsGlobPlan::Excerpt(url) : url;
+}
+
 void HdfsListStream::Open() {
+	// A walk logs to the thread's logger when it starts; a retry runs on the thread that called Next().
+	HdfsRpcLoggerScope log_scope(rpc_logger.lock());
 	client = connection->Get();
 	try {
-		walk = glob ? client->Glob(hdfs_path, options) : client->List(hdfs_path, false, options);
+		walk = plan ? client->Glob(plan, options) : client->List(hdfs_path, false, options);
 	} catch (const HdfsError &error) {
-		// Only an invalid pattern fails here; cluster errors surface in Next().
-		ThrowHdfsError(StringUtil::Format("Failed to glob HDFS pattern '%s'", url), error);
+		// Cluster errors surface in Next(); this covers a failure to start the walk.
+		ThrowHdfsError(StringUtil::Format(plan ? "Failed to glob HDFS pattern '%s'" : "Failed to list HDFS path '%s'",
+		                                  DisplayUrl()),
+		               error);
 	}
 }
 
@@ -1087,7 +1132,8 @@ bool HdfsListStream::Next(vector<HdfsEntry> &out, idx_t max_entries, optional_pt
 				continue;
 			}
 			ThrowHdfsError(
-			    StringUtil::Format(glob ? "Failed to glob HDFS pattern '%s'" : "Failed to list HDFS path '%s'", url),
+			    StringUtil::Format(plan ? "Failed to glob HDFS pattern '%s'" : "Failed to list HDFS path '%s'",
+			                       DisplayUrl()),
 			    error);
 		}
 		if (pending) {
@@ -1109,7 +1155,7 @@ unique_ptr<HdfsListStream> HdfsFileSystem::OpenListStream(const string &url, Hdf
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(url, authority, hdfs_path);
-	return make_uniq<HdfsListStream>(GetConnection(url, authority, opener), url, false, options);
+	return make_uniq<HdfsListStream>(GetConnection(url, authority, opener), url, nullptr, options);
 }
 
 unique_ptr<HdfsListStream> HdfsFileSystem::OpenGlobStream(const string &url, HdfsWalkOptions options,
@@ -1117,7 +1163,17 @@ unique_ptr<HdfsListStream> HdfsFileSystem::OpenGlobStream(const string &url, Hdf
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(url, authority, hdfs_path);
-	return make_uniq<HdfsListStream>(GetConnection(url, authority, opener), url, true, options);
+	// Parse the pattern once, before connecting: an invalid one (including a "." or ".." component that only
+	// appears after brace expansion or unescaping) is refused without a NameNode, and without waiting on an
+	// unreachable one. The walk, and a retried walk, use this plan.
+	shared_ptr<const HdfsGlobPlan> plan;
+	try {
+		plan = make_shared_ptr<HdfsGlobPlan>(HdfsGlobPlan::Parse(hdfs_path, options.include_hidden));
+	} catch (const InvalidInputException &error) {
+		throw InvalidInputException("Failed to glob HDFS pattern '%s': %s", HdfsGlobPlan::Excerpt(url),
+		                            ErrorData(error).RawMessage());
+	}
+	return make_uniq<HdfsListStream>(GetConnection(url, authority, opener), url, std::move(plan), options);
 }
 
 bool HdfsFileSystem::CanHandleFile(const string &fpath) {

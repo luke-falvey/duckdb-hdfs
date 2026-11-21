@@ -34,14 +34,33 @@ cd "${REPO_ROOT}"
 # standard Hadoop env vars the extension reads, as the Hadoop CLI does.
 # Every test file run here is recorded, so one that needs the cluster but is
 # never run fails the script (see the end) instead of being skipped silently.
+# A file skipped by an unmet `require` (an extension, or an env var such as
+# HDFS_TEST_NO_KMS) exits 0 too, so a reported skip fails the script as well.
+# unittest's skip summary; the self-check below fails the script if it no longer matches what unittest prints.
+SKIP_MARKER="Skipped tests for the following reasons"
 RAN_TESTS=""
 run_cluster_test() { # test file, HADOOP_USER_NAME, [extra env assignments...]
-    local test_file="$1" user="$2"
+    local test_file="$1" user="$2" output status=0
     shift 2
+    output="$(mktemp)"
     env HDFS_TEST_RUNNING=1 HADOOP_CONF_DIR="${HADOOP_CONF_DIR_FOR_TESTS:-${REPO_ROOT}/test/hdfs-conf}" \
-        HADOOP_USER_NAME="${user}" "$@" "${UNITTEST}" "${test_file}"
+        HADOOP_USER_NAME="${user}" "$@" "${UNITTEST}" "${test_file}" 2>&1 | tee "${output}" || status=$?
+    if [ "${status}" -eq 0 ] && grep -q "${SKIP_MARKER}" "${output}"; then
+        echo "ERROR: ${test_file} was skipped (in whole or in part); see the reasons above" >&2
+        status=1
+    fi
+    rm -f "${output}"
+    if [ "${status}" -ne 0 ]; then
+        exit "${status}"
+    fi
     RAN_TESTS="${RAN_TESTS} ${test_file}"
 }
+# The skip check must be able to fail: a file whose require-env isn't set has to produce the marker.
+skip_check="$(env -u HDFS_KERBEROS_NO_TICKET "${UNITTEST}" test/sql/hdfs_kerberos_no_ticket.test 2>&1 || true)"
+if ! grep -q "${SKIP_MARKER}" <<< "${skip_check}"; then
+    echo "ERROR: unittest no longer reports a skipped test as '${SKIP_MARKER}'; update the skip check" >&2
+    exit 1
+fi
 run_cluster_test test/sql/hdfs.test hadoop
 run_cluster_test test/sql/hdfs_glob.test hadoop
 run_cluster_test test/sql/hdfs_edge.test hadoop
@@ -56,32 +75,59 @@ run_cluster_test test/sql/hdfs_permissions.test guest
 echo "==> Checking a same-size replacement with the same mtime isn't served from the external file cache..."
 # hdfs dfs -cp replaces the file (a new inode) with one of the same length, and
 # -touch sets the old mtime back (whole seconds, so the original is set to one
-# first). Only the file id tells the two versions apart. Both reads run in one
+# first; in UTC, so the expected time below doesn't depend on the container's
+# zone). Only the file id tells the two versions apart. Both reads run in one
 # process, so the second one could hit the first one's cache entries.
+# The script checks its own preconditions: the cache holds the first read,
+# and both versions have the same size and mtime. A control read with
+# validation off must then see the stale cached value, which shows the "2"
+# comes from the version tag and not from a read the cache never served.
 # .shell passes arguments with spaces unquoted, so it runs small scripts.
 VERSION_TAG_DIR="$(mktemp -d)"
 cat > "${VERSION_TAG_DIR}/touch.sh" <<'SH'
-docker exec duckdb-hdfs-test bash -lc 'hdfs dfs -touch -m -t 20200101:000000 /test/version_tag.parquet' >/dev/null 2>&1
+docker exec -e HADOOP_CLIENT_OPTS=-Duser.timezone=UTC duckdb-hdfs-test bash -lc \
+    'hdfs dfs -touch -m -t 20200101:000000 /test/version_tag.parquet' >/dev/null 2>&1 || echo "touch failed"
 SH
 cat > "${VERSION_TAG_DIR}/replace.sh" <<'SH'
-docker exec duckdb-hdfs-test bash -lc 'hdfs dfs -cp -f /test/version_tag_2.parquet /test/version_tag.parquet &&
-    hdfs dfs -touch -m -t 20200101:000000 /test/version_tag.parquet' >/dev/null 2>&1
+# $1: the version to copy over /test/version_tag.parquet.
+docker exec -e HADOOP_CLIENT_OPTS=-Duser.timezone=UTC duckdb-hdfs-test bash -lc \
+    "hdfs dfs -cp -f /test/$1 /test/version_tag.parquet &&
+    hdfs dfs -touch -m -t 20200101:000000 /test/version_tag.parquet" >/dev/null 2>&1 || echo "replace failed"
 SH
 version_tag_out="$(HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" HADOOP_USER_NAME=hadoop \
-    "${REPO_ROOT}/build/release/duckdb" -no-agent -csv -noheader <<SQL
+    "${REPO_ROOT}/build/release/duckdb" -no-agent -bail -csv -noheader <<SQL
 COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/version_tag.parquet' (FORMAT parquet);
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/version_tag_1.parquet' (FORMAT parquet);
 COPY (SELECT 2 AS v) TO 'hdfs://localhost:9000/test/version_tag_2.parquet' (FORMAT parquet);
+SELECT 'sizes', count(DISTINCT size) FROM hdfs_ls('hdfs://localhost:9000/test/version_tag*.parquet');
 .shell bash ${VERSION_TAG_DIR}/touch.sh
+SELECT 'mtime', last_modified = TIMESTAMPTZ '2020-01-01 00:00:00+00' FROM hdfs_stat('hdfs://localhost:9000/test/version_tag.parquet');
 SET enable_external_file_cache = true;
 SET cache_local_files = true;
-SELECT v FROM read_parquet('hdfs://localhost:9000/test/version_tag.parquet');
-.shell bash ${VERSION_TAG_DIR}/replace.sh
-SELECT v FROM read_parquet('hdfs://localhost:9000/test/version_tag.parquet');
+SELECT 'read', v FROM read_parquet('hdfs://localhost:9000/test/version_tag.parquet');
+SELECT 'cached', count(*) > 0 FROM duckdb_external_file_cache() WHERE path LIKE '%/test/version_tag.parquet';
+.shell bash ${VERSION_TAG_DIR}/replace.sh version_tag_2.parquet
+SELECT 'mtime', last_modified = TIMESTAMPTZ '2020-01-01 00:00:00+00' FROM hdfs_stat('hdfs://localhost:9000/test/version_tag.parquet');
+SELECT 'read', v FROM read_parquet('hdfs://localhost:9000/test/version_tag.parquet');
+SET validate_external_file_cache = 'NO_VALIDATION';
+.shell bash ${VERSION_TAG_DIR}/replace.sh version_tag_1.parquet
+SELECT 'control', v FROM read_parquet('hdfs://localhost:9000/test/version_tag.parquet');
 SQL
 )"
 rm -rf "${VERSION_TAG_DIR}"
-if [ "$(echo "${version_tag_out}" | tr -d '\r' | tail -n 2 | tr '\n' ' ')" != "1 2 " ]; then
-    echo "ERROR: expected the replaced file's value (1, then 2); got: ${version_tag_out}" >&2
+version_tag_expected="sizes,1
+mtime,true
+read,1
+cached,true
+mtime,true
+read,2
+control,2"
+if [ "$(echo "${version_tag_out}" | tr -d '\r')" != "${version_tag_expected}" ]; then
+    echo "ERROR: unexpected output of the version-tag check (the stale-cache control reads 2, validation off)." >&2
+    echo "expected:" >&2
+    echo "${version_tag_expected}" >&2
+    echo "got:" >&2
+    echo "${version_tag_out}" >&2
     exit 1
 fi
 echo "OK"

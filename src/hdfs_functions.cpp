@@ -302,9 +302,17 @@ void HdfsMetaExecute(ClientContext &context, TableFunctionInput &data_p, DataChu
 			auto &bind_data = data_p.bind_data->Cast<HdfsMetaBindData>();
 			auto &hdfs = bind_data.hdfs.get();
 			auto opener = ClientData::Get(context).file_opener.get();
-			if (hdfs.Exists(bind_data.path, opener)) {
+			// One stat: a file is its own row; only a directory needs listing (a second call, so a directory deleted
+			// in between fails the listing rather than giving no rows).
+			HdfsEntry entry;
+			if (!hdfs.TryStat(bind_data.path, entry, opener)) {
+				state.stream.reset();
+			} else if (entry.is_dir) {
 				state.stream = hdfs.OpenListStream(bind_data.path, state.options, opener);
 				NextBatch(context, *state.stream, rows);
+			} else {
+				state.stream.reset();
+				rows.push_back(std::move(entry));
 			}
 		}
 	} else {

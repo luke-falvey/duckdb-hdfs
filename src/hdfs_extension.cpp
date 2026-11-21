@@ -60,8 +60,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db.GetLogManager().RegisterLogType(make_uniq<HdfsLogType>());
 	config.AddExtensionOption("hdfs_list_parallelism",
 	                          "Maximum number of concurrent HDFS directory-listing RPCs (threads) used by each listing "
-	                          "or glob that walks more than one directory (e.g. hdfs_ls('/path/**')), from 1 (no "
-	                          "parallelism) to 64",
+	                          "or glob that walks more than one directory (e.g. hdfs_ls('hdfs:///path/**')), from 1 "
+	                          "(no parallelism) to 64",
 	                          LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_HDFS_LIST_PARALLELISM),
 	                          SetHdfsListParallelism);
 	config.AddExtensionOption("hdfs_skip_permission_errors",

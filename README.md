@@ -50,9 +50,12 @@ with `SET cache_local_files = true` (see [Performance](#performance)).
 
 ## Platforms
 
-Linux and macOS. CI builds the extension for DuckDB's Linux and macOS
-platforms (`.github/workflows/MainDistributionPipeline.yml`). The cluster and
-Kerberos tests run on Linux amd64 only (`.github/workflows/Integration.yml`).
+Linux and macOS. CI (`.github/workflows/MainDistributionPipeline.yml`) builds
+linux_amd64, linux_arm64 and osx_arm64, and runs the no-cluster SQL tests on
+linux_amd64 and osx_arm64 (linux_arm64 is built but not tested). osx_amd64
+and the musl builds are opt-in in extension-ci-tools and aren't built. The
+cluster and Kerberos tests run on Linux amd64 only
+(`.github/workflows/Integration.yml`).
 Windows and WebAssembly aren't supported: libhdfs3 needs POSIX sockets, and its
 vcpkg port excludes Windows.
 
@@ -137,7 +140,7 @@ guaranteed — add `ORDER BY path` if it matters.
 | `size` | `BIGINT` | Length in bytes (0 for directories) |
 | `owner`, `group` | `VARCHAR` | |
 | `permissions` | `VARCHAR` | `rwxr-xr-x`, as `hdfs dfs -ls` shows it (the sticky bit as `t`/`T`: `rwxrwxrwt`) |
-| `mode` | `USMALLINT` | The permission bits as a number, sticky bit included (`rwxr-xr-x` = 493, `rwxrwxrwt` = 1023) |
+| `mode` | `USMALLINT` | The permission bits as a number, sticky bit included (`rwxr-xr-x` = 493, `rwxrwxrwt` = 1023); HDFS's ACL, encryption and erasure-coding flag bits are left out |
 | `replication` | `INTEGER` | `NULL` for directories |
 | `block_size` | `BIGINT` | `NULL` for directories |
 | `last_modified` | `TIMESTAMP WITH TIME ZONE` | Modification time (an instant, as `read_blob`'s `last_modified`) |
@@ -198,8 +201,9 @@ Behavior notes:
   wrote it disconnects (`CALL hdfs_reset_connections()`, or the process
   exiting) and its lease expires, when HDFS recovers it with what was written.
   A writer that is dropped without an error commits, as for local files; if
-  that commit fails, the file is removed and the error goes to DuckDB's log
-  (`duckdb_logs`), since the caller didn't ask for it.
+  that commit fails, the file is aborted as above and the error can only be
+  logged (`duckdb_logs`, when logging is enabled), since the caller didn't ask
+  for it. Core does this for `EXPORT DATABASE`'s `schema.sql` and `load.sql`.
 - **Existing files.** DuckDB asks for an exclusive create when it expects a new
   file; the NameNode then refuses to replace a file that appeared meanwhile.
   Otherwise an existing file is replaced.
@@ -217,9 +221,10 @@ Behavior notes:
 - **Connection failures.** Reads are retried once on a new connection. Creates,
   deletes and renames are not simply sent again (the first attempt may have
   taken effect): after reconnecting, the extension checks whether it did (a
-  deleted path is gone; a renamed source is gone and the target has its
-  length). Where it can't tell, as for a create whose file now exists, the
-  error says the outcome is unknown.
+  deleted path is gone; a renamed source is gone and the target is the same
+  file, by its file id, or by its length without one). Where it can't tell,
+  as for a create whose file now exists, the error says the outcome is
+  unknown.
 
 ## URLs
 
@@ -227,10 +232,14 @@ Paths are `hdfs://host:port/path`; `host:port` selects the NameNode. The
 scheme-only form `hdfs:///path` uses `fs.defaultFS` from your Hadoop config.
 `hdfs_ls`, `hdfs_stat` and `hdfs_exists` take these URLs only (a bare `/path`
 is an error, not a path on the default FS). Paths with a `.` or `..`
-component are refused, as HDFS forbids them.
+component are refused, as HDFS forbids them. In a glob pattern this applies
+after brace expansion and escapes too: `{..}` and `\.\.` are refused (so a
+file literally named `{..}` is reached as `\{..\}`).
 
 Glob patterns may have at most 128 brace groups and 64 KiB, and expand to at
-most 10,000 patterns.
+most 10,000 patterns; expanding one may build at most 16 MiB of patterns,
+counting the intermediate ones. An invalid pattern is refused before
+connecting.
 
 ## Configuration
 
@@ -301,7 +310,19 @@ CREATE SECRET prod (
 
 Both parameters are optional; what a secret leaves out comes from the
 environment. On a Kerberos cluster the identity is always the ticket cache's
-principal, so `USER` is an error there.
+principal, so `USER` is an error there. A directory without `core-site.xml`
+or `hdfs-site.xml` is an error.
+
+The client reads `CONFIG_DIR` itself, outside DuckDB's file system. So with
+`enable_external_access = false` the directory must be an absolute path (not
+`~/...` or `file://...`, since the client reads the path as given) in
+`allowed_directories` or `allowed_paths`, as for any local read. An
+`allowed_paths` entry for the directory lets the client read the files in it,
+though DuckDB's own reads would need each file listed. `HADOOP_CONF_DIR` and
+`HADOOP_HOME` are the operator's environment and are not checked. A
+`CONFIG_DIR` is trusted configuration: it names NameNodes, the KMS and the
+ticket cache, so allow only directories whose files you trust (a query that
+can write to an allowed directory can also write a `core-site.xml` there).
 
 - **Scopes match whole path components**: a secret scoped to
   `hdfs://nn:8020/data` covers `hdfs://nn:8020/data` and everything below it,
@@ -387,6 +408,13 @@ Tuning:
   …) as remote, and `hdfs://` isn't on it, so HDFS files are cached only with
   `SET cache_local_files = true` (which caches local files too), and
   `validate_external_file_cache = 'VALIDATE_REMOTE'` doesn't validate them.
+  With `SET parquet_metadata_cache = true`, listings carry the same version
+  as an etag, so a repeated `count(*)` over a glob is answered from the
+  cached footers without opening any file after the first (the one the
+  query's bind reads). A single file is opened either way; its cached footer
+  is checked through the open handle's tag. Without a file id (an old
+  NameNode) there is no version tag, and both caches fall back to the
+  modification time.
 - **Short-circuit local reads**: when DuckDB runs on DataNode hosts, set
   `dfs.client.read.shortcircuit=true` and `dfs.domain.socket.path` in
   `hdfs-site.xml` (as for Hadoop clients) to read local block replicas

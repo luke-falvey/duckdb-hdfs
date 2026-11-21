@@ -55,11 +55,20 @@ public:
 	//! The longest pattern accepted, in bytes (the NameNode's own path limit is 8000 characters; brace alternatives
 	//! make a pattern longer than any path it expands to).
 	static constexpr idx_t MAX_PATTERN_LENGTH = 65536;
+	//! The most bytes brace expansion may build, counting every intermediate pattern: the length and group caps
+	//! alone allow a 64 KiB pattern with 13 groups (8,192 copies of 64 KiB, about 0.5 GB outside DuckDB's memory
+	//! limit).
+	static constexpr idx_t MAX_EXPANSION_BYTES = 16ULL * 1024 * 1024;
 
 	//! Throws InvalidInputException for an invalid pattern (unclosed brace group, more than one `**`, more than
-	//! MAX_EXPANDED_PATTERNS expanded patterns, more than MAX_BRACE_GROUPS groups, longer than MAX_PATTERN_LENGTH).
+	//! MAX_EXPANDED_PATTERNS expanded patterns, more than MAX_BRACE_GROUPS groups, longer than MAX_PATTERN_LENGTH,
+	//! more than MAX_EXPANSION_BYTES expanded, or a literal `.` or `..` component after expansion and unescaping).
 	static HdfsGlobPlan Parse(const string &pattern, bool include_hidden);
 
+	//! The pattern this plan was parsed from.
+	const string &Pattern() const {
+		return pattern;
+	}
 	//! The literal directory the walk starts from (for an all-literal pattern: the path itself).
 	const string &Root() const {
 		return root;
@@ -75,11 +84,14 @@ public:
 	//! Match a child (of a directory holding `states`) by name.
 	Step Match(const vector<State> &states, const string &name, bool is_dir) const;
 
+	//! At most the first 200 bytes of `pattern` (with "..." if cut, at a UTF-8 character boundary), for error
+	//! messages: a pattern may be 64 KiB.
+	static string Excerpt(const string &pattern);
 	//! Hadoop's hidden-name convention: a leading `.` or `_`.
 	static bool IsHidden(const string &name);
 	//! Expand `{a,b}` groups into brace-free patterns. Braces inside a character class (`[{]`) or escaped (`\{`) are
 	//! literal. Throws InvalidInputException for an unclosed group, more than MAX_EXPANDED_PATTERNS results, more than
-	//! MAX_BRACE_GROUPS groups or a pattern longer than MAX_PATTERN_LENGTH.
+	//! MAX_BRACE_GROUPS groups, a pattern longer than MAX_PATTERN_LENGTH or more than MAX_EXPANSION_BYTES built.
 	static vector<string> ExpandBraces(const string &pattern);
 
 private:
@@ -97,13 +109,14 @@ private:
 	using StateSet = unordered_set<State, StateHash>;
 
 	void MatchAt(State state, const string &name, bool is_dir, Step &step, StateSet &seen) const;
-	static void ExpandBraces(const string &pattern, const string &original, vector<string> &result);
+	static void ExpandBraces(const string &pattern, const string &original, vector<string> &result, idx_t &budget);
 
 	vector<vector<Component>> patterns;
 	string root;
 	vector<State> initial;
 	bool emit_root = false;
 	bool include_hidden = false;
+	string pattern;
 };
 
 } // namespace duckdb
