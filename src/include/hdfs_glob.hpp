@@ -49,9 +49,15 @@ public:
 	//! The most patterns brace expansion may produce: each group multiplies the count, so a few dozen groups would
 	//! otherwise exhaust memory.
 	static constexpr idx_t MAX_EXPANDED_PATTERNS = 10000;
+	//! The most brace groups (`{` that open a group, nested or not) a pattern may have: expansion recurses once per
+	//! group, and a group with one alternative never counts towards MAX_EXPANDED_PATTERNS.
+	static constexpr idx_t MAX_BRACE_GROUPS = 128;
+	//! The longest pattern accepted, in bytes (the NameNode's own path limit is 8000 characters; brace alternatives
+	//! make a pattern longer than any path it expands to).
+	static constexpr idx_t MAX_PATTERN_LENGTH = 65536;
 
 	//! Throws InvalidInputException for an invalid pattern (unclosed brace group, more than one `**`, more than
-	//! MAX_EXPANDED_PATTERNS expanded patterns).
+	//! MAX_EXPANDED_PATTERNS expanded patterns, more than MAX_BRACE_GROUPS groups, longer than MAX_PATTERN_LENGTH).
 	static HdfsGlobPlan Parse(const string &pattern, bool include_hidden);
 
 	//! The literal directory the walk starts from (for an all-literal pattern: the path itself).
@@ -72,7 +78,8 @@ public:
 	//! Hadoop's hidden-name convention: a leading `.` or `_`.
 	static bool IsHidden(const string &name);
 	//! Expand `{a,b}` groups into brace-free patterns. Braces inside a character class (`[{]`) or escaped (`\{`) are
-	//! literal. Throws InvalidInputException for an unclosed group or more than MAX_EXPANDED_PATTERNS results.
+	//! literal. Throws InvalidInputException for an unclosed group, more than MAX_EXPANDED_PATTERNS results, more than
+	//! MAX_BRACE_GROUPS groups or a pattern longer than MAX_PATTERN_LENGTH.
 	static vector<string> ExpandBraces(const string &pattern);
 
 private:

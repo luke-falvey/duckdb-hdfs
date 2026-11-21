@@ -63,6 +63,9 @@ public:
 	timestamp_t mtime;
 	//! A write (or closing the writer) failed: the file is incomplete, and only Abort() is left.
 	bool failed = false;
+	//! Where the NameNode RPCs made on this handle are logged (HDFS log type): the logger of the query that opened
+	//! it, whichever thread later closes or aborts it.
+	weak_ptr<Logger> rpc_logger;
 
 public:
 	//! Complete the file (writers). If that fails, the file is aborted (removed) and the error thrown.
@@ -130,6 +133,12 @@ public:
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override;
 	//! "<mtime>:<length>", so the external file cache validates without another RPC.
 	string GetVersionTag(FileHandle &handle) override;
+	//! Open handles are always files.
+	FileType GetFileType(FileHandle &handle) override;
+	//! Answered from the listing's status when `file` comes from a glob (no NameNode call), else by one stat; the
+	//! default would open the file (block locations, and a KMS call in an encryption zone) for metadata-only reads
+	//! such as `SELECT size FROM read_blob(...)`.
+	optional<FileMetadata> GetStatsIfExists(const OpenFileInfo &file, optional_ptr<FileOpener> opener) override;
 
 	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
@@ -170,12 +179,16 @@ public:
 	HdfsEntry Stat(const string &url, optional_ptr<FileOpener> opener);
 	//! Whether `url` exists (file or directory).
 	bool Exists(const string &url, optional_ptr<FileOpener> opener);
+	//! Stat(), or false if `url` doesn't exist (one NameNode call either way).
+	bool TryStat(const string &url, HdfsEntry &result, optional_ptr<FileOpener> opener);
 	//! Drop every cached connection (hdfs_reset_connections()), so the next access reconnects with the current
 	//! secrets and Hadoop configuration. Open files and running listings keep their client. Returns the number
 	//! dropped.
 	idx_t ResetConnections();
 
 	bool CanHandleFile(const string &fpath) override;
+	//! Whether `path` is an hdfs:// URL (the paths this file system handles).
+	static bool IsHdfsUrl(const string &path);
 	string GetName() const override {
 		return "HdfsFileSystem";
 	}

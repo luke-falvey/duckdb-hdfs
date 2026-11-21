@@ -893,6 +893,10 @@ public:
 		return mtime;
 	}
 
+	int64_t FileId() const override {
+		return file_id;
+	}
+
 	// Replace the version a reader was opened with (before it is shared): the file changed after `version` was
 	// taken, so a fresh stat names it.
 	void SetVersion(const HdfsFileStatus &version) {
@@ -1063,7 +1067,8 @@ public:
 			auto failure = Describe(std::current_exception());
 			// The NameNode is unreachable, or refused: releasing the stream now would try to complete the file
 			// (and block on the same NameNode). Leave the stream unclosed instead: the file stays under construction,
-			// not complete, and its lease lapses once this client disconnects.
+			// not complete, and its lease lapses once this client disconnects. Connections are cached, so that can be
+			// as late as hdfs_reset_connections() or the process exiting (docs/REVIEW_QUORUM_ROUND2.md, open item).
 			(void)out.release(); // NOLINT: deliberately leaked, see above
 			throw HdfsError(failure.type, "delete incomplete file '" + path + "' failed: " + failure.message);
 		}
@@ -1282,6 +1287,10 @@ void SetLogSeverity(const Hdfs::Config &conf) {
 
 void HdfsClient::SetThreadLogger(const shared_ptr<Logger> &logger) {
 	ThreadLogger() = logger;
+}
+
+shared_ptr<Logger> HdfsClient::GetThreadLogger() {
+	return ThreadLogger().lock();
 }
 
 shared_ptr<HdfsClient> HdfsClient::Connect(const string &authority, const HdfsConnectionConfig &config) {

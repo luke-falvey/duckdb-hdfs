@@ -44,8 +44,23 @@ void EpochConversion() {
 
 } // namespace
 
+void Permissions() {
+	CHECK(HdfsPermissionString(0755) == "rwxr-xr-x");
+	CHECK(HdfsPermissionString(0640) == "rw-r-----");
+	CHECK(HdfsPermissionString(0) == "---------");
+	// The sticky bit, as Hadoop's FsPermission shows it.
+	CHECK(HdfsPermissionString(01777) == "rwxrwxrwt");
+	CHECK(HdfsPermissionString(01776) == "rwxrwxrwT");
+	CHECK(HdfsPermissionMode(01777) == 01777);
+	CHECK(HdfsPermissionMode(0755) == 0755);
+	// Bits HDFS doesn't define are not reported.
+	CHECK(HdfsPermissionMode(07777) == 01777);
+	CHECK(HdfsPermissionString(0xF3ED) == "rwxr-xr-t");
+}
+
 int main() {
 	EpochConversion();
+	Permissions();
 	if (failures) {
 		std::fprintf(stderr, "%d check(s) failed\n", failures);
 		return 1;

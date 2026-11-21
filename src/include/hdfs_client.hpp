@@ -86,6 +86,8 @@ public:
 	virtual int64_t Length() const = 0;
 	//! The modification time (epoch milliseconds) of the file version this reader reads.
 	virtual uint64_t ModificationTime() const = 0;
+	//! The NameNode inode id of that version (0 if unknown).
+	virtual int64_t FileId() const = 0;
 	//! Read exactly `nr_bytes` at `offset`; files in an encryption zone are decrypted.
 	virtual void Read(data_ptr_t buffer, idx_t nr_bytes, idx_t offset) = 0;
 };
@@ -104,9 +106,10 @@ public:
 	//! Flush and complete the file; the data is durable once this returns. If it throws, the file may be
 	//! incomplete; Abort() still removes it.
 	virtual void Close() = 0;
-	//! Abandon the write without completing the file: delete it on the NameNode, then release the stream. The
-	//! file is never published under its name with partial contents. Never waits for the file to complete. Throws
-	//! if the delete fails (the incomplete file may then remain, until its lease expires).
+	//! Abandon the write without completing the file: delete it on the NameNode, then release the stream. Never
+	//! waits for the file to complete. Throws if the delete fails: the file then stays under construction while
+	//! this client keeps renewing its lease, and once the client disconnects and the lease expires, HDFS recovers
+	//! it under its name with what was written.
 	virtual void Abort() = 0;
 };
 
@@ -130,8 +133,11 @@ public:
 	static shared_ptr<HdfsClient> Connect(const string &authority, const HdfsConnectionConfig &config);
 	//! Log the NameNode RPCs this thread makes from now on (HdfsLogType, one entry per call) to `logger`, or stop
 	//! logging them (nullptr). Only a weak reference is kept: once the logger is gone (its query has ended), nothing
-	//! is logged. Walks log to the logger that was current when they started, from all their threads.
+	//! is logged. Walks log to the logger that was current when they started, from all their threads. Calls on an
+	//! open file use HdfsRpcLoggerScope with the logger of the query that opened it.
 	static void SetThreadLogger(const shared_ptr<Logger> &logger);
+	//! This thread's current RPC logger (null if none, or if it is gone).
+	static shared_ptr<Logger> GetThreadLogger();
 
 	virtual HdfsFileStatus Stat(const string &path) = 0;
 	//! Open a file for reading. `expected` is the file's status from a listing (length, mtime and, if known, file
@@ -156,6 +162,24 @@ public:
 	//! The entries (files and directories) a glob pattern matches: `*`, `?`, `[...]`, `\` escapes, `{a,b}` and `**`.
 	//! Throws an INVALID_INPUT HdfsError for an invalid pattern.
 	virtual unique_ptr<HdfsWalk> Glob(const string &pattern, const HdfsWalkOptions &options) = 0;
+};
+
+//! While alive, sends this thread's NameNode RPCs to `logger` (HdfsClient::SetThreadLogger), then restores the
+//! previous logger. For calls on an open file (abort, close, stat), which can run on any thread, after the thread
+//! last served another query or connection.
+class HdfsRpcLoggerScope {
+public:
+	explicit HdfsRpcLoggerScope(const shared_ptr<Logger> &logger) : previous(HdfsClient::GetThreadLogger()) {
+		HdfsClient::SetThreadLogger(logger);
+	}
+	~HdfsRpcLoggerScope() {
+		HdfsClient::SetThreadLogger(previous);
+	}
+	HdfsRpcLoggerScope(const HdfsRpcLoggerScope &) = delete;
+	HdfsRpcLoggerScope &operator=(const HdfsRpcLoggerScope &) = delete;
+
+private:
+	shared_ptr<Logger> previous;
 };
 
 } // namespace duckdb

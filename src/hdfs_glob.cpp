@@ -23,6 +23,10 @@ bool ExplicitHiddenPrefix(const string &pattern) {
 //! Mirrors the bracket parsing of DuckDB's Glob(): an optional `!`, a `]` right after that is literal, `a-z`
 //! ranges, and no escapes inside the class. A `[` without a closing `]` is not a class.
 idx_t ClassEnd(const string &pattern, idx_t open) {
+	// Without any ']' after it, no '[' starts a class; checked first, so a run of unclosed '[' stays cheap.
+	if (pattern.find(']', open + 1) == string::npos) {
+		return string::npos;
+	}
 	auto pos = open + 1;
 	if (pos < pattern.size() && pattern[pos] == '!') {
 		pos++;
@@ -90,6 +94,19 @@ bool IsHdfsGlob(const string &path) {
 }
 
 vector<string> HdfsGlobPlan::ExpandBraces(const string &pattern) {
+	// Bound the work before expanding: the result cap alone doesn't, since a group with one alternative ("{a}")
+	// never multiplies the count, yet each group is one recursion level that copies the pattern.
+	if (pattern.size() > MAX_PATTERN_LENGTH) {
+		throw InvalidInputException("Glob pattern is too long (%llu bytes; at most %llu)", pattern.size(),
+		                            MAX_PATTERN_LENGTH);
+	}
+	idx_t groups = 0;
+	for (idx_t char_idx = 0; char_idx < pattern.size();) {
+		if (pattern[char_idx] == '{' && ++groups > MAX_BRACE_GROUPS) {
+			throw InvalidInputException("Glob pattern has more than %llu brace groups", MAX_BRACE_GROUPS);
+		}
+		char_idx += VerbatimLength(pattern, char_idx);
+	}
 	vector<string> result;
 	ExpandBraces(pattern, pattern, result);
 	return result;
@@ -151,7 +168,8 @@ void HdfsGlobPlan::ExpandBraces(const string &pattern, const string &original, v
 	auto prefix = pattern.substr(0, start);
 	auto suffix = pattern.substr(close + 1);
 	for (auto &alternative : alternatives) {
-		// Each level removes one brace pair, so the recursion terminates; the count check above bounds the work.
+		// Each level removes one brace pair, so the recursion is at most MAX_BRACE_GROUPS deep; the count check above
+		// bounds the number of leaves.
 		ExpandBraces(prefix + alternative + suffix, original, result);
 	}
 }

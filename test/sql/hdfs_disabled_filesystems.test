@@ -31,9 +31,9 @@ SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
 ----
 Permission Error: File system HdfsFileSystem has been disabled by configuration
 
-# A scheme-less path (on the default FS) is refused too.
+# The default FS (hdfs:///) is refused too.
 statement error
-SELECT * FROM hdfs_stat('/data');
+SELECT * FROM hdfs_stat('hdfs:///data');
 ----
 Permission Error: File system HdfsFileSystem has been disabled by configuration
 

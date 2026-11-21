@@ -283,3 +283,15 @@ statement error
 FROM globbed('/m/{jan,feb/*.csv');
 ----
 <REGEX>:Invalid Input Error: .*Unclosed brace group.*
+
+# Brace groups with a single alternative never multiply the pattern count, but each one is a recursion level:
+# the group count is capped, so such a pattern fails the query instead of the process.
+statement error
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/' || repeat('{a}', 100000));
+----
+<REGEX>:Invalid Input Error: .*Glob pattern is too long.*
+
+statement error
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/' || repeat('{a}', 1000) || '.csv');
+----
+<REGEX>:Invalid Input Error: .*more than 128 brace groups.*

@@ -217,6 +217,12 @@ SELECT * FROM hdfs_ls('hdfs://localhost:9000/test/**/a/**');
 ----
 multiple '**'
 
+# The sticky bit shows as 't', as in `hdfs dfs -ls`, and is part of mode (01777 = 1023).
+query TI
+SELECT permissions, mode FROM hdfs_stat('hdfs://localhost:9000/sticky');
+----
+rwxrwxrwt	1023
+
 # hdfs_stat returns exactly one row for a single path, file or directory.
 query TT
 SELECT name, type FROM hdfs_stat('hdfs://localhost:9000/test/nested');
@@ -893,3 +899,66 @@ SELECT count(DISTINCT md5(content)) FROM read_blob(['hdfs://localhost:9000/test/
 
 statement ok
 RESET threads;
+
+# --- URLs keep the caller's authority ----------------------------------------------
+
+# Spellings of a host that differ only in case share one connection; listings and globs still return URLs in the
+# spelling of the call, whichever spelling connected first (as hdfs_stat does). Secret scopes and allowed paths
+# are matched against these URLs as given.
+query I
+SELECT count(*) > 0 FROM hdfs_ls('hdfs://localhost:9000/test');
+----
+true
+
+query II
+SELECT count(*) > 0, bool_and(starts_with(path, 'hdfs://LOCALHOST:9000/test/')) FROM hdfs_ls('hdfs://LOCALHOST:9000/test');
+----
+true	true
+
+query I
+SELECT bool_and(starts_with(path, 'hdfs://LOCALHOST:9000/test/')) FROM hdfs_ls('hdfs://LOCALHOST:9000/test/*.csv');
+----
+true
+
+query I
+SELECT bool_and(starts_with(filename, 'hdfs://LOCALHOST:9000/test/')) FROM read_csv('hdfs://LOCALHOST:9000/test/seq*.csv', filename = true);
+----
+true
+
+# --- EXPORT / IMPORT DATABASE --------------------------------------------------------
+
+# EXPORT DATABASE writes schema.sql and load.sql through handles it drops without Close(): the destructor commits
+# them. A round trip through HDFS proves both files arrive whole. (Kept last: it switches the default database.)
+statement ok
+ATTACH ':memory:' AS export_src;
+
+statement ok
+USE export_src;
+
+statement ok
+CREATE TABLE t AS SELECT range AS id, 'v' || range AS s FROM range(1000);
+
+statement ok
+CREATE VIEW v AS SELECT id FROM t WHERE id % 2 = 0;
+
+statement ok
+EXPORT DATABASE 'hdfs://localhost:9000/test/export_db' (FORMAT parquet);
+
+statement ok
+ATTACH ':memory:' AS export_dst;
+
+statement ok
+USE export_dst;
+
+statement ok
+IMPORT DATABASE 'hdfs://localhost:9000/test/export_db';
+
+query III
+SELECT count(*), sum(id), max(s) FROM t;
+----
+1000	499500	v999
+
+query I
+SELECT count(*) FROM v;
+----
+500

@@ -136,8 +136,8 @@ guaranteed — add `ORDER BY path` if it matters.
 | `type` | `VARCHAR` | `'file'` or `'directory'` |
 | `size` | `BIGINT` | Length in bytes (0 for directories) |
 | `owner`, `group` | `VARCHAR` | |
-| `permissions` | `VARCHAR` | `rwxr-xr-x`, as `hdfs dfs -ls` shows it |
-| `mode` | `USMALLINT` | The permission bits as a number (`rwxr-xr-x` = 493) |
+| `permissions` | `VARCHAR` | `rwxr-xr-x`, as `hdfs dfs -ls` shows it (the sticky bit as `t`/`T`: `rwxrwxrwt`) |
+| `mode` | `USMALLINT` | The permission bits as a number, sticky bit included (`rwxr-xr-x` = 493, `rwxrwxrwt` = 1023) |
 | `replication` | `INTEGER` | `NULL` for directories |
 | `block_size` | `BIGINT` | `NULL` for directories |
 | `last_modified` | `TIMESTAMP WITH TIME ZONE` | Modification time (an instant, as `read_blob`'s `last_modified`) |
@@ -194,15 +194,21 @@ Behavior notes:
   the writer closes it, so a write that fails (an error in the query, a failed
   write or close) is *aborted*: the file is deleted on the NameNode without
   being completed. If that delete fails too (the NameNode is unreachable), the
-  error says so; the file then stays under construction, and HDFS recovers it
-  (with what was written) once its lease expires. A writer that is dropped
-  without an error commits, as for local files.
+  error says so; the file then stays under construction until the client that
+  wrote it disconnects (`CALL hdfs_reset_connections()`, or the process
+  exiting) and its lease expires, when HDFS recovers it with what was written.
+  A writer that is dropped without an error commits, as for local files; if
+  that commit fails, the file is removed and the error goes to DuckDB's log
+  (`duckdb_logs`), since the caller didn't ask for it.
 - **Existing files.** DuckDB asks for an exclusive create when it expects a new
   file; the NameNode then refuses to replace a file that appeared meanwhile.
   Otherwise an existing file is replaced.
-- **Durability.** A file's data is durable once the write completes. DuckDB's
-  `FileSync` (used e.g. by its log storage) does an hsync: what was written so
-  far is on the DataNodes' disks, while the file stays open.
+- **Durability.** A completed file is replicated on the DataNodes, but, as for
+  any HDFS client, its last bytes may still be in their page cache unless the
+  cluster sets `dfs.datanode.synconclose`. DuckDB's `FileSync` does an hsync:
+  what was written so far is on the DataNodes' disks, while the file stays
+  open. Because appending isn't supported, DuckDB's file log storage can't
+  reopen an existing log file on HDFS (a new session fails to append to it).
 - **Directories.** A partitioned `COPY` creates its output directory and the
   partition directories one level at a time, so, as for local files, the
   output directory's parent must exist. Removing a directory that should be
@@ -219,6 +225,12 @@ Behavior notes:
 
 Paths are `hdfs://host:port/path`; `host:port` selects the NameNode. The
 scheme-only form `hdfs:///path` uses `fs.defaultFS` from your Hadoop config.
+`hdfs_ls`, `hdfs_stat` and `hdfs_exists` take these URLs only (a bare `/path`
+is an error, not a path on the default FS). Paths with a `.` or `..`
+component are refused, as HDFS forbids them.
+
+Glob patterns may have at most 128 brace groups and 64 KiB, and expand to at
+most 10,000 patterns.
 
 ## Configuration
 
@@ -237,8 +249,9 @@ SET hdfs_list_parallelism = 64;
 
 - `hdfs_list_parallelism` multiplies the load on the NameNode: raise it
   cautiously on shared clusters. Each listing or glob starts its own threads,
-  so the setting is capped at 64 (0 is an error; 1 lists one directory at a
-  time).
+  outside DuckDB's `threads` limit, so the setting is capped at 64 (0 is an
+  error; 1 lists one directory at a time), and concurrent queries each start
+  their own.
 - Hidden entries are names starting with `_` or `.`. `hdfs_ls` takes the
   per-call override `include_hidden := …`, and `skip_permission_errors := …`
   for `hdfs_skip_permission_errors`.
@@ -343,8 +356,8 @@ single-file read and of listings.
 
 ### Logging NameNode RPCs
 
-The `HDFS` log type records one entry per NameNode RPC the extension makes:
-the operation (`getFileInfo`, `getBlockLocations`, `listDirectory`,
+The `HDFS` log type records one entry per NameNode operation the extension
+starts (libhdfs3's own calls are not included; see below): the operation (`getFileInfo`, `getBlockLocations`, `listDirectory`,
 `getBatchedListing`, `create`, `mkdirs`, `delete`, `rename2`), the HDFS path,
 `duration_us` and whether it succeeded (`ok`).
 
@@ -369,10 +382,11 @@ FROM duckdb_logs_parsed('HDFS') GROUP BY op;
 Tuning:
 
 - **Repeated scans**: DuckDB's external file cache can keep file contents in
-  memory across queries, validated by modification time and size. DuckDB
-  only treats a fixed list of URL schemes (`s3://`, `https://`, …) as remote,
-  and `hdfs://` isn't on it, so HDFS files are cached only with
-  `SET cache_local_files = true` (which caches local files too).
+  memory across queries, validated by the file's id, modification time and
+  size. DuckDB only treats a fixed list of URL schemes (`s3://`, `https://`,
+  …) as remote, and `hdfs://` isn't on it, so HDFS files are cached only with
+  `SET cache_local_files = true` (which caches local files too), and
+  `validate_external_file_cache = 'VALIDATE_REMOTE'` doesn't validate them.
 - **Short-circuit local reads**: when DuckDB runs on DataNode hosts, set
   `dfs.client.read.shortcircuit=true` and `dfs.domain.socket.path` in
   `hdfs-site.xml` (as for Hadoop clients) to read local block replicas

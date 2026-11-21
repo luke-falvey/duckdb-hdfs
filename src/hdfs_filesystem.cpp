@@ -30,7 +30,7 @@ namespace {
 
 //! Split a URL into its authority ("hdfs://host:port", or "" for the default FS) and the scheme-less path ("/a/b").
 //! Inputs without the hdfs:// scheme are a path on the default FS.
-void ParseHdfsPath(const string &path, string &authority, string &hdfs_path) {
+void ParseHdfsUrl(const string &path, string &authority, string &hdfs_path) {
 	const string scheme = "hdfs://";
 	if (path.rfind(scheme, 0) != 0) {
 		authority = "";
@@ -50,6 +50,30 @@ void ParseHdfsPath(const string &path, string &authority, string &hdfs_path) {
 		authority = path.substr(0, slash_pos);
 		hdfs_path = path.substr(slash_pos);
 	}
+}
+
+//! Refuse a path with a "." or ".." component. HDFS forbids them in names, and DuckDB doesn't canonicalize remote
+//! paths before its allowed_directories check, so "hdfs://nn/allowed/../x" would otherwise pass that check.
+void CheckNoDotComponents(const string &url, const string &hdfs_path) {
+	idx_t start = 0;
+	while (start <= hdfs_path.size()) {
+		auto slash = hdfs_path.find('/', start);
+		if (slash == string::npos) {
+			slash = hdfs_path.size();
+		}
+		auto length = slash - start;
+		if ((length == 1 || length == 2) && hdfs_path.compare(start, length, string(length, '.')) == 0) {
+			throw InvalidInputException("HDFS path '%s' has a '%s' component; HDFS paths cannot contain '.' or '..'",
+			                            url, hdfs_path.substr(start, length));
+		}
+		start = slash + 1;
+	}
+}
+
+//! ParseHdfsUrl, refusing "." and ".." components.
+void ParseHdfsPath(const string &path, string &authority, string &hdfs_path) {
+	ParseHdfsUrl(path, authority, hdfs_path);
+	CheckNoDotComponents(path, hdfs_path);
 }
 
 //! Reattach an authority to a scheme-less path.
@@ -193,6 +217,7 @@ private:
 };
 
 HdfsFileHandle::~HdfsFileHandle() {
+	HdfsRpcLoggerScope log_scope(rpc_logger.lock());
 	// Some core writers drop a handle without calling Close() (EXPORT DATABASE's schema.sql / load.sql), as local
 	// files allow, so a writer destroyed normally still commits. One destroyed while an exception unwinds, or after a
 	// failed write, belongs to a failed write: it is aborted, and the file it created is removed. Neither path lets an
@@ -201,7 +226,21 @@ HdfsFileHandle::~HdfsFileHandle() {
 		try {
 			Close();
 			return;
-		} catch (...) { // NOLINT: Close() already aborted the write
+		} catch (std::exception &error) {
+			// Close() already aborted (removed) the file. The caller dropped the handle without Close(), so the error
+			// has nowhere to go but the log.
+			try {
+				if (logger) {
+					auto message =
+					    StringUtil::Format("Failed to complete HDFS file '%s' (handle dropped without Close; "
+					                       "the file was removed): %s",
+					                       path, ErrorData(error).RawMessage());
+					DUCKDB_LOG_ERROR(logger, message);
+				}
+			} catch (...) { // NOLINT: destructors must not throw
+			}
+			return;
+		} catch (...) { // NOLINT: destructors must not throw
 			return;
 		}
 	}
@@ -212,6 +251,7 @@ HdfsFileHandle::~HdfsFileHandle() {
 }
 
 void HdfsFileHandle::Close() {
+	HdfsRpcLoggerScope log_scope(rpc_logger.lock());
 	if (reader || writer) {
 		DUCKDB_LOG_FILE_SYSTEM_CLOSE((*this));
 	}
@@ -242,6 +282,7 @@ void HdfsFileHandle::Close() {
 }
 
 void HdfsFileHandle::Abort() {
+	HdfsRpcLoggerScope log_scope(rpc_logger.lock());
 	reader.reset();
 	if (!writer) {
 		return;
@@ -476,6 +517,7 @@ unique_ptr<FileHandle> HdfsFileSystem::OpenFileInternal(const string &path, File
 		handle->mtime = HdfsTimestampFromEpochMs(static_cast<int64_t>(handle->reader->ModificationTime()), path);
 		handle->has_mtime = true;
 	}
+	handle->rpc_logger = HdfsLoggerFor(opener);
 	if (opener) {
 		handle->TryAddLogger(*opener);
 	}
@@ -612,6 +654,7 @@ timestamp_t HdfsFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	ParseHdfsPath(handle.path, authority, hdfs_path);
 	HdfsFileStatus status;
 	try {
+		HdfsRpcLoggerScope log_scope(hdfs_handle.rpc_logger.lock());
 		status = hdfs_handle.client->Stat(hdfs_path);
 	} catch (const HdfsError &error) {
 		ThrowHdfsError(StringUtil::Format("Failed to stat HDFS file '%s'", handle.path), error);
@@ -622,13 +665,72 @@ timestamp_t HdfsFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	return hdfs_handle.mtime;
 }
 
+namespace {
+
+//! The version tag of a file: the same identity reader sharing uses (file id, mtime, length). A file replaced by
+//! one of the same length with its mtime kept (`hdfs dfs -cp -p`, `distcp -pt`) has a new inode id. With a tag,
+//! DuckDB's external file cache trusts it alone (no recently-modified margin), so it must tell those versions apart.
+string HdfsVersionTag(int64_t file_id, timestamp_t mtime, int64_t length) {
+	return std::to_string(file_id) + ":" + std::to_string(Timestamp::GetEpochMs(mtime)) + ":" + std::to_string(length);
+}
+
+} // namespace
+
 string HdfsFileSystem::GetVersionTag(FileHandle &handle) {
 	auto &hdfs_handle = handle.Cast<HdfsFileHandle>();
 	if (!hdfs_handle.reader) {
 		return string();
 	}
-	return std::to_string(Timestamp::GetEpochMs(GetLastModifiedTime(handle))) + ":" +
-	       std::to_string(hdfs_handle.length);
+	return HdfsVersionTag(hdfs_handle.reader->FileId(), GetLastModifiedTime(handle),
+	                      NumericCast<int64_t>(hdfs_handle.length));
+}
+
+FileType HdfsFileSystem::GetFileType(FileHandle &handle) {
+	return FileType::FILE_TYPE_REGULAR;
+}
+
+optional<FileMetadata> HdfsFileSystem::GetStatsIfExists(const OpenFileInfo &file, optional_ptr<FileOpener> opener) {
+	FileMetadata metadata;
+	idx_t file_size;
+	timestamp_t last_modified;
+	string type;
+	if (file.extended_info && file.extended_info->TryGetOption("file_size", file_size) &&
+	    file.extended_info->TryGetOption("last_modified", last_modified) &&
+	    (!file.extended_info->TryGetOption("type", type) || type == "file")) {
+		metadata.file_size = NumericCast<int64_t>(file_size);
+		metadata.last_modification_time = last_modified;
+		metadata.file_type = FileType::FILE_TYPE_REGULAR;
+		idx_t file_id;
+		if (file.extended_info->TryGetOption("hdfs_file_id", file_id)) {
+			metadata.file_id = file_id;
+			metadata.version_tag = HdfsVersionTag(NumericCast<int64_t>(file_id), last_modified, metadata.file_size);
+		}
+		return metadata;
+	}
+	HdfsEntry entry;
+	if (!TryStat(file.path, entry, opener)) {
+		return nullopt;
+	}
+	metadata.file_size = entry.size;
+	metadata.last_modification_time = entry.mtime;
+	metadata.file_type = entry.is_dir ? FileType::FILE_TYPE_DIR : FileType::FILE_TYPE_REGULAR;
+	if (entry.file_id > 0) {
+		metadata.file_id = NumericCast<idx_t>(entry.file_id);
+		metadata.version_tag = HdfsVersionTag(entry.file_id, entry.mtime, entry.size);
+	}
+	return metadata;
+}
+
+bool HdfsFileSystem::TryStat(const string &url, HdfsEntry &result, optional_ptr<FileOpener> opener) {
+	HdfsFileStatus status;
+	if (!TryStat(url, status, opener)) {
+		return false;
+	}
+	string authority;
+	string hdfs_path;
+	ParseHdfsPath(url, authority, hdfs_path);
+	result = MakeHdfsEntry(authority, status);
+	return true;
 }
 
 bool HdfsFileSystem::TryStat(const string &url, HdfsFileStatus &result, optional_ptr<FileOpener> opener) {
@@ -909,11 +1011,10 @@ protected:
 			}
 		}
 		// As in DuckDB's local glob: a pattern that matches nothing may be a file whose name contains glob characters.
-		if (expanded_files.empty() && IsHdfsGlob(pattern) && fs.Exists(pattern, opener)) {
-			auto entry = fs.Stat(pattern, opener);
-			if (!entry.is_dir) {
-				expanded_files.push_back(MakeOpenFileInfo(entry));
-			}
+		// One stat answers both "does it exist" and "what is it".
+		HdfsEntry entry;
+		if (expanded_files.empty() && IsHdfsGlob(pattern) && fs.TryStat(pattern, entry, opener) && !entry.is_dir) {
+			expanded_files.push_back(MakeOpenFileInfo(entry));
 		}
 		std::sort(expanded_files.begin(), expanded_files.end());
 		return !expanded_files.empty();
@@ -994,7 +1095,9 @@ bool HdfsListStream::Next(vector<HdfsEntry> &out, idx_t max_entries, optional_pt
 			continue;
 		}
 		for (auto &status : batch) {
-			out.push_back(MakeHdfsEntry(connection->authority, status));
+			// The caller's own spelling of the authority: a connection is shared by spellings that differ in the
+			// host's case, and the URLs are matched against secret scopes and allowed paths as given.
+			out.push_back(MakeHdfsEntry(authority, status));
 		}
 		emitted_any |= !out.empty();
 		return more;
@@ -1018,7 +1121,11 @@ unique_ptr<HdfsListStream> HdfsFileSystem::OpenGlobStream(const string &url, Hdf
 }
 
 bool HdfsFileSystem::CanHandleFile(const string &fpath) {
-	return StringUtil::StartsWith(fpath, "hdfs://");
+	return IsHdfsUrl(fpath);
+}
+
+bool HdfsFileSystem::IsHdfsUrl(const string &path) {
+	return StringUtil::StartsWith(path, "hdfs://");
 }
 
 namespace {

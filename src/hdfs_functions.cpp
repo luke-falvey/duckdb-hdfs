@@ -62,17 +62,21 @@ void DefineMetadataSchema(vector<LogicalType> &types, vector<Identifier> &names)
 	         "permissions", "mode", "replication", "block_size", "last_modified", "last_accessed"};
 }
 
-//! The 9 permission bits as "rwxr-xr-x", as `hdfs dfs -ls` shows them.
-string PermissionString(uint16_t mode) {
-	static const char *const RWX[] = {"---", "--x", "-w-", "-wx", "r--", "r-x", "rw-", "rwx"};
-	return string(RWX[(mode >> 6) & 0x7]) + RWX[(mode >> 3) & 0x7] + RWX[mode & 0x7];
+//! The functions take hdfs:// URLs only, as scans do (HdfsFileSystem::CanHandleFile). A scheme-less "/data" would
+//! name a path on fs.defaultFS while DuckDB's allowed_directories check judges it as a local path; "", "s3://..."
+//! and typos like "hdfs:/nn/x" would silently go to the default FS too.
+void RequireHdfsUrl(const char *function_name, const string &path) {
+	if (!HdfsFileSystem::IsHdfsUrl(path)) {
+		throw InvalidInputException("%s: '%s' is not an hdfs:// URL (use hdfs:///path for a path on fs.defaultFS)",
+		                            function_name, path);
+	}
 }
 
 //! The checks DuckDB's OpenerFileSystem makes before every file system call: the file system isn't in
 //! `disabled_filesystems`, and with `enable_external_access = false` the path is in `allowed_directories` /
 //! `allowed_paths`. The functions call HdfsFileSystem directly, so they must make them themselves.
 void VerifyCanAccess(ClientContext &context, HdfsFileSystem &hdfs, const string &path) {
-	// By name rather than by path: a scheme-less path (the default FS) would otherwise resolve to the local FS.
+	// By name rather than by path, as DuckDB does for scans.
 	if (FileSystem::GetFileSystem(context).SubSystemIsDisabled(hdfs.GetName())) {
 		throw PermissionException("File system %s has been disabled by configuration", hdfs.GetName());
 	}
@@ -101,10 +105,12 @@ struct HdfsMetaBindData : public TableFunctionData {
 unique_ptr<FunctionData> HdfsMetaBind(ClientContext &context, TableFunctionBindInput &input,
                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<HdfsTableFunctionInfo>();
+	auto function_name = info.op == HdfsMetaOp::LIST ? "hdfs_ls" : "hdfs_stat";
 	if (input.inputs[0].IsNull()) {
-		throw BinderException("%s: the path cannot be NULL", info.op == HdfsMetaOp::LIST ? "hdfs_ls" : "hdfs_stat");
+		throw BinderException("%s: the path cannot be NULL", function_name);
 	}
 	auto result = make_uniq<HdfsMetaBindData>(info.hdfs.get(), info.op, StringValue::Get(input.inputs[0]));
+	RequireHdfsUrl(function_name, result->path);
 	// Only hdfs_ls has named parameters.
 	for (auto &parameter : input.named_parameters) {
 		if (parameter.first == "skip_permission_errors") {
@@ -215,7 +221,7 @@ void WriteColumn(column_t column_id, const vector<HdfsEntry> &rows, idx_t first_
 				writer.WriteValue(string_t(row.group));
 				break;
 			default: {
-				auto permissions = PermissionString(row.permission);
+				auto permissions = HdfsPermissionString(row.permission);
 				writer.WriteValue(string_t(permissions));
 				break;
 			}
@@ -240,7 +246,7 @@ void WriteColumn(column_t column_id, const vector<HdfsEntry> &rows, idx_t first_
 	case COL_MODE: {
 		auto writer = FlatVector::Writer<uint16_t>(result, count);
 		for (auto &row : rows) {
-			writer.WriteValue(row.permission);
+			writer.WriteValue(HdfsPermissionMode(row.permission));
 		}
 		break;
 	}
@@ -329,6 +335,7 @@ void HdfsExistsExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 	auto opener = ClientData::Get(context).file_opener.get();
 	UnaryExecutor::Execute<string_t, bool>(args.data[0], result, args.size(), [&](string_t path) {
 		auto url = path.GetString();
+		RequireHdfsUrl("hdfs_exists", url);
 		VerifyCanAccess(context, hdfs, url);
 		return hdfs.Exists(url, opener);
 	});
@@ -373,7 +380,7 @@ void RegisterHdfsFunctions(ExtensionLoader &loader, HdfsFileSystem &hdfs) {
 	// a bug in a function it assumed can't fail.
 	exists.SetFallible();
 	// The answer changes as files come and go, so it must not be constant-folded or kept in a prepared statement's
-	// plan (as the default, CONSISTENT, allows). Within one query it is one answer per row, as for now().
+	// plan (as the default, CONSISTENT, allows). Each row makes its own lookup.
 	exists.SetStability(FunctionStability::CONSISTENT_WITHIN_QUERY);
 	CreateScalarFunctionInfo exists_info(std::move(exists));
 	exists_info.descriptions.push_back(

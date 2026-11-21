@@ -32,26 +32,59 @@ cd "${REPO_ROOT}"
 # HADOOP_CONF_DIR provides client config; HADOOP_USER_NAME makes us the owner of
 # the hadoop-owned /test dir so the write tests are permitted. Both are the
 # standard Hadoop env vars the extension reads, as the Hadoop CLI does.
-HDFS_TEST_RUNNING=1 \
-HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
-HADOOP_USER_NAME=hadoop \
-    "${UNITTEST}" test/sql/hdfs.test
-HDFS_TEST_RUNNING=1 \
-HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
-HADOOP_USER_NAME=hadoop \
-    "${UNITTEST}" test/sql/hdfs_glob.test
-HDFS_TEST_RUNNING=1 \
-HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
-HADOOP_USER_NAME=hadoop \
-    "${UNITTEST}" test/sql/hdfs_edge.test
+# Every test file run here is recorded, so one that needs the cluster but is
+# never run fails the script (see the end) instead of being skipped silently.
+RAN_TESTS=""
+run_cluster_test() { # test file, HADOOP_USER_NAME, [extra env assignments...]
+    local test_file="$1" user="$2"
+    shift 2
+    env HDFS_TEST_RUNNING=1 HADOOP_CONF_DIR="${HADOOP_CONF_DIR_FOR_TESTS:-${REPO_ROOT}/test/hdfs-conf}" \
+        HADOOP_USER_NAME="${user}" "$@" "${UNITTEST}" "${test_file}"
+    RAN_TESTS="${RAN_TESTS} ${test_file}"
+}
+run_cluster_test test/sql/hdfs.test hadoop
+run_cluster_test test/sql/hdfs_glob.test hadoop
+run_cluster_test test/sql/hdfs_edge.test hadoop
+# The NameNode RPC budget of reads and listings (HDFS log type).
+run_cluster_test test/sql/hdfs_rpc_log.test hadoop
 
 echo "==> Running HDFS permission tests (as a non-superuser)..."
 # A separate run as a plain user: the superuser above bypasses HDFS permission
 # checks, so it can never hit the AccessControlExceptions these tests need.
-HDFS_TEST_RUNNING=1 \
-HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" \
-HADOOP_USER_NAME=guest \
-    "${UNITTEST}" test/sql/hdfs_permissions.test
+run_cluster_test test/sql/hdfs_permissions.test guest
+
+echo "==> Checking a same-size replacement with the same mtime isn't served from the external file cache..."
+# hdfs dfs -cp replaces the file (a new inode) with one of the same length, and
+# -touch sets the old mtime back (whole seconds, so the original is set to one
+# first). Only the file id tells the two versions apart. Both reads run in one
+# process, so the second one could hit the first one's cache entries.
+# .shell passes arguments with spaces unquoted, so it runs small scripts.
+VERSION_TAG_DIR="$(mktemp -d)"
+cat > "${VERSION_TAG_DIR}/touch.sh" <<'SH'
+docker exec duckdb-hdfs-test bash -lc 'hdfs dfs -touch -m -t 20200101:000000 /test/version_tag.parquet' >/dev/null 2>&1
+SH
+cat > "${VERSION_TAG_DIR}/replace.sh" <<'SH'
+docker exec duckdb-hdfs-test bash -lc 'hdfs dfs -cp -f /test/version_tag_2.parquet /test/version_tag.parquet &&
+    hdfs dfs -touch -m -t 20200101:000000 /test/version_tag.parquet' >/dev/null 2>&1
+SH
+version_tag_out="$(HADOOP_CONF_DIR="${REPO_ROOT}/test/hdfs-conf" HADOOP_USER_NAME=hadoop \
+    "${REPO_ROOT}/build/release/duckdb" -no-agent -csv -noheader <<SQL
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/version_tag.parquet' (FORMAT parquet);
+COPY (SELECT 2 AS v) TO 'hdfs://localhost:9000/test/version_tag_2.parquet' (FORMAT parquet);
+.shell bash ${VERSION_TAG_DIR}/touch.sh
+SET enable_external_file_cache = true;
+SET cache_local_files = true;
+SELECT v FROM read_parquet('hdfs://localhost:9000/test/version_tag.parquet');
+.shell bash ${VERSION_TAG_DIR}/replace.sh
+SELECT v FROM read_parquet('hdfs://localhost:9000/test/version_tag.parquet');
+SQL
+)"
+rm -rf "${VERSION_TAG_DIR}"
+if [ "$(echo "${version_tag_out}" | tr -d '\r' | tail -n 2 | tr '\n' ' ')" != "1 2 " ]; then
+    echo "ERROR: expected the replaced file's value (1, then 2); got: ${version_tag_out}" >&2
+    exit 1
+fi
+echo "OK"
 
 echo "==> Checking batched and one-directory-per-call listings agree..."
 NO_BATCH_CONF="$(mktemp -d)"
@@ -139,9 +172,20 @@ text = open(path).read()
 text = re.sub(r"\s*<property>\s*<name>hadoop\.security\.key\.provider\.path</name>.*?</property>", "", text, flags=re.S)
 open(path, "w").write(text)
 PY
-HDFS_TEST_RUNNING=1 HDFS_TEST_NO_KMS=1 \
-HADOOP_CONF_DIR="${NO_KMS_CONF}" \
-HADOOP_USER_NAME=hadoop \
-    "${UNITTEST}" test/sql/hdfs_ez_no_provider.test
+HADOOP_CONF_DIR_FOR_TESTS="${NO_KMS_CONF}" run_cluster_test test/sql/hdfs_ez_no_provider.test hadoop HDFS_TEST_NO_KMS=1
 rm -rf "${NO_KMS_CONF}"
 
+
+echo "==> Checking every cluster test file ran..."
+missing=""
+for test_file in $(grep -l '^require-env HDFS_TEST_RUNNING' test/sql/*.test); do
+    case " ${RAN_TESTS} " in
+    *" ${test_file} "*) ;;
+    *) missing="${missing} ${test_file}" ;;
+    esac
+done
+if [ -n "${missing}" ]; then
+    echo "ERROR: these need the cluster (require-env HDFS_TEST_RUNNING) but this script doesn't run them:${missing}" >&2
+    exit 1
+fi
+echo "OK"

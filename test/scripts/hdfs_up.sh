@@ -47,6 +47,8 @@ docker exec "${CONTAINER}" hdfs dfsadmin -safemode leave >/dev/null 2>&1 || true
 
 echo "==> Seeding fixtures under /test ..."
 docker exec "${CONTAINER}" hdfs dfs -mkdir -p /test /test/nested
+# A sticky directory (mode 1777, like the usual HDFS /tmp), for the permissions column.
+docker exec "${CONTAINER}" bash -lc "hdfs dfs -mkdir -p /sticky && hdfs dfs -chmod 1777 /sticky"
 
 # CSV fixture, created directly in the container.
 docker exec "${CONTAINER}" bash -lc \
