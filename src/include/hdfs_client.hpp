@@ -14,6 +14,7 @@
 namespace duckdb {
 
 class Logger;
+class HdfsGlobPlan;
 
 //! What kind of failure an HdfsError is, for callers that react to it (retry, "not found", ...).
 enum class HdfsErrorType {
@@ -159,9 +160,10 @@ public:
 	virtual void Rename(const string &source, const string &target, bool overwrite) = 0;
 	//! List `path`'s children (`recursive`: the whole subtree); a file lists as itself.
 	virtual unique_ptr<HdfsWalk> List(const string &path, bool recursive, const HdfsWalkOptions &options) = 0;
-	//! The entries (files and directories) a glob pattern matches: `*`, `?`, `[...]`, `\` escapes, `{a,b}` and `**`.
-	//! Throws an INVALID_INPUT HdfsError for an invalid pattern.
-	virtual unique_ptr<HdfsWalk> Glob(const string &pattern, const HdfsWalkOptions &options) = 0;
+	//! The entries (files and directories) `plan` matches: HdfsGlobPlan::Parse of `pattern` (`*`, `?`, `[...]`, `\`
+	//! escapes, `{a,b}` and `**`). The caller parses once, before connecting; the walk and its retries share it.
+	virtual unique_ptr<HdfsWalk> Glob(const string &pattern, shared_ptr<const HdfsGlobPlan> plan,
+	                                  const HdfsWalkOptions &options) = 0;
 };
 
 //! While alive, sends this thread's NameNode RPCs to `logger` (HdfsClient::SetThreadLogger), then restores the

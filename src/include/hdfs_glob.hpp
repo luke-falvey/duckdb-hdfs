@@ -80,6 +80,8 @@ public:
 	//! Match a child (of a directory holding `states`) by name.
 	Step Match(const vector<State> &states, const string &name, bool is_dir) const;
 
+	//! At most the first 200 bytes of `pattern` (with "..." if cut), for error messages: a pattern may be 64 KiB.
+	static string Excerpt(const string &pattern);
 	//! Hadoop's hidden-name convention: a leading `.` or `_`.
 	static bool IsHidden(const string &name);
 	//! Expand `{a,b}` groups into brace-free patterns. Braces inside a character class (`[{]`) or escaped (`\{`) are

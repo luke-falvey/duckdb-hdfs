@@ -82,6 +82,11 @@ vector<string> SplitComponents(const string &path) {
 
 } // namespace
 
+string HdfsGlobPlan::Excerpt(const string &pattern) {
+	static constexpr idx_t MAX_EXCERPT = 200;
+	return pattern.size() <= MAX_EXCERPT ? pattern : pattern.substr(0, MAX_EXCERPT) + "...";
+}
+
 bool HdfsGlobPlan::IsHidden(const string &name) {
 	return !name.empty() && (name[0] == '.' || name[0] == '_');
 }
@@ -128,7 +133,7 @@ void HdfsGlobPlan::ExpandBraces(const string &pattern, const string &original, v
 		if (result.size() >= MAX_EXPANDED_PATTERNS) {
 			throw InvalidInputException("Glob pattern '%s' expands to more than %llu patterns: each {a,b} group "
 			                            "multiplies the count. Use fewer brace groups or several queries",
-			                            original, MAX_EXPANDED_PATTERNS);
+			                            Excerpt(original), MAX_EXPANDED_PATTERNS);
 		}
 		result.push_back(pattern);
 		return;
@@ -165,7 +170,7 @@ void HdfsGlobPlan::ExpandBraces(const string &pattern, const string &original, v
 		}
 	}
 	if (close == string::npos) {
-		throw InvalidInputException("Unclosed brace group in glob pattern '%s'", original);
+		throw InvalidInputException("Unclosed brace group in glob pattern '%s'", Excerpt(original));
 	}
 	auto prefix = pattern.substr(0, start);
 	auto suffix = pattern.substr(close + 1);
@@ -177,7 +182,7 @@ void HdfsGlobPlan::ExpandBraces(const string &pattern, const string &original, v
 		if (size > budget) {
 			throw InvalidInputException("Glob pattern '%s' is too large to expand: its brace groups would build more "
 			                            "than %llu bytes of patterns. Use fewer brace groups or a shorter pattern",
-			                            original.substr(0, 200), MAX_EXPANSION_BYTES);
+			                            Excerpt(original), MAX_EXPANSION_BYTES);
 		}
 		budget -= size;
 		ExpandBraces(prefix + alternative + suffix, original, result, budget);
@@ -214,14 +219,14 @@ HdfsGlobPlan HdfsGlobPlan::Parse(const string &pattern, bool include_hidden) {
 				if (component.kind == ComponentKind::LITERAL && (component.text == "." || component.text == "..")) {
 					throw InvalidInputException("Glob pattern '%s' has a '%s' component (after brace expansion and "
 					                            "escapes); HDFS paths cannot contain '.' or '..'",
-					                            pattern, component.text);
+					                            Excerpt(pattern), component.text);
 				}
 			}
 			components.push_back(std::move(component));
 		}
 		if (crawls > 1) {
 			// The same restriction (and message) as DuckDB's globber.
-			throw InvalidInputException("Cannot use multiple '**' in one path: '%s'", pattern);
+			throw InvalidInputException("Cannot use multiple '**' in one path: '%s'", Excerpt(pattern));
 		}
 		plan.patterns.push_back(std::move(components));
 	}

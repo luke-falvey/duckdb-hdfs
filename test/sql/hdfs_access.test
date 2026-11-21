@@ -145,7 +145,34 @@ CREATE SECRET outside_conf (TYPE hdfs, CONFIG_DIR '/etc', SCOPE 'hdfs://127.0.0.
 statement error
 SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf/x');
 ----
-Permission Error: Cannot use HDFS secret 'outside_conf': its CONFIG_DIR '/etc' is not in allowed_directories (enable_external_access is false)
+Permission Error: Cannot use HDFS secret 'outside_conf': with enable_external_access = false, its CONFIG_DIR '/etc' must be an absolute path in allowed_directories or allowed_paths (set them before disabling external access), or leave CONFIG_DIR out to use HADOOP_CONF_DIR
+
+# The check canonicalises '..' as for local reads: '/data/../etc' is '/etc'.
+statement ok
+CREATE OR REPLACE SECRET outside_conf (TYPE hdfs, CONFIG_DIR '/data/../etc', SCOPE 'hdfs://127.0.0.1:1/allowed/conf');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf/x');
+----
+<REGEX>:Permission Error: Cannot use HDFS secret 'outside_conf': with enable_external_access = false, its CONFIG_DIR '/data/\.\./etc' must be.*
+
+# The client is handed the string as given, so it must be the path that was checked: a '~' or 'file://' spelling
+# (which the check would expand or strip, and libhdfs3 wouldn't) is refused, even under an allowed directory.
+statement ok
+CREATE OR REPLACE SECRET outside_conf (TYPE hdfs, CONFIG_DIR '~/conf', SCOPE 'hdfs://127.0.0.1:1/allowed/conf');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf/x');
+----
+<REGEX>:Permission Error: Cannot use HDFS secret 'outside_conf': with enable_external_access = false, its CONFIG_DIR '~/conf' must be an absolute path.*
+
+statement ok
+CREATE OR REPLACE SECRET outside_conf (TYPE hdfs, CONFIG_DIR 'file:///data/hadoop', SCOPE 'hdfs://127.0.0.1:1/allowed/conf');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf/x');
+----
+<REGEX>:Permission Error: Cannot use HDFS secret 'outside_conf': with enable_external_access = false, its CONFIG_DIR 'file:///data/hadoop' must be an absolute path.*
 
 statement error
 SELECT * FROM read_csv('hdfs://127.0.0.1:1/allowed/conf/x.csv');

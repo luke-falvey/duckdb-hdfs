@@ -427,7 +427,7 @@ public:
 	bool include_hidden = false;
 	bool batched_listing = true;
 	size_t max_parallelism = 1;
-	unique_ptr<HdfsGlobPlan> plan;
+	shared_ptr<const HdfsGlobPlan> plan;
 	std::shared_ptr<std::atomic<size_t>> batch_limit; // see HdfsClientImpl
 	// Where the workers log their RPCs: the logger of the thread that started the walk.
 	shared_ptr<Logger> logger;
@@ -1197,10 +1197,8 @@ public:
 		return std::move(walk);
 	}
 
-	unique_ptr<HdfsWalk> Glob(const string &pattern, const HdfsWalkOptions &options) override {
-		auto plan = Guard("invalid glob pattern", [&] {
-			return make_uniq<HdfsGlobPlan>(HdfsGlobPlan::Parse(pattern, options.include_hidden));
-		});
+	unique_ptr<HdfsWalk> Glob(const string &pattern, shared_ptr<const HdfsGlobPlan> plan,
+	                          const HdfsWalkOptions &options) override {
 		auto walk = NewWalk(pattern, options);
 		walk->glob = true;
 		auto root = plan->Root();

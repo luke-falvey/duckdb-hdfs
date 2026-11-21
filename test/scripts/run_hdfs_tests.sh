@@ -36,21 +36,31 @@ cd "${REPO_ROOT}"
 # never run fails the script (see the end) instead of being skipped silently.
 # A file skipped by an unmet `require` (an extension, or an env var such as
 # HDFS_TEST_NO_KMS) exits 0 too, so a reported skip fails the script as well.
+# unittest's skip summary; the self-check below fails the script if it no longer matches what unittest prints.
+SKIP_MARKER="Skipped tests for the following reasons"
 RAN_TESTS=""
 run_cluster_test() { # test file, HADOOP_USER_NAME, [extra env assignments...]
-    local test_file="$1" user="$2" output
+    local test_file="$1" user="$2" output status=0
     shift 2
     output="$(mktemp)"
     env HDFS_TEST_RUNNING=1 HADOOP_CONF_DIR="${HADOOP_CONF_DIR_FOR_TESTS:-${REPO_ROOT}/test/hdfs-conf}" \
-        HADOOP_USER_NAME="${user}" "$@" "${UNITTEST}" "${test_file}" 2>&1 | tee "${output}"
-    if grep -q "Skipped tests for the following reasons" "${output}"; then
-        rm -f "${output}"
+        HADOOP_USER_NAME="${user}" "$@" "${UNITTEST}" "${test_file}" 2>&1 | tee "${output}" || status=$?
+    if [ "${status}" -eq 0 ] && grep -q "${SKIP_MARKER}" "${output}"; then
         echo "ERROR: ${test_file} was skipped (in whole or in part); see the reasons above" >&2
-        exit 1
+        status=1
     fi
     rm -f "${output}"
+    if [ "${status}" -ne 0 ]; then
+        exit "${status}"
+    fi
     RAN_TESTS="${RAN_TESTS} ${test_file}"
 }
+# The skip check must be able to fail: a file whose require-env isn't set has to produce the marker.
+skip_check="$(env -u HDFS_KERBEROS_NO_TICKET "${UNITTEST}" test/sql/hdfs_kerberos_no_ticket.test 2>&1 || true)"
+if ! grep -q "${SKIP_MARKER}" <<< "${skip_check}"; then
+    echo "ERROR: unittest no longer reports a skipped test as '${SKIP_MARKER}'; update the skip check" >&2
+    exit 1
+fi
 run_cluster_test test/sql/hdfs.test hadoop
 run_cluster_test test/sql/hdfs_glob.test hadoop
 run_cluster_test test/sql/hdfs_edge.test hadoop

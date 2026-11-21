@@ -242,6 +242,16 @@ void BraceExpansionBytes() {
 	// Groups with one alternative copy the whole pattern once per group and leaf.
 	CHECK(Throws([&] { HdfsGlobPlan::Parse("/d/" + Repeat("{a,b}", 8) + Repeat("{a}", 100) + padding, false); },
 	             "too large to expand"));
+	// The error quotes an excerpt of the pattern, not all of it.
+	try {
+		HdfsGlobPlan::Parse("/d/" + padding + Repeat("{a,b}", 13), false);
+		CHECK(false);
+	} catch (const std::exception &error) {
+		CHECK(std::string(error.what()).size() < 1000);
+		CHECK(std::string(error.what()).find("/d/" + Repeat("x", 197) + "...") != std::string::npos);
+	}
+	CHECK_EQ(HdfsGlobPlan::Excerpt("/short"), std::string("/short"));
+	CHECK_EQ(HdfsGlobPlan::Excerpt(Repeat("y", 300)), Repeat("y", 200) + "...");
 	// Ordinary patterns stay well inside it: 10,000 results of about 100 bytes.
 	CHECK_EQ(HdfsGlobPlan::ExpandBraces("/d/" + Repeat("y", 80) + Repeat("{0,1,2,3,4,5,6,7,8,9}", 4)).size(),
 	         size_t(10000));

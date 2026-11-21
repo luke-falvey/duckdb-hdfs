@@ -64,15 +64,17 @@ client_settings() {
 # that needs the Kerberos cluster must be run (checked at the end).
 RAN_TESTS=""
 run_kerberos_test() { # test file; the environment comes from the caller
-    local test_file="$1" output
+    local test_file="$1" output status=0
     output="$(mktemp)"
-    "${UNITTEST}" "${test_file}" 2>&1 | tee "${output}"
-    if grep -q "Skipped tests for the following reasons" "${output}"; then
-        rm -f "${output}"
+    "${UNITTEST}" "${test_file}" 2>&1 | tee "${output}" || status=$?
+    if [ "${status}" -eq 0 ] && grep -q "Skipped tests for the following reasons" "${output}"; then
         echo "ERROR: ${test_file} was skipped (in whole or in part); see the reasons above" >&2
-        exit 1
+        status=1
     fi
     rm -f "${output}"
+    if [ "${status}" -ne 0 ]; then
+        exit "${status}"
+    fi
     RAN_TESTS="${RAN_TESTS} ${test_file}"
 }
 

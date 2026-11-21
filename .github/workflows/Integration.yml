@@ -14,10 +14,10 @@ on:
     paths-ignore: ['**.md', 'docs/**']
   workflow_dispatch:
 
-# One group per pull request or branch, so a new push cancels the run it supersedes; on main every commit keeps its
-# own run (its sha is in the group).
+# One group per pull request or branch, so a new push cancels the run it supersedes; on main and duckdb-review every
+# commit keeps its own run (its sha is in the group).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ (github.ref != 'refs/heads/main' && github.ref != 'refs/heads/duckdb-review') || github.sha }}
   cancel-in-progress: true
 
 jobs:

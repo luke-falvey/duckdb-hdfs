@@ -79,7 +79,9 @@ public:
 //! continues, in no particular order. Not thread-safe.
 class HdfsListStream {
 public:
-	HdfsListStream(shared_ptr<HdfsConnection> connection, string url, bool glob, HdfsWalkOptions options);
+	//! Lists `url`, or with a `plan` (HdfsGlobPlan::Parse of its path) the entries that glob matches.
+	HdfsListStream(shared_ptr<HdfsConnection> connection, string url, shared_ptr<const HdfsGlobPlan> plan,
+	               HdfsWalkOptions options);
 
 	//! Replace `out` with the next batch (at most `max_entries`), blocking until one arrives. Returns false at the
 	//! end. A connection failure is retried once while no entries have been handed out yet. With a `context`, the
@@ -93,7 +95,8 @@ private:
 	const string url;
 	string authority;
 	string hdfs_path;
-	const bool glob;
+	//! The glob's plan, parsed once for the walk and any retry; null for a listing.
+	const shared_ptr<const HdfsGlobPlan> plan;
 	const HdfsWalkOptions options;
 	shared_ptr<HdfsClient> client;
 	unique_ptr<HdfsWalk> walk;

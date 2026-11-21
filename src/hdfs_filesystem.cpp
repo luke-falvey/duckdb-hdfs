@@ -335,6 +335,27 @@ struct HdfsSecretMatch {
 	string secret;
 };
 
+//! libhdfs3 reads a secret's CONFIG_DIR itself, outside DuckDB's file system, so with enable_external_access =
+//! false it is checked as a local read: otherwise a secret could point the client (NameNodes, KMS URL, ticket
+//! cache) at a directory allowed_directories doesn't cover. The client gets the string as given, so it must be an
+//! absolute path: CanAccessFile would check "~/x" or "file:///x" as another path than libhdfs3 then reads. Checked
+//! on every lookup, so a connection cached while external access was on is refused too.
+void CheckConfigDirAccess(DatabaseInstance &db, optional_ptr<FileOpener> opener, const string &secret_name,
+                          const string &config_dir) {
+	Value external_access;
+	bool restricted = FileOpener::TryGetCurrentSetting(opener, "enable_external_access", external_access) &&
+	                  !external_access.IsNull() && !BooleanValue::Get(external_access);
+	bool absolute = !config_dir.empty() && config_dir[0] == '/';
+	if ((restricted && !absolute) ||
+	    !DBConfig::GetConfig(db).CanAccessFile(config_dir, FileType::FILE_TYPE_DIR, opener)) {
+		throw PermissionException(
+		    "Cannot use HDFS secret '%s': with enable_external_access = false, its CONFIG_DIR '%s' must be an "
+		    "absolute path in allowed_directories or allowed_paths (set them before disabling external access), or "
+		    "leave CONFIG_DIR out to use HADOOP_CONF_DIR",
+		    secret_name, config_dir);
+	}
+}
+
 HdfsSecretMatch LookupSecret(const string &url, optional_ptr<FileOpener> opener) {
 	HdfsSecretMatch result;
 	if (!opener) {
@@ -370,14 +391,7 @@ HdfsSecretMatch LookupSecret(const string &url, optional_ptr<FileOpener> opener)
 			Value value;
 			if (kv_secret.TryGetValue("config_dir", value) && !value.IsNull()) {
 				result.config.config_dir = value.ToString();
-				// libhdfs3 reads the XML there itself, outside DuckDB's file system: check it as a local read, so
-				// that with enable_external_access = false a secret can't point the client (NameNodes, KMS URL,
-				// ticket cache) at a directory allowed_directories doesn't cover.
-				if (!DBConfig::GetConfig(*db).CanAccessFile(result.config.config_dir, FileType::FILE_TYPE_DIR)) {
-					throw PermissionException("Cannot use HDFS secret '%s': its CONFIG_DIR '%s' is not in "
-					                          "allowed_directories (enable_external_access is false)",
-					                          secret.GetName().GetIdentifierName(), result.config.config_dir);
-				}
+				CheckConfigDirAccess(*db, opener, secret.GetName().GetIdentifierName(), result.config.config_dir);
 			}
 			if (kv_secret.TryGetValue("user", value) && !value.IsNull()) {
 				result.config.user = value.ToString();
@@ -454,6 +468,8 @@ unique_ptr<FileHandle> HdfsFileSystem::OpenFileExtended(const OpenFileInfo &file
 	}
 	HdfsFileStatus expected;
 	expected.length = NumericCast<int64_t>(file_size);
+	// Clamped for the reader-version match only; a pre-1970 file then never matches its listing's etag, which costs
+	// a Parquet metadata cache miss, not a stale read (docs/REVIEW_QUORUM_ROUND3.md, pre-1970 mtimes).
 	expected.mtime = NumericCast<uint64_t>(MaxValue<int64_t>(Timestamp::GetEpochMs(last_modified), 0));
 	idx_t file_id;
 	if (file.extended_info->TryGetOption("hdfs_file_id", file_id)) {
@@ -1069,9 +1085,9 @@ unique_ptr<MultiFileList> HdfsFileSystem::GlobFilesExtended(const string &path, 
 	return make_uniq<HdfsGlobResult>(*this, path, options, opener);
 }
 
-HdfsListStream::HdfsListStream(shared_ptr<HdfsConnection> connection_p, string url_p, bool glob,
-                               HdfsWalkOptions options)
-    : connection(std::move(connection_p)), url(std::move(url_p)), glob(glob), options(options),
+HdfsListStream::HdfsListStream(shared_ptr<HdfsConnection> connection_p, string url_p,
+                               shared_ptr<const HdfsGlobPlan> plan_p, HdfsWalkOptions options)
+    : connection(std::move(connection_p)), url(std::move(url_p)), plan(std::move(plan_p)), options(options),
       rpc_logger(HdfsClient::GetThreadLogger()) {
 	ParseHdfsPath(url, authority, hdfs_path);
 	Open();
@@ -1082,10 +1098,12 @@ void HdfsListStream::Open() {
 	HdfsRpcLoggerScope log_scope(rpc_logger.lock());
 	client = connection->Get();
 	try {
-		walk = glob ? client->Glob(hdfs_path, options) : client->List(hdfs_path, false, options);
+		walk = plan ? client->Glob(hdfs_path, plan, options) : client->List(hdfs_path, false, options);
 	} catch (const HdfsError &error) {
-		// Only an invalid pattern fails here; cluster errors surface in Next().
-		ThrowHdfsError(StringUtil::Format("Failed to glob HDFS pattern '%s'", url), error);
+		// Cluster errors surface in Next(); this covers a failure to start the walk.
+		ThrowHdfsError(StringUtil::Format(plan ? "Failed to glob HDFS pattern '%s'" : "Failed to list HDFS path '%s'",
+		                                  HdfsGlobPlan::Excerpt(url)),
+		               error);
 	}
 }
 
@@ -1109,7 +1127,8 @@ bool HdfsListStream::Next(vector<HdfsEntry> &out, idx_t max_entries, optional_pt
 				continue;
 			}
 			ThrowHdfsError(
-			    StringUtil::Format(glob ? "Failed to glob HDFS pattern '%s'" : "Failed to list HDFS path '%s'", url),
+			    StringUtil::Format(plan ? "Failed to glob HDFS pattern '%s'" : "Failed to list HDFS path '%s'",
+			                       HdfsGlobPlan::Excerpt(url)),
 			    error);
 		}
 		if (pending) {
@@ -1131,7 +1150,7 @@ unique_ptr<HdfsListStream> HdfsFileSystem::OpenListStream(const string &url, Hdf
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(url, authority, hdfs_path);
-	return make_uniq<HdfsListStream>(GetConnection(url, authority, opener), url, false, options);
+	return make_uniq<HdfsListStream>(GetConnection(url, authority, opener), url, nullptr, options);
 }
 
 unique_ptr<HdfsListStream> HdfsFileSystem::OpenGlobStream(const string &url, HdfsWalkOptions options,
@@ -1139,14 +1158,17 @@ unique_ptr<HdfsListStream> HdfsFileSystem::OpenGlobStream(const string &url, Hdf
 	string authority;
 	string hdfs_path;
 	ParseHdfsPath(url, authority, hdfs_path);
-	// Check the pattern before connecting: an invalid one (including a "." or ".." component that only appears
-	// after brace expansion or unescaping) is refused without a NameNode, and without waiting on an unreachable one.
+	// Parse the pattern once, before connecting: an invalid one (including a "." or ".." component that only
+	// appears after brace expansion or unescaping) is refused without a NameNode, and without waiting on an
+	// unreachable one. The walk, and a retried walk, use this plan.
+	shared_ptr<const HdfsGlobPlan> plan;
 	try {
-		(void)HdfsGlobPlan::Parse(hdfs_path, options.include_hidden);
+		plan = make_shared_ptr<HdfsGlobPlan>(HdfsGlobPlan::Parse(hdfs_path, options.include_hidden));
 	} catch (const InvalidInputException &error) {
-		throw InvalidInputException("Failed to glob HDFS pattern '%s': %s", url, ErrorData(error).RawMessage());
+		throw InvalidInputException("Failed to glob HDFS pattern '%s': %s", HdfsGlobPlan::Excerpt(url),
+		                            ErrorData(error).RawMessage());
 	}
-	return make_uniq<HdfsListStream>(GetConnection(url, authority, opener), url, true, options);
+	return make_uniq<HdfsListStream>(GetConnection(url, authority, opener), url, std::move(plan), options);
 }
 
 bool HdfsFileSystem::CanHandleFile(const string &fpath) {
