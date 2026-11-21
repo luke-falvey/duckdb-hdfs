@@ -22,7 +22,7 @@ SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/data.parquet');
 ----
 5
 
-query TTB
+query TTT
 SELECT op, path, ok FROM duckdb_logs_parsed('HDFS') ORDER BY op;
 ----
 getBlockLocations	/test/data.parquet	true
@@ -40,7 +40,7 @@ CALL truncate_duckdb_logs();
 
 # read_blob without the content column needs only the file's status: the scan's stat answers it, and the file is
 # never opened (no getBlockLocations; in an encryption zone, no KMS call).
-query B
+query T
 SELECT size > 0 FROM read_blob('hdfs://localhost:9000/test/data.parquet');
 ----
 true
@@ -139,7 +139,7 @@ COPY (SELECT CASE WHEN range = 50000 THEN error('boom') ELSE range END AS v FROM
 ----
 boom
 
-query TB
+query TT
 SELECT op, ok FROM duckdb_logs_parsed('HDFS') WHERE path = '/test/rpc_abort.csv' AND op IN ('create', 'delete')
 ORDER BY op;
 ----
@@ -162,7 +162,7 @@ SELECT * FROM hdfs_stat('hdfs://localhost:9000/test/does_not_exist');
 ----
 Failed to stat HDFS path 'hdfs://localhost:9000/test/does_not_exist'
 
-query TTB
+query TTT
 SELECT op, path, ok FROM duckdb_logs_parsed('HDFS');
 ----
 getFileInfo	/test/does_not_exist	false
