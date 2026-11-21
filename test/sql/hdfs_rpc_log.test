@@ -107,15 +107,16 @@ CALL truncate_duckdb_logs();
 # --- the literal fallback ------------------------------------------------------------
 
 # A pattern that matches nothing may be a file whose name contains glob characters. One getFileInfo after the
-# listing answers both whether it exists and what it is.
+# listing answers both whether it exists and what it is. (Parquet: its second open reuses the listing's status, as
+# above, so only the glob's calls and one getBlockLocations remain.)
 statement ok
-COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/rpc[1].csv';
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/rpc[1].parquet' (FORMAT parquet);
 
 statement ok
 CALL truncate_duckdb_logs();
 
 query I
-SELECT v FROM read_csv('hdfs://localhost:9000/test/rpc[1].csv');
+SELECT v FROM read_parquet('hdfs://localhost:9000/test/rpc[1].parquet');
 ----
 1
 
