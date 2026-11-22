@@ -387,6 +387,15 @@ HdfsSecretMatch LookupSecret(const string &url, optional_ptr<FileOpener> opener)
 			}
 		}
 		if (scopes.empty() || ScopeCovers(longest, url)) {
+			// Persistent secrets are read back without the extension, so one written by a newer version (another
+			// provider, other keys) still reaches this build. Refuse it: read as a `config` secret it would have no
+			// CONFIG_DIR, and connect through the Hadoop environment instead.
+			if (secret.GetProvider() != "config") {
+				throw InvalidConfigurationException(
+				    "HDFS secret '%s' has provider '%s', which this version of the hdfs extension doesn't support: it "
+				    "was created by a newer version. Update the hdfs extension, or recreate the secret",
+				    secret.GetName().GetIdentifierName(), secret.GetProvider().GetIdentifierName());
+			}
 			auto &kv_secret = secret.Cast<KeyValueSecret>();
 			Value value;
 			if (kv_secret.TryGetValue("config_dir", value) && !value.IsNull()) {
@@ -424,7 +433,13 @@ string NormalizeAuthority(const string &authority) {
 }
 
 bool SameConfig(const HdfsConnectionConfig &a, const HdfsConnectionConfig &b) {
-	return a.config_dir == b.config_dir && a.user == b.user;
+	return a.Identity() == b.Identity();
+}
+
+//! `authority` (normalized) followed by `suffix`, length-prefixed so that no authority and suffix can run together.
+string AuthorityKey(const string &authority, const string &suffix) {
+	auto normalized = NormalizeAuthority(authority);
+	return std::to_string(normalized.size()) + ":" + normalized + suffix;
 }
 
 } // namespace
@@ -434,12 +449,26 @@ shared_ptr<HdfsConnection> HdfsFileSystem::GetConnection(const string &url, cons
 	// Every operation gets its connection here first: log its NameNode RPCs to the caller's query (HDFS log type).
 	HdfsClient::SetThreadLogger(HdfsLoggerFor(opener));
 	auto match = LookupSecret(url, opener);
-	// One connection per authority and secret: when the secret is replaced with a new configuration, so is its
-	// connection. Open files and listings keep the client they hold.
-	auto key = NormalizeAuthority(authority) + '\0' + match.secret;
+	// One connection per NameNode and configuration: secrets (or no secret) that configure a NameNode the same way
+	// share it. Each secret owns the entry it last used, so when it is replaced with a new configuration, its old
+	// connection is dropped unless another secret still uses it. Open files and listings keep the client they hold.
+	auto key = AuthorityKey(authority, match.config.Identity());
+	auto owner = AuthorityKey(authority, match.secret);
 	lock_guard<mutex> guard(connections_lock);
+	auto &owned = connection_owners[owner];
+	if (owned != key) {
+		auto previous = std::move(owned);
+		owned = key;
+		bool still_used = false;
+		for (auto &entry : connection_owners) {
+			still_used = still_used || entry.second == previous;
+		}
+		if (!previous.empty() && !still_used) {
+			connections.erase(previous);
+		}
+	}
 	auto &connection = connections[key];
-	if (!connection || !SameConfig(connection->config, match.config)) {
+	if (!connection) {
 		connection = make_shared_ptr<HdfsConnection>(authority, std::move(match.config));
 	}
 	return connection;
@@ -449,6 +478,7 @@ idx_t HdfsFileSystem::ResetConnections() {
 	lock_guard<mutex> guard(connections_lock);
 	auto count = connections.size();
 	connections.clear();
+	connection_owners.clear();
 	return count;
 }
 

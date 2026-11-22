@@ -210,8 +210,8 @@ public:
 
 private:
 	//! The connection for `url`: its authority ("hdfs://host:port", or "" for the default FS) and the configuration
-	//! of the hdfs secret matching it. Cached per (normalized) authority and secret, and replaced when that secret's
-	//! configuration changes.
+	//! of the hdfs secret matching it. Cached per (normalized) authority and configuration; a secret replaced with a
+	//! new configuration releases its old connection unless another secret uses it too.
 	shared_ptr<HdfsConnection> GetConnection(const string &url, const string &authority,
 	                                         optional_ptr<FileOpener> opener);
 	//! `expected`: the status a listing reported (null if unknown).
@@ -221,7 +221,10 @@ private:
 	bool TryStat(const string &url, HdfsFileStatus &result, optional_ptr<FileOpener> opener);
 
 	mutex connections_lock;
+	//! Keyed by authority + configuration identity.
 	unordered_map<string, shared_ptr<HdfsConnection>> connections;
+	//! Authority + secret ("<storage>.<name>", "" for none) -> the key of the connection it last used.
+	unordered_map<string, string> connection_owners;
 };
 
 //! Registers hdfs_reset_connections().

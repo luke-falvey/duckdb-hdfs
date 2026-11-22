@@ -77,6 +77,11 @@ struct HdfsConnectionConfig {
 	string config_dir;
 	//! The user to act as (simple authentication only).
 	string user;
+
+	//! What the connection is configured from, as one string: two configs are the same configuration iff their
+	//! identities are equal. It covers what the config names (the directory and the user), not the contents of the
+	//! files there (an edited core-site.xml keeps its identity) nor the environment variables.
+	string Identity() const;
 };
 
 //! An open file. Reads may run concurrently.

@@ -330,9 +330,11 @@ can write to an allowed directory can also write a `core-site.xml` there).
   DuckDB secrets.
 - **Each path resolves its own secret.** A rename (`COPY ... USE_TMP_FILE`)
   needs its source and target to resolve to the same configuration.
-- **Connections are cached** per NameNode and secret, for the database's
-  lifetime. Replacing a secret (`CREATE OR REPLACE SECRET`) with a new
-  configuration replaces its connection. To pick up other changes (an edited
+- **Connections are cached** per NameNode and configuration (`CONFIG_DIR` and
+  `USER`), for the database's lifetime: secrets that configure a NameNode the
+  same way share one connection. Replacing a secret (`CREATE OR REPLACE
+  SECRET`) with a new configuration replaces its connection. To pick up other
+  changes (an edited
   `core-site.xml` / `hdfs-site.xml`, a new Kerberos ticket cache, environment
   variables) or to release the connections of dropped secrets, call
   `hdfs_reset_connections()`; it returns how many connections it dropped.
