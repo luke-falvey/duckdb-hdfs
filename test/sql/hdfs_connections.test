@@ -123,19 +123,20 @@ statement ok
 DROP SECRET same_b;
 
 # A secret without parameters configures a NameNode like no secret at all (the Hadoop environment), so a URL in its
-# scope and one outside any scope share a connection. Nothing listens on port 1, so both fail to connect.
+# scope and one outside any scope share a connection. Nothing listens on port 1, so the first NameNode call of each
+# fails (the client connects lazily).
 statement ok
 CREATE SECRET empty (TYPE hdfs, SCOPE 'hdfs://127.0.0.1:1/empty');
 
 statement error
 SELECT hdfs_exists('hdfs://127.0.0.1:1/empty/x');
 ----
-Failed to connect to HDFS
+Connection refused
 
 statement error
 SELECT hdfs_exists('hdfs://127.0.0.1:1/elsewhere/x');
 ----
-Failed to connect to HDFS
+Connection refused
 
 query I
 SELECT connections_dropped FROM hdfs_reset_connections();
