@@ -334,7 +334,41 @@ struct HdfsSecretMatch {
 	HdfsConnectionConfig config;
 	//! Which secret ("<storage>.<name>"), empty without one.
 	string secret;
+	//! A `config_snapshot` secret's name and PROPERTIES, turned into `config.properties` only when a connection is
+	//! built (most lookups find a cached one).
+	string snapshot_name;
+	Value snapshot_properties;
 };
+
+[[noreturn]] void ThrowNewerSecret(const string &name, const string &detail) {
+	throw InvalidConfigurationException(
+	    "HDFS secret '%s' %s, which this version of the hdfs extension does not support (it may have been created by "
+	    "a newer version). Update the hdfs extension, or remove the secret with DROP PERSISTENT SECRET %s",
+	    name, detail, name);
+}
+
+//! Read a `config_snapshot` secret into `result`.
+void ReadSnapshotSecret(const KeyValueSecret &secret, const string &name, HdfsSecretMatch &result) {
+	Value value;
+	if (!secret.TryGetValue("format_version", value) || value.IsNull()) {
+		throw InvalidConfigurationException("HDFS secret '%s' has no format_version: recreate it", name);
+	}
+	auto version = value.GetValue<int64_t>();
+	if (version > HDFS_SNAPSHOT_FORMAT_VERSION) {
+		ThrowNewerSecret(name, StringUtil::Format("has format_version %d", version));
+	}
+	if (!secret.TryGetValue("fingerprint", value) || value.IsNull() || value.ToString().empty()) {
+		throw InvalidConfigurationException("HDFS secret '%s' has no fingerprint: recreate it", name);
+	}
+	result.config.fingerprint = value.ToString();
+	if (secret.TryGetValue("user", value) && !value.IsNull()) {
+		result.config.user = value.ToString();
+	}
+	if (!secret.TryGetValue("properties", result.snapshot_properties)) {
+		throw InvalidConfigurationException("HDFS secret '%s' has no properties: recreate it", name);
+	}
+	result.snapshot_name = name;
+}
 
 //! libhdfs3 reads a secret's CONFIG_DIR itself, outside DuckDB's file system, so with enable_external_access =
 //! false it is checked as a local read: otherwise a secret could point the client (NameNodes, KMS URL, ticket
@@ -391,26 +425,27 @@ HdfsSecretMatch LookupSecret(const string &url, optional_ptr<FileOpener> opener)
 			// written by a newer version of the extension (another provider, other keys) reaches this build too.
 			// Refuse it: read as a `config` secret it would have no CONFIG_DIR, and would silently connect through
 			// the Hadoop environment instead.
-			if (secret.GetProvider() != HDFS_SECRET_PROVIDER_CONFIG) {
-				auto name = secret.GetName().GetIdentifierName();
-				throw InvalidConfigurationException(
-				    "HDFS secret '%s' has provider '%s', which this version of the hdfs extension does not support (it "
-				    "may have been created by a newer version). Update the hdfs extension, or remove the secret with "
-				    "DROP PERSISTENT SECRET %s",
-				    name, secret.GetProvider().GetIdentifierName(), name);
-			}
+			auto name = secret.GetName().GetIdentifierName();
+			auto &provider = secret.GetProvider();
 			auto &kv_secret = secret.Cast<KeyValueSecret>();
-			Value value;
-			if (kv_secret.TryGetValue("config_dir", value) && !value.IsNull()) {
-				result.config.config_dir = value.ToString();
-				CheckConfigDirAccess(*db, opener, secret.GetName().GetIdentifierName(), result.config.config_dir);
-			}
-			if (kv_secret.TryGetValue("user", value) && !value.IsNull()) {
-				result.config.user = value.ToString();
+			if (provider == HDFS_SECRET_PROVIDER_SNAPSHOT) {
+				// Made before external access was disabled, from an allowed directory, or by the operator (the
+				// secret directory): its properties are trusted like an allowed CONFIG_DIR's files.
+				ReadSnapshotSecret(kv_secret, name, result);
+			} else if (provider == HDFS_SECRET_PROVIDER_CONFIG) {
+				Value value;
+				if (kv_secret.TryGetValue("config_dir", value) && !value.IsNull()) {
+					result.config.config_dir = value.ToString();
+					CheckConfigDirAccess(*db, opener, name, result.config.config_dir);
+				}
+				if (kv_secret.TryGetValue("user", value) && !value.IsNull()) {
+					result.config.user = value.ToString();
+				}
+			} else {
+				ThrowNewerSecret(name, StringUtil::Format("has provider '%s'", provider.GetIdentifierName()));
 			}
 			// Secret names are case-insensitive: a secret replaced under another spelling is the same secret.
-			result.secret =
-			    match.secret_entry->storage_mode + "." + StringUtil::Lower(secret.GetName().GetIdentifierName());
+			result.secret = match.secret_entry->storage_mode + "." + StringUtil::Lower(name);
 			return result;
 		}
 		// `longest` ends inside a component: retry with the URL cut at the last '/' before that point.
@@ -475,11 +510,58 @@ shared_ptr<HdfsConnection> HdfsFileSystem::GetConnection(const string &url, cons
 			connections.erase(previous);
 		}
 	}
-	auto &connection = connections[key];
-	if (!connection) {
-		connection = make_shared_ptr<HdfsConnection>(authority, std::move(match.config));
+	auto cached = connections.find(key);
+	if (cached != connections.end()) {
+		return cached->second;
 	}
+	if (match.config.IsSnapshot()) {
+		// The fingerprint is the cache key: a stored secret edited so that its properties no longer match it could
+		// otherwise share another configuration's connection.
+		auto properties =
+		    HdfsPropertiesFromValue(match.snapshot_properties, "HDFS secret '" + match.snapshot_name + "'");
+		if (HdfsConnectionConfig::Fingerprint(properties, match.config.user) != match.config.fingerprint) {
+			throw InvalidConfigurationException("HDFS secret '%s' was modified after it was created (its properties "
+			                                    "don't match its fingerprint): recreate it",
+			                                    match.snapshot_name);
+		}
+		match.config.properties = make_shared_ptr<map<string, string>>(std::move(properties));
+	}
+	auto connection = make_shared_ptr<HdfsConnection>(authority, std::move(match.config));
+	connections[key] = connection;
 	return connection;
+}
+
+map<string, string> HdfsPropertiesFromValue(const Value &value, const string &what) {
+	if (value.IsNull()) {
+		throw InvalidInputException("%s: PROPERTIES is NULL", what);
+	}
+	if (value.type().id() != LogicalTypeId::MAP) {
+		throw InvalidInputException("%s: PROPERTIES must be a MAP(VARCHAR, VARCHAR), not %s", what,
+		                            value.type().ToString());
+	}
+	map<string, string> result;
+	for (auto &entry : MapValue::GetChildren(value)) {
+		auto &key_value = StructValue::GetChildren(entry);
+		if (key_value[0].IsNull() || key_value[0].ToString().empty()) {
+			throw InvalidInputException("%s: a property name in PROPERTIES is NULL or empty", what);
+		}
+		auto key = key_value[0].ToString();
+		if (key_value[1].IsNull()) {
+			throw InvalidInputException("%s: property '%s' in PROPERTIES is NULL", what, key);
+		}
+		result[key] = key_value[1].ToString();
+	}
+	return result;
+}
+
+Value HdfsPropertiesToValue(const map<string, string> &properties) {
+	vector<Value> keys;
+	vector<Value> values;
+	for (auto &property : properties) {
+		keys.emplace_back(property.first);
+		values.emplace_back(property.second);
+	}
+	return Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(keys), std::move(values));
 }
 
 idx_t HdfsFileSystem::ResetConnections() {

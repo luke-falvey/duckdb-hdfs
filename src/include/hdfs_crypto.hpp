@@ -86,6 +86,9 @@ struct HdfsCrypto {
 	//! The decrypted key in a KMS decrypt response ({"material": "<base64>", ...}). Throws if there is none.
 	static string KmsDecryptedKey(const string &body);
 
+	//! SHA-256 of `data`, as 64 lowercase hex digits.
+	static string Sha256Hex(const string &data);
+
 	//! Overwrite a secret's bytes with zeros (in a way the compiler can't drop).
 	static void Wipe(string &secret);
 

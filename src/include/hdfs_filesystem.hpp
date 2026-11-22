@@ -10,6 +10,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "hdfs_client.hpp"
 
@@ -229,5 +230,11 @@ private:
 
 //! Registers hdfs_reset_connections().
 void RegisterHdfsConnectionFunctions(ExtensionLoader &loader, HdfsFileSystem &hdfs);
+
+//! The Hadoop properties in a MAP(VARCHAR, VARCHAR) value (a `config_snapshot` secret's PROPERTIES). Throws
+//! InvalidInputException, naming `what`, for a NULL map, a NULL or empty key, or a NULL value.
+map<string, string> HdfsPropertiesFromValue(const Value &value, const string &what);
+//! The properties as a MAP(VARCHAR, VARCHAR) value, in key order.
+Value HdfsPropertiesToValue(const map<string, string> &properties);
 
 } // namespace duckdb
