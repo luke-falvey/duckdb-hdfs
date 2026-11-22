@@ -1,0 +1,57 @@
+# name: test/sql/hdfs_snapshot_cluster.test
+# description: a config_snapshot secret holding test/hdfs-conf's properties works like that directory.
+# group: [sql]
+
+# run_hdfs_tests.sh runs this file with HADOOP_CONF_DIR pointing at an empty directory, so only the snapshot can say
+# where the NameNode and the KMS are: without it, hdfs:/// would have no NameNode.
+
+require hdfs
+
+require-env HDFS_TEST_RUNNING
+
+statement error
+SELECT count(*) FROM read_csv('hdfs:///test/data.csv');
+----
+no NameNode given
+
+# The properties of test/hdfs-conf/core-site.xml and hdfs-site.xml.
+statement ok
+CREATE SECRET snapshot (TYPE hdfs, PROVIDER config_snapshot, PROPERTIES MAP {
+    'fs.defaultFS': 'hdfs://localhost:9000',
+    'hadoop.security.key.provider.path': 'kms://http@localhost:9600/kms',
+    'dfs.client.use.datanode.hostname': 'true',
+    'dfs.default.blocksize': '1048576',
+    'dfs.blocksize': '1048576',
+    'dfs.prefetchsize': '2',
+    'dfs.replication': '1'});
+
+# fs.defaultFS comes from the snapshot...
+query IT
+SELECT id, name FROM read_csv('hdfs:///test/data.csv') ORDER BY id;
+----
+1	alice
+2	bob
+3	carol
+
+# ...and so does the KMS: a file the Java client encrypted reads back as plaintext.
+query IT
+SELECT id, name FROM read_csv('hdfs://localhost:9000/ez/java_written.csv') ORDER BY id;
+----
+1	alice
+2	bob
+3	carol
+
+# Writes use the snapshot's block size (libhdfs3's dfs.default.blocksize; its default is 64 MiB). Replication isn't
+# checked: libhdfs3 reads dfs.default.replica, not Hadoop's dfs.replication, for CONFIG_DIR configurations too.
+statement ok
+COPY (SELECT range AS n FROM range(300000)) TO 'hdfs://localhost:9000/test/snapshot_write.csv';
+
+query I
+SELECT block_size FROM hdfs_stat('hdfs://localhost:9000/test/snapshot_write.csv');
+----
+1048576
+
+query I
+SELECT sum(n) FROM read_csv('hdfs://localhost:9000/test/snapshot_write.csv');
+----
+44999850000

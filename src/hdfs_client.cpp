@@ -324,11 +324,23 @@ void ApplyHadoopDefaults(Hdfs::Config &conf) {
 	SetDefault(conf, "dfs.client.log.severity", "FATAL");
 }
 
-// Build the libhdfs3 config from core-site.xml / hdfs-site.xml (later files
-// override earlier ones), then apply the extension's defaults.
-Hdfs::Config LoadConfig(const char *explicit_dir) {
+// Build the libhdfs3 config: a snapshot's properties, else core-site.xml /
+// hdfs-site.xml (later files override earlier ones) from the config's
+// directory or the Hadoop environment; then apply the extension's defaults.
+// A snapshot never reads the environment, so it behaves the same anywhere.
+Hdfs::Config LoadConfig(const HdfsConnectionConfig &config) {
 	Hdfs::Config conf;
-	auto dir = ConfigDir(explicit_dir);
+	if (config.IsSnapshot()) {
+		if (!config.properties) {
+			throw InternalException("HDFS snapshot configuration without its properties");
+		}
+		for (auto &property : *config.properties) {
+			conf.set(property.first.c_str(), property.second);
+		}
+		ApplyHadoopDefaults(conf);
+		return conf;
+	}
+	auto dir = ConfigDir(config.config_dir.empty() ? nullptr : config.config_dir.c_str());
 	if (!dir.empty()) {
 		for (const char *file : {"core-site.xml", "hdfs-site.xml"}) {
 			auto path = dir + "/" + file;
@@ -1302,9 +1314,43 @@ shared_ptr<Logger> HdfsClient::GetThreadLogger() {
 }
 
 string HdfsConnectionConfig::Identity() const {
-	// "d1" tags a directory-or-environment config; a length prefix keeps the
-	// two strings apart whatever they contain (a VARCHAR can hold a NUL).
+	// "s1" tags a snapshot (its fingerprint covers the user), "d1" a
+	// directory-or-environment config; a length prefix keeps the two strings
+	// apart whatever they contain (a VARCHAR can hold a NUL). Not persisted.
+	if (IsSnapshot()) {
+		return "s1:" + fingerprint;
+	}
 	return "d1:" + std::to_string(config_dir.size()) + ":" + config_dir + ":" + user;
+}
+
+namespace {
+
+void AppendUint32(string &out, uint32_t value) {
+	for (int shift = 24; shift >= 0; shift -= 8) {
+		out += static_cast<char>((value >> shift) & 0xff);
+	}
+}
+
+void AppendLengthPrefixed(string &out, const string &value) {
+	AppendUint32(out, static_cast<uint32_t>(value.size()));
+	out += value;
+}
+
+} // namespace
+
+string HdfsConnectionConfig::Fingerprint(const map<string, string> &properties, const string &user) {
+	// Version 1: a tag, whether a user is set, the user, the property count,
+	// then each key and value in bytewise key order (std::map<string> compares
+	// with char_traits, i.e. memcmp). Lengths are 4-byte big-endian.
+	string preimage("duckdb-hdfs-config-v1", sizeof("duckdb-hdfs-config-v1"));
+	preimage += static_cast<char>(user.empty() ? 0 : 1);
+	AppendLengthPrefixed(preimage, user);
+	AppendUint32(preimage, static_cast<uint32_t>(properties.size()));
+	for (auto &property : properties) {
+		AppendLengthPrefixed(preimage, property.first);
+		AppendLengthPrefixed(preimage, property.second);
+	}
+	return HdfsCrypto::Sha256Hex(preimage);
 }
 
 shared_ptr<HdfsClient> HdfsClient::Connect(const string &authority, const HdfsConnectionConfig &config) {
@@ -1318,7 +1364,7 @@ shared_ptr<HdfsClient> HdfsClient::Connect(const string &authority, const HdfsCo
 		    !FileExists(config.config_dir + "/hdfs-site.xml")) {
 			ConfigError("config_dir '" + config.config_dir + "' has no core-site.xml or hdfs-site.xml");
 		}
-		auto conf = LoadConfig(config.config_dir.empty() ? nullptr : config.config_dir.c_str());
+		auto conf = LoadConfig(config);
 		SetLogSeverity(conf);
 		string auth = conf.getString("hadoop.security.authentication", "simple");
 		std::transform(auth.begin(), auth.end(), auth.begin(), [](unsigned char c) { return std::tolower(c); });

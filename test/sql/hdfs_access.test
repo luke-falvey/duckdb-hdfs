@@ -32,6 +32,11 @@ EXECUTE ls_data;
 ----
 IO Error
 
+# A snapshot secret made while access is allowed keeps working once it is disabled (it reads no local file).
+statement ok
+CREATE SECRET early_snapshot (TYPE hdfs, PROVIDER config_snapshot, SCOPE 'hdfs://127.0.0.1:1/allowed/snapshot',
+    PROPERTIES MAP {'hadoop.security.authentication': 'bogus'});
+
 statement ok
 SET enable_external_access = false;
 
@@ -240,3 +245,18 @@ statement error
 EXECUTE exists_data;
 ----
 Permission Error: Cannot access path "hdfs://127.0.0.1:1/data" - file system operations are disabled by configuration
+
+# --- config_snapshot secrets ----------------------------------------------------------
+
+# Properties name NameNodes, the KMS and local paths, so they can't be set from SQL while access is disabled...
+statement error
+CREATE SECRET late_snapshot (TYPE hdfs, PROVIDER config_snapshot, SCOPE 'hdfs://127.0.0.1:1/allowed/late',
+    PROPERTIES MAP {'fs.defaultFS': 'hdfs://elsewhere:8020'});
+----
+Permission Error: HDFS secret 'late_snapshot': PROPERTIES can't be set while enable_external_access = false
+
+# ...but one made beforehand is used without a check: the call gets as far as reading its configuration.
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/snapshot/x');
+----
+hadoop.security.authentication=bogus is not supported
