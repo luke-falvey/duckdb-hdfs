@@ -41,14 +41,15 @@ SELECT id, name FROM read_csv('hdfs://localhost:9000/ez/java_written.csv') ORDER
 2	bob
 3	carol
 
-# Writes use the snapshot's block size and replication.
+# Writes use the snapshot's block size (libhdfs3's dfs.default.blocksize; its default is 64 MiB). Replication isn't
+# checked: libhdfs3 reads dfs.default.replica, not Hadoop's dfs.replication, for CONFIG_DIR configurations too.
 statement ok
 COPY (SELECT range AS n FROM range(300000)) TO 'hdfs://localhost:9000/test/snapshot_write.csv';
 
-query II
-SELECT block_size, replication FROM hdfs_stat('hdfs://localhost:9000/test/snapshot_write.csv');
+query I
+SELECT block_size FROM hdfs_stat('hdfs://localhost:9000/test/snapshot_write.csv');
 ----
-1048576	1
+1048576
 
 query I
 SELECT sum(n) FROM read_csv('hdfs://localhost:9000/test/snapshot_write.csv');
