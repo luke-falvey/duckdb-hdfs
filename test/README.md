@@ -16,8 +16,12 @@ cluster used to exercise the `hdfs` extension end-to-end.
   `make test` (its own file, because a disabled file system can't be
   re-enabled).
 - `sql/hdfs_connections.test` — secret scope matching by whole path components,
-  connection replacement when a secret changes, `hdfs_reset_connections()`. No
-  cluster; `make test`.
+  connection sharing and replacement when a secret changes,
+  `hdfs_reset_connections()`. No cluster; `make test`.
+- `sql/hdfs_secret_provider.test` — a persistent `hdfs` secret with a provider
+  this version doesn't know (`data/hdfs_future_secret/`, written by its
+  `make_fixture.py`) is refused. No cluster; `make test` (its own file, because
+  `secret_directory` must be set before any secret is loaded).
 - `sql/hdfs.test` — integration tests run against a real HDFS. Gated behind
   `require-env HDFS_TEST_RUNNING`, so `make test` skips them unless a cluster is
   up. The tests that need the parquet extension come last, after a late

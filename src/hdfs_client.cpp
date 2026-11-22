@@ -281,18 +281,11 @@ void SetDefault(Hdfs::Config &conf, const char *key, const string &value) {
 	}
 }
 
-// Build the libhdfs3 config from core-site.xml / hdfs-site.xml.
-Hdfs::Config LoadConfig(const char *explicit_dir) {
-	Hdfs::Config conf;
-	auto dir = ConfigDir(explicit_dir);
-	if (!dir.empty()) {
-		for (const char *file : {"core-site.xml", "hdfs-site.xml"}) {
-			auto path = dir + "/" + file;
-			if (FileExists(path)) {
-				conf.update(path.c_str());
-			}
-		}
-	}
+// Map the Hadoop settings in `conf` to libhdfs3's names, and fill in the
+// extension's defaults for what the config leaves unset. Runs after the
+// configuration is read, whatever it was read from, so defaults are never
+// part of the configuration itself.
+void ApplyHadoopDefaults(Hdfs::Config &conf) {
 	// libhdfs3 has its own setting names and much longer defaults than the
 	// Hadoop Java client (e.g. 10 connect retries, hour-long timeouts). Use the
 	// Hadoop setting when the cluster config has one, else a Hadoop-like default.
@@ -329,6 +322,22 @@ Hdfs::Config LoadConfig(const char *explicit_dir) {
 	// a new TCP (and, on secure clusters, SASL) handshake follows.
 	SetDefault(conf, "dfs.client.socketcache.capacity", "64");
 	SetDefault(conf, "dfs.client.log.severity", "FATAL");
+}
+
+// Build the libhdfs3 config from core-site.xml / hdfs-site.xml (later files
+// override earlier ones), then apply the extension's defaults.
+Hdfs::Config LoadConfig(const char *explicit_dir) {
+	Hdfs::Config conf;
+	auto dir = ConfigDir(explicit_dir);
+	if (!dir.empty()) {
+		for (const char *file : {"core-site.xml", "hdfs-site.xml"}) {
+			auto path = dir + "/" + file;
+			if (FileExists(path)) {
+				conf.update(path.c_str());
+			}
+		}
+	}
+	ApplyHadoopDefaults(conf);
 	return conf;
 }
 // --- paths and entries --------------------------------------------------------
@@ -1290,6 +1299,12 @@ void HdfsClient::SetThreadLogger(const shared_ptr<Logger> &logger) {
 
 shared_ptr<Logger> HdfsClient::GetThreadLogger() {
 	return ThreadLogger().lock();
+}
+
+string HdfsConnectionConfig::Identity() const {
+	// "d1" tags a directory-or-environment config; a length prefix keeps the
+	// two strings apart whatever they contain (a VARCHAR can hold a NUL).
+	return "d1:" + std::to_string(config_dir.size()) + ":" + config_dir + ":" + user;
 }
 
 shared_ptr<HdfsClient> HdfsClient::Connect(const string &authority, const HdfsConnectionConfig &config) {

@@ -3,7 +3,9 @@
 # group: [sql]
 
 # A secret's CONFIG_DIR is checked before any network access, so a missing one tells which secret a URL resolved
-# to: no NameNode is needed.
+# to: no NameNode is needed. Only the last case (a secret without CONFIG_DIR) reads the Hadoop environment and tries
+# to connect (to port 1, where nothing listens); it checks only that the call fails, so the environment doesn't
+# matter much.
 
 require hdfs
 
@@ -49,7 +51,8 @@ SELECT hdfs_exists('hdfs://127.0.0.1:1/scoped/a.csv');
 ----
 config_dir '/nonexistent_replaced' has no core-site.xml or hdfs-site.xml
 
-# hdfs_reset_connections() drops every cached connection (one per NameNode and secret) and returns how many.
+# hdfs_reset_connections() drops every cached connection (one per NameNode and configuration) and returns how many.
+# Two: the replaced secret released its old connection.
 query I
 SELECT connections_dropped FROM hdfs_reset_connections();
 ----
@@ -60,11 +63,162 @@ SELECT connections_dropped FROM hdfs_reset_connections();
 ----
 0
 
+# Secrets that configure a NameNode the same way share its connection.
 statement ok
-CALL hdfs_reset_connections();
+CREATE SECRET same_a (TYPE hdfs, SCOPE 'hdfs://127.0.0.1:1/same_a', CONFIG_DIR '/nonexistent_same');
+
+statement ok
+CREATE SECRET same_b (TYPE hdfs, SCOPE 'hdfs://127.0.0.1:1/same_b', CONFIG_DIR '/nonexistent_same');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/same_a/x');
+----
+config_dir '/nonexistent_same' has no core-site.xml or hdfs-site.xml
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/same_b/x');
+----
+config_dir '/nonexistent_same' has no core-site.xml or hdfs-site.xml
+
+query I
+SELECT connections_dropped FROM hdfs_reset_connections();
+----
+1
+
+# A secret replaced and then replaced back holds one connection, not one per configuration it had.
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/scoped/a.csv');
+----
+config_dir '/nonexistent_replaced' has no core-site.xml or hdfs-site.xml
+
+statement ok
+CREATE OR REPLACE SECRET scoped (TYPE hdfs, SCOPE 'hdfs://127.0.0.1:1/scoped', CONFIG_DIR '/nonexistent_scoped');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/scoped/a.csv');
+----
+config_dir '/nonexistent_scoped' has no core-site.xml or hdfs-site.xml
+
+statement ok
+CREATE OR REPLACE SECRET scoped (TYPE hdfs, SCOPE 'hdfs://127.0.0.1:1/scoped', CONFIG_DIR '/nonexistent_replaced');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/scoped/a.csv');
+----
+config_dir '/nonexistent_replaced' has no core-site.xml or hdfs-site.xml
+
+query I
+SELECT connections_dropped FROM hdfs_reset_connections();
+----
+1
+
+# Replacing one of two secrets that share a connection keeps the shared connection for the other: two connections.
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/same_a/x');
+----
+config_dir '/nonexistent_same' has no core-site.xml or hdfs-site.xml
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/same_b/x');
+----
+config_dir '/nonexistent_same' has no core-site.xml or hdfs-site.xml
+
+statement ok
+CREATE OR REPLACE SECRET same_a (TYPE hdfs, SCOPE 'hdfs://127.0.0.1:1/same_a', CONFIG_DIR '/nonexistent_moved');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/same_a/x');
+----
+config_dir '/nonexistent_moved' has no core-site.xml or hdfs-site.xml
+
+query I
+SELECT connections_dropped FROM hdfs_reset_connections();
+----
+2
+
+# USER is part of the configuration: the same CONFIG_DIR as another user is another connection.
+statement ok
+CREATE SECRET same_dir_other_user (TYPE hdfs, SCOPE 'hdfs://127.0.0.1:1/other_user', CONFIG_DIR '/nonexistent_same',
+    USER 'someone_else');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/same_b/x');
+----
+config_dir '/nonexistent_same' has no core-site.xml or hdfs-site.xml
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/other_user/x');
+----
+config_dir '/nonexistent_same' has no core-site.xml or hdfs-site.xml
+
+query I
+SELECT connections_dropped FROM hdfs_reset_connections();
+----
+2
+
+# A host name given with a port is a DNS name, so its case doesn't matter: one NameNode, one connection.
+statement ok
+CREATE SECRET lower_host (TYPE hdfs, SCOPE 'hdfs://localhost:1/', CONFIG_DIR '/nonexistent_same');
+
+statement ok
+CREATE SECRET upper_host (TYPE hdfs, SCOPE 'hdfs://LOCALHOST:1/', CONFIG_DIR '/nonexistent_same');
+
+statement error
+SELECT hdfs_exists('hdfs://localhost:1/x');
+----
+config_dir '/nonexistent_same' has no core-site.xml or hdfs-site.xml
+
+statement error
+SELECT hdfs_exists('hdfs://LOCALHOST:1/x');
+----
+config_dir '/nonexistent_same' has no core-site.xml or hdfs-site.xml
+
+query I
+SELECT connections_dropped FROM hdfs_reset_connections();
+----
+1
 
 statement ok
 DROP SECRET scoped;
 
 statement ok
 DROP SECRET catchall;
+
+statement ok
+DROP SECRET same_a;
+
+statement ok
+DROP SECRET same_b;
+
+statement ok
+DROP SECRET same_dir_other_user;
+
+statement ok
+DROP SECRET lower_host;
+
+statement ok
+DROP SECRET upper_host;
+
+# A secret without parameters configures a NameNode like no secret at all (the Hadoop environment), so a URL in its
+# scope and one outside any scope share a connection. Both calls fail, since nothing answers on port 1; how they fail
+# depends on the environment's configuration (e.g. a Kerberos one), but the error names the NameNode either way.
+statement ok
+CREATE SECRET empty (TYPE hdfs, SCOPE 'hdfs://127.0.0.1:1/empty');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/empty/x');
+----
+127.0.0.1:1
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/elsewhere/x');
+----
+127.0.0.1:1
+
+query I
+SELECT connections_dropped FROM hdfs_reset_connections();
+----
+1
+
+statement ok
+DROP SECRET empty;

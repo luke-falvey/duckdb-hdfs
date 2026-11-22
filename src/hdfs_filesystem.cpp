@@ -387,6 +387,18 @@ HdfsSecretMatch LookupSecret(const string &url, optional_ptr<FileOpener> opener)
 			}
 		}
 		if (scopes.empty() || ScopeCovers(longest, url)) {
+			// Persistent secrets are read back as plain key-value secrets whatever provider wrote them, so one
+			// written by a newer version of the extension (another provider, other keys) reaches this build too.
+			// Refuse it: read as a `config` secret it would have no CONFIG_DIR, and would silently connect through
+			// the Hadoop environment instead.
+			if (secret.GetProvider() != HDFS_SECRET_PROVIDER_CONFIG) {
+				auto name = secret.GetName().GetIdentifierName();
+				throw InvalidConfigurationException(
+				    "HDFS secret '%s' has provider '%s', which this version of the hdfs extension does not support (it "
+				    "may have been created by a newer version). Update the hdfs extension, or remove the secret with "
+				    "DROP PERSISTENT SECRET %s",
+				    name, secret.GetProvider().GetIdentifierName(), name);
+			}
 			auto &kv_secret = secret.Cast<KeyValueSecret>();
 			Value value;
 			if (kv_secret.TryGetValue("config_dir", value) && !value.IsNull()) {
@@ -396,7 +408,9 @@ HdfsSecretMatch LookupSecret(const string &url, optional_ptr<FileOpener> opener)
 			if (kv_secret.TryGetValue("user", value) && !value.IsNull()) {
 				result.config.user = value.ToString();
 			}
-			result.secret = match.secret_entry->storage_mode + "." + secret.GetName();
+			// Secret names are case-insensitive: a secret replaced under another spelling is the same secret.
+			result.secret =
+			    match.secret_entry->storage_mode + "." + StringUtil::Lower(secret.GetName().GetIdentifierName());
 			return result;
 		}
 		// `longest` ends inside a component: retry with the URL cut at the last '/' before that point.
@@ -423,8 +437,15 @@ string NormalizeAuthority(const string &authority) {
 	return authority.substr(0, host_start) + StringUtil::Lower(authority.substr(host_start));
 }
 
+//! Whether two configs name the same configuration (directory and user; not the files' contents nor the environment).
 bool SameConfig(const HdfsConnectionConfig &a, const HdfsConnectionConfig &b) {
-	return a.config_dir == b.config_dir && a.user == b.user;
+	return a.Identity() == b.Identity();
+}
+
+//! `authority` (normalized) followed by `suffix`, length-prefixed so that no authority and suffix can run together.
+string AuthorityKey(const string &authority, const string &suffix) {
+	auto normalized = NormalizeAuthority(authority);
+	return std::to_string(normalized.size()) + ":" + normalized + suffix;
 }
 
 } // namespace
@@ -434,12 +455,28 @@ shared_ptr<HdfsConnection> HdfsFileSystem::GetConnection(const string &url, cons
 	// Every operation gets its connection here first: log its NameNode RPCs to the caller's query (HDFS log type).
 	HdfsClient::SetThreadLogger(HdfsLoggerFor(opener));
 	auto match = LookupSecret(url, opener);
-	// One connection per authority and secret: when the secret is replaced with a new configuration, so is its
-	// connection. Open files and listings keep the client they hold.
-	auto key = NormalizeAuthority(authority) + '\0' + match.secret;
+	// One connection per NameNode and configuration: secrets (or no secret) that configure a NameNode the same way
+	// share it, and a connection failure drops the client for all of them. Each secret owns the entry it last used,
+	// so when it is replaced with a new configuration, its old connection is dropped unless another secret still
+	// uses it. Owners of dropped secrets stay until hdfs_reset_connections(), so their connections do too. Open files
+	// and listings keep the client they hold.
+	// The secret lookup (and with it the CONFIG_DIR access check) runs on every call, before the cache: a cached or
+	// shared connection must never let a URL skip it.
+	auto key = AuthorityKey(authority, match.config.Identity());
+	auto owner = AuthorityKey(authority, match.secret);
 	lock_guard<mutex> guard(connections_lock);
+	auto &owned = connection_owners[owner];
+	if (owned != key) {
+		auto previous = std::move(owned);
+		owned = key;
+		if (!previous.empty() &&
+		    std::none_of(connection_owners.begin(), connection_owners.end(),
+		                 [&](const pair<const string, string> &entry) { return entry.second == previous; })) {
+			connections.erase(previous);
+		}
+	}
 	auto &connection = connections[key];
-	if (!connection || !SameConfig(connection->config, match.config)) {
+	if (!connection) {
 		connection = make_shared_ptr<HdfsConnection>(authority, std::move(match.config));
 	}
 	return connection;
@@ -449,6 +486,7 @@ idx_t HdfsFileSystem::ResetConnections() {
 	lock_guard<mutex> guard(connections_lock);
 	auto count = connections.size();
 	connections.clear();
+	connection_owners.clear();
 	return count;
 }
 
@@ -950,8 +988,8 @@ void HdfsFileSystem::MoveFile(const string &source, const string &target, option
 	auto target_connection = GetConnection(target, target_authority, opener);
 	if (!SameConfig(connection->config, target_connection->config)) {
 		throw NotImplementedException(
-		    "Cannot move HDFS file '%s' -> '%s': the two paths are configured by different hdfs secrets", source,
-		    target);
+		    "Cannot move HDFS file '%s' -> '%s': the two paths resolve to hdfs secrets with different configurations",
+		    source, target);
 	}
 	try {
 		// The source's identity (file id, else length), to recognise a rename that took effect before a connection

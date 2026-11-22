@@ -26,12 +26,12 @@ static void RegisterHdfsSecret(ExtensionLoader &loader) {
 	SecretType secret_type;
 	secret_type.name = "hdfs";
 	secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
-	secret_type.default_provider = "config";
+	secret_type.default_provider = HDFS_SECRET_PROVIDER_CONFIG;
 	loader.RegisterSecretType(secret_type);
 
 	CreateSecretFunction config_function;
 	config_function.secret_type = "hdfs";
-	config_function.provider = "config";
+	config_function.provider = HDFS_SECRET_PROVIDER_CONFIG;
 	config_function.function = CreateHdfsSecretFromConfig;
 	config_function.named_parameters["config_dir"] = LogicalType::VARCHAR;
 	config_function.named_parameters["user"] = LogicalType::VARCHAR;
