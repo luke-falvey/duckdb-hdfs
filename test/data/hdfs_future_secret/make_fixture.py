@@ -3,6 +3,7 @@
 # length-prefixed strings are patched in place to strings of the same length.
 # Usage: python -m venv v && v/bin/pip install duckdb==1.4.1 && v/bin/python make_fixture.py <output dir>
 import duckdb, sys, pathlib
+
 d = pathlib.Path(sys.argv[1]).resolve()
 con = duckdb.connect()
 con.execute(f"SET secret_directory = '{d}'")

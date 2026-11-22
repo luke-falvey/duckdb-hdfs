@@ -48,3 +48,14 @@ test_batch:
 	./build/unit_test/hdfs_batch_test
 
 .PHONY: test_unit test_glob test_functions test_crypto test_batch
+
+# DuckDB reads a persistent secret file only if it is private (mode 0600), and git checks files out as 0644: make
+# the provider-guard fixture (test/sql/hdfs_secret_provider.test) private before the SQL tests run.
+SECRET_FIXTURES = $(wildcard test/data/*/*.duckdb_secret)
+
+secret_fixture_permissions:
+	chmod 600 $(SECRET_FIXTURES)
+
+test test_release test_debug test_reldebug: secret_fixture_permissions
+
+.PHONY: secret_fixture_permissions

@@ -5,7 +5,7 @@
 # A secret's CONFIG_DIR is checked before any network access, so a missing one tells which secret a URL resolved
 # to: no NameNode is needed. Only the last case (a secret without CONFIG_DIR) reads the Hadoop environment and tries
 # to connect (to port 1, where nothing listens); it checks only that the call fails, so the environment doesn't
-# matter.
+# matter much.
 
 require hdfs
 
@@ -200,16 +200,20 @@ statement ok
 DROP SECRET upper_host;
 
 # A secret without parameters configures a NameNode like no secret at all (the Hadoop environment), so a URL in its
-# scope and one outside any scope share a connection. Both calls fail: with no cluster configuration nothing answers
-# on port 1 (the error then depends on the environment, so it isn't checked).
+# scope and one outside any scope share a connection. Both calls fail, since nothing answers on port 1; how they fail
+# depends on the environment's configuration (e.g. a Kerberos one), but the error names the NameNode either way.
 statement ok
 CREATE SECRET empty (TYPE hdfs, SCOPE 'hdfs://127.0.0.1:1/empty');
 
 statement error
 SELECT hdfs_exists('hdfs://127.0.0.1:1/empty/x');
+----
+127.0.0.1:1
 
 statement error
 SELECT hdfs_exists('hdfs://127.0.0.1:1/elsewhere/x');
+----
+127.0.0.1:1
 
 query I
 SELECT connections_dropped FROM hdfs_reset_connections();

@@ -409,7 +409,8 @@ HdfsSecretMatch LookupSecret(const string &url, optional_ptr<FileOpener> opener)
 				result.config.user = value.ToString();
 			}
 			// Secret names are case-insensitive: a secret replaced under another spelling is the same secret.
-			result.secret = match.secret_entry->storage_mode + "." + StringUtil::Lower(secret.GetName().GetIdentifierName());
+			result.secret =
+			    match.secret_entry->storage_mode + "." + StringUtil::Lower(secret.GetName().GetIdentifierName());
 			return result;
 		}
 		// `longest` ends inside a component: retry with the URL cut at the last '/' before that point.
