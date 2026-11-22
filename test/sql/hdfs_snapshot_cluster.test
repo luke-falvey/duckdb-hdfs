@@ -1,6 +1,5 @@
 # name: test/sql/hdfs_snapshot_cluster.test
-# description: a config_snapshot secret holding test/hdfs-conf's properties works like that directory, against the
-#              test cluster.
+# description: a config_snapshot secret holding test/hdfs-conf's properties works like that directory.
 # group: [sql]
 
 # run_hdfs_tests.sh runs this file with HADOOP_CONF_DIR pointing at an empty directory, so only the snapshot can say
