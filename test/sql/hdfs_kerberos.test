@@ -11,6 +11,8 @@ require parquet
 
 require-env HDFS_KERBEROS_TEST_RUNNING
 
+require-env HADOOP_CONF_DIR
+
 statement ok
 COPY (SELECT range AS n, md5(range::VARCHAR) AS h FROM range(100000))
 TO 'hdfs://localhost:19000/krb/data.parquet' (FORMAT parquet, ROW_GROUP_SIZE 10000);
@@ -63,3 +65,31 @@ query I
 SELECT hdfs_exists('hdfs://localhost:19000/krb/tmp.csv');
 ----
 true
+
+# A config_snapshot secret captured from this mode's client configuration works the same (wire protection
+# included); the identity is still the local ticket's principal, so USER is still an error.
+statement ok
+CREATE SECRET krb_snapshot (TYPE hdfs, PROVIDER config_snapshot, SCOPE 'hdfs://localhost:19000/krb/snapshot',
+    CONFIG_DIR '${HADOOP_CONF_DIR}');
+
+statement ok
+COPY (SELECT 3 AS v) TO 'hdfs://localhost:19000/krb/snapshot/s.csv' (FORMAT csv, HEADER);
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:19000/krb/snapshot/s.csv');
+----
+3
+
+query T
+SELECT owner FROM hdfs_stat('hdfs://localhost:19000/krb/snapshot/s.csv');
+----
+hadoop
+
+statement ok
+CREATE SECRET krb_snapshot_user (TYPE hdfs, PROVIDER config_snapshot, SCOPE 'hdfs://localhost:19000/krb/as_user',
+    CONFIG_DIR '${HADOOP_CONF_DIR}', USER 'someone');
+
+statement error
+SELECT hdfs_exists('hdfs://localhost:19000/krb/as_user/x');
+----
+a user can't be set on a Kerberos cluster

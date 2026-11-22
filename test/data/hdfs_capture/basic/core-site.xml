@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<!-- Captured by hdfs_snapshot_secret.test: hdfs-site.xml overrides the authentication set here. -->
+<configuration>
+    <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://127.0.0.1:1</value>
+    </property>
+    <property>
+        <name>hadoop.security.authentication</name>
+        <value>core_bogus</value>
+    </property>
+    <!-- Another service's credential: dropped from the snapshot, and listed in dropped_keys. -->
+    <property>
+        <name>fs.s3a.secret.key</name>
+        <value>not-really-a-secret</value>
+    </property>
+    <!-- A name without a value is an empty value, as in libhdfs3. -->
+    <property>
+        <name>duckdb.test.empty</name>
+    </property>
+    <!-- Not interpreted: no ${...} substitution, and <final> is ignored. -->
+    <property>
+        <name>duckdb.test.literal</name>
+        <value>${user.name}</value>
+        <final>true</final>
+    </property>
+</configuration>

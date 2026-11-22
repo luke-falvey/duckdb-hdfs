@@ -12,7 +12,7 @@ require hdfs
 
 # '/data/' is a local directory: it must not grant access to /data on HDFS.
 statement ok
-SET allowed_directories = ['hdfs://127.0.0.1:1/allowed', '/data/'];
+SET allowed_directories = ['hdfs://127.0.0.1:1/allowed', '/data/', '{TEST_DIR}/'];
 
 statement ok
 SET allowed_paths = ['hdfs://127.0.0.1:1/one.csv'];
@@ -31,6 +31,11 @@ statement error
 EXECUTE ls_data;
 ----
 IO Error
+
+# A Hadoop configuration in an allowed directory, for a config_snapshot secret to capture below.
+statement ok
+COPY (SELECT '<configuration><property><name>hadoop.security.authentication</name><value>captured_bogus</value></property></configuration>')
+TO '{TEST_DIR}/core-site.xml' (FORMAT csv, HEADER false);
 
 # A snapshot secret made while access is allowed keeps working once it is disabled (it reads no local file).
 statement ok
@@ -260,3 +265,19 @@ statement error
 SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/snapshot/x');
 ----
 hadoop.security.authentication=bogus is not supported
+
+# CONFIG_DIR is read through DuckDB's file system, so a directory allowed_directories covers can be captured...
+statement ok
+CREATE SECRET allowed_capture (TYPE hdfs, PROVIDER config_snapshot, SCOPE 'hdfs://127.0.0.1:1/allowed/captured',
+    CONFIG_DIR '{TEST_DIR}');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/captured/x');
+----
+hadoop.security.authentication=captured_bogus is not supported
+
+# ...and any other can't.
+statement error
+CREATE SECRET outside_capture (TYPE hdfs, PROVIDER config_snapshot, CONFIG_DIR '/etc/hadoop');
+----
+Permission Error

@@ -19,11 +19,13 @@ cluster used to exercise the `hdfs` extension end-to-end.
   connection sharing and replacement when a secret changes,
   `hdfs_reset_connections()`. No cluster; `make test`.
 - `sql/hdfs_snapshot_secret.test` — `config_snapshot` secrets: validation,
-  refused credentials, use without any XML file, connection sharing, and a
-  persistent secret across a restart. No cluster; `make test`.
+  refused credentials, use without any XML file, capture from a `CONFIG_DIR`
+  (`data/hdfs_capture/`: precedence, dropped credentials, entities, malformed
+  files), connection sharing, and a persistent secret across a restart. No
+  cluster; `make test`.
 - `sql/hdfs_snapshot_cluster.test` — a `config_snapshot` secret holding
-  `hdfs-conf/`'s properties reads, decrypts (KMS) and writes like that
-  directory. Cluster; `run_hdfs_tests.sh` runs it with an empty
+  `hdfs-conf/`'s properties, given and captured, reads, decrypts (KMS) and
+  writes like that directory. Cluster; `run_hdfs_tests.sh` runs it with an empty
   `HADOOP_CONF_DIR`, so only the snapshot configures the client.
 - `sql/hdfs_secret_provider.test` — a persistent `hdfs` secret with a provider
   this version doesn't know (`data/hdfs_future_secret/`, written by its
@@ -48,6 +50,9 @@ cluster used to exercise the `hdfs` extension end-to-end.
   and a failed write. Cluster; `run_hdfs_tests.sh`.
 - `sql/hdfs_glob.test` — glob semantics (wildcards, classes, `**`, braces,
   hidden names) against a fixture tree it creates under `/globtest`.
+- `cpp/hdfs_hadoop_xml_test.cpp` — the Hadoop XML parser `config_snapshot`
+  secrets capture a `CONFIG_DIR` with, case by case and against libhdfs3's own
+  parser (`make test_unit`, after `make`; it links libhdfs3).
 - `cpp/hdfs_glob_test.cpp`, `cpp/hdfs_functions_test.cpp`,
   `cpp/hdfs_crypto_test.cpp`, `cpp/hdfs_batch_test.cpp` — C++ unit tests for
   the glob planner (brace expansion and its bounds, roots, hidden names,

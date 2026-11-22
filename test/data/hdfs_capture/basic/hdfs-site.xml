@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<configuration>
+    <property>
+        <name>hadoop.security.authentication</name>
+        <value>bogus</value>
+    </property>
+    <property>
+        <name>dfs.client.socket-timeout</name>
+        <value>30000</value>
+    </property>
+</configuration>
