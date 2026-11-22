@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<!-- An external entity must not read a local file into the secret: entities are never expanded. -->
+<!DOCTYPE configuration [ <!ENTITY leak SYSTEM "file:///etc/hostname"> ]>
+<configuration>
+    <property>
+        <name>duckdb.test.leak</name>
+        <value>&leak;</value>
+    </property>
+    <property>
+        <name>hadoop.security.authentication</name>
+        <value>bogus</value>
+    </property>
+</configuration>

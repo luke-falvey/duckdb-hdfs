@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<configuration>
+    <setting><name>fs.defaultFS</name><value>hdfs://127.0.0.1:1</value></setting>
+</configuration>

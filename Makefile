@@ -19,7 +19,7 @@ UNIT_PKGS = libcurl libssl libcrypto
 UNIT_CXXFLAGS = -std=c++17 -O1 -Wall -Wextra -Isrc/include -Iduckdb/src/include
 DUCKDB_STATIC_LIBS = $(BUILD_DIR)/src/libduckdb_static.a $(wildcard $(BUILD_DIR)/third_party/*/libduckdb_*.a)
 
-test_unit: test_glob test_functions test_crypto test_batch
+test_unit: test_glob test_functions test_crypto test_batch test_hadoop_xml
 
 test_glob:
 	mkdir -p build/unit_test
@@ -47,7 +47,21 @@ test_batch:
 	$(CXX) $(UNIT_CXXFLAGS) test/cpp/hdfs_batch_test.cpp -o build/unit_test/hdfs_batch_test
 	./build/unit_test/hdfs_batch_test
 
-.PHONY: test_unit test_glob test_functions test_crypto test_batch
+# The Hadoop XML parser is checked against libhdfs3's own (its Config class), so this links libhdfs3 too.
+HADOOP_XML_PKGS = libxml-2.0 protobuf libgsasl mit-krb5-gssapi openssl
+LIBHDFS3_INCLUDE = $(VCPKG_INSTALLED_DIR)/include/libhdfs3
+
+test_hadoop_xml:
+	@test -n "$(VCPKG_INSTALLED_DIR)" || { echo "No vcpkg packages under $(BUILD_DIR); run make first"; exit 1; }
+	mkdir -p build/unit_test
+	$(CXX) $(UNIT_CXXFLAGS) -I$(LIBHDFS3_INCLUDE) -I$(LIBHDFS3_INCLUDE)/common \
+		src/hdfs_hadoop_xml.cpp test/cpp/hdfs_hadoop_xml_test.cpp \
+		-Wl,--start-group $(DUCKDB_STATIC_LIBS) $(VCPKG_INSTALLED_DIR)/lib/libhdfs3.a -Wl,--end-group \
+		$$(PKG_CONFIG_PATH=$(VCPKG_INSTALLED_DIR)/lib/pkgconfig pkg-config --static --cflags --libs $(HADOOP_XML_PKGS)) \
+		-lpthread -ldl -o build/unit_test/hdfs_hadoop_xml_test
+	./build/unit_test/hdfs_hadoop_xml_test
+
+.PHONY: test_unit test_glob test_functions test_crypto test_batch test_hadoop_xml
 
 # DuckDB reads a persistent secret file only if it is private (mode 0600), and git checks files out as 0644: make
 # the provider-guard fixture (test/sql/hdfs_secret_provider.test) private before the SQL tests run.

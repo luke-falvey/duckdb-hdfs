@@ -1,6 +1,7 @@
 {
         "dependencies": [
                 "libhdfs3",
+                "libxml2",
                 "openssl",
                 {
                         "name": "curl",

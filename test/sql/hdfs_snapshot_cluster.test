@@ -55,3 +55,20 @@ query I
 SELECT sum(n) FROM read_csv('hdfs://localhost:9000/test/snapshot_write.csv');
 ----
 44999850000
+
+# The same configuration captured from test/hdfs-conf (read now, through DuckDB's file system) works the same.
+statement ok
+CREATE SECRET captured (TYPE hdfs, PROVIDER config_snapshot, SCOPE 'hdfs://localhost:9000/ez/',
+    CONFIG_DIR 'test/hdfs-conf');
+
+query I
+SELECT secret_string LIKE '%captured_from=test/hdfs-conf;dropped_keys=[];%' FROM duckdb_secrets() WHERE name = 'captured';
+----
+true
+
+query IT
+SELECT id, name FROM read_csv('hdfs://localhost:9000/ez/java_written.csv') ORDER BY id;
+----
+1	alice
+2	bob
+3	carol

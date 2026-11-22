@@ -327,8 +327,22 @@ can write to an allowed directory can also write a `core-site.xml` there).
 #### Configuration snapshots
 
 A `config_snapshot` secret holds the Hadoop configuration itself, as the
-properties a `core-site.xml` / `hdfs-site.xml` would set, so a persistent
-secret keeps working without any file on the machine:
+properties a `core-site.xml` / `hdfs-site.xml` set, so a persistent secret keeps
+working without any file on the machine. Capture an existing client
+configuration once:
+
+```sql
+CREATE PERSISTENT SECRET prod (
+    TYPE hdfs,
+    PROVIDER config_snapshot,
+    SCOPE 'hdfs://prod-ns/',
+    CONFIG_DIR '/etc/hadoop/prod',  -- read now; the directory isn't kept
+    USER 'analytics'                -- optional; simple authentication only
+);
+```
+
+or give the properties yourself (`PROPERTIES` also overrides a `CONFIG_DIR`'s
+values):
 
 ```sql
 CREATE PERSISTENT SECRET prod (
@@ -343,26 +357,32 @@ CREATE PERSISTENT SECRET prod (
         'dfs.namenode.rpc-address.prod-ns.nn2': 'nn2.example.com:8020',
         'dfs.client.failover.proxy.provider.prod-ns':
             'org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider'
-    },
-    USER 'analytics'                -- optional; simple authentication only
+    }
 );
 ```
 
+- `CONFIG_DIR` is read when the secret is created, as the client reads it at
+  connect: `core-site.xml`, then `hdfs-site.xml` over it (one of them must
+  exist). The files are read through DuckDB's file system, so
+  `enable_external_access`, `allowed_directories` and `allowed_paths` apply.
+  `duckdb_secrets()` shows the directory as `captured_from`.
 - The properties are the whole configuration: no XML file and no
-  `HADOOP_CONF_DIR` is read. `HADOOP_USER_NAME` still applies without `USER`,
-  and on a Kerberos cluster the identity is still the local ticket cache's
-  principal (the ticket and `krb5.conf` stay on the machine).
-- Values are stored as given (no `${...}` substitution, as libhdfs3 does with
-  XML files). The extension's defaults (timeouts, retries) apply on top, as
-  for `CONFIG_DIR`.
-- Credentials are refused: a property whose name contains `password`,
-  `passwd`, `secret` or `keytab`, or starts with
-  `hadoop.security.credential.`, is an error. Secrets are stored unencrypted,
-  and nothing is redacted in `duckdb_secrets()`.
-- The properties can't be set while `enable_external_access = false` (they
-  name NameNodes, the KMS and local paths); a snapshot created before external
-  access was disabled keeps working.
-- A snapshot doesn't change when the cluster does: to pick up a new
+  `HADOOP_CONF_DIR` is read when connecting. `HADOOP_USER_NAME` still applies
+  without `USER`, and on a Kerberos cluster the identity is still the local
+  ticket cache's principal (the ticket and `krb5.conf` stay on the machine).
+- Values are kept as written: no `${...}` substitution, `<final>` ignored, no
+  entities, as libhdfs3 reads XML files. The extension's defaults (timeouts,
+  retries) apply on top, as for `CONFIG_DIR`.
+- Credentials are never stored: a property whose name contains `password`,
+  `passwd`, `secret` or `keytab`, or starts with `hadoop.security.credential.`,
+  is left out of a captured configuration (`duckdb_secrets()` lists it in
+  `dropped_keys`) and is an error in `PROPERTIES`. Secrets are stored
+  unencrypted, and nothing is redacted in `duckdb_secrets()`.
+- `PROPERTIES` can't be set while `enable_external_access = false` (they name
+  NameNodes, the KMS and local paths); a `CONFIG_DIR` in `allowed_directories`
+  can still be captured, and a snapshot created before external access was
+  disabled keeps working.
+- A snapshot doesn't change when the files or the cluster do: to pick up a new
   configuration, `CREATE OR REPLACE` the secret. A stored secret whose
   properties were edited by hand is refused.
 
