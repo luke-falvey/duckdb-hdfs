@@ -70,6 +70,9 @@ struct HdfsWalkOptions {
 	static constexpr idx_t MAX_PARALLELISM = 64;
 };
 
+//! The provider of the `hdfs` secrets this version creates and reads (CREATE SECRET (TYPE hdfs, PROVIDER config)).
+static constexpr const char *HDFS_SECRET_PROVIDER_CONFIG = "config";
+
 //! Where a connection's configuration comes from (an `hdfs` secret); empty fields fall back to the Hadoop
 //! environment (HADOOP_CONF_DIR or HADOOP_HOME/etc/hadoop, HADOOP_USER_NAME).
 struct HdfsConnectionConfig {

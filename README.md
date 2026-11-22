@@ -332,13 +332,18 @@ can write to an allowed directory can also write a `core-site.xml` there).
   needs its source and target to resolve to the same configuration.
 - **Connections are cached** per NameNode and configuration (`CONFIG_DIR` and
   `USER`), for the database's lifetime: secrets that configure a NameNode the
-  same way share one connection. Replacing a secret (`CREATE OR REPLACE
-  SECRET`) with a new configuration replaces its connection. To pick up other
-  changes (an edited
-  `core-site.xml` / `hdfs-site.xml`, a new Kerberos ticket cache, environment
-  variables) or to release the connections of dropped secrets, call
-  `hdfs_reset_connections()`; it returns how many connections it dropped.
+  same way share one connection (a secret without parameters shares the one
+  URLs without a secret use). Replacing a secret (`CREATE OR REPLACE SECRET`)
+  with a new configuration replaces its connection. To pick up other changes
+  (an edited `core-site.xml` / `hdfs-site.xml`, a new Kerberos ticket cache,
+  environment variables) or to release the connections of dropped secrets,
+  call `hdfs_reset_connections()`; it returns how many connections it dropped.
   Files that are open keep their connection until they are closed.
+- **Persistent secrets** (`CREATE PERSISTENT SECRET`) are stored in
+  `~/.duckdb/stored_secrets` (DuckDB's `secret_directory`), unencrypted. A
+  persistent `hdfs` secret whose provider this version doesn't know (one
+  written by a newer version of the extension) is an error for the URLs in
+  its scope: update the extension, or `DROP PERSISTENT SECRET` it.
 
 ```sql
 CALL hdfs_reset_connections();
