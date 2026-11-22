@@ -221,6 +221,11 @@ PY
 HADOOP_CONF_DIR_FOR_TESTS="${NO_KMS_CONF}" run_cluster_test test/sql/hdfs_ez_no_provider.test hadoop HDFS_TEST_NO_KMS=1
 rm -rf "${NO_KMS_CONF}"
 
+echo "==> Running config_snapshot tests with no Hadoop configuration in the environment..."
+EMPTY_CONF="$(mktemp -d)"
+HADOOP_CONF_DIR_FOR_TESTS="${EMPTY_CONF}" run_cluster_test test/sql/hdfs_snapshot_cluster.test hadoop
+rm -rf "${EMPTY_CONF}"
+
 
 echo "==> Checking every cluster test file ran..."
 missing=""

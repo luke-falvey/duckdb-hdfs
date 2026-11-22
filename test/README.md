@@ -18,6 +18,13 @@ cluster used to exercise the `hdfs` extension end-to-end.
 - `sql/hdfs_connections.test` — secret scope matching by whole path components,
   connection sharing and replacement when a secret changes,
   `hdfs_reset_connections()`. No cluster; `make test`.
+- `sql/hdfs_snapshot_secret.test` — `config_snapshot` secrets: validation,
+  refused credentials, use without any XML file, connection sharing, and a
+  persistent secret across a restart. No cluster; `make test`.
+- `sql/hdfs_snapshot_cluster.test` — a `config_snapshot` secret holding
+  `hdfs-conf/`'s properties reads, decrypts (KMS) and writes like that
+  directory. Cluster; `run_hdfs_tests.sh` runs it with an empty
+  `HADOOP_CONF_DIR`, so only the snapshot configures the client.
 - `sql/hdfs_secret_provider.test` — a persistent `hdfs` secret with a provider
   this version doesn't know (`data/hdfs_future_secret/`, written by its
   `make_fixture.py`) is refused. No cluster; `make test` (its own file, because

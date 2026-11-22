@@ -218,6 +218,22 @@ void HdfsCrypto::Wipe(string &secret) {
 	}
 }
 
+string HdfsCrypto::Sha256Hex(const string &data) {
+	unsigned char digest[EVP_MAX_MD_SIZE];
+	unsigned int length = 0;
+	if (EVP_Digest(data.data(), data.size(), digest, &length, EVP_sha256(), nullptr) != 1 || length != 32) {
+		throw IOException("SHA-256 failed");
+	}
+	static const char *const hex = "0123456789abcdef";
+	string out;
+	out.reserve(2 * length);
+	for (unsigned int i = 0; i < length; i++) {
+		out += hex[digest[i] >> 4];
+		out += hex[digest[i] & 0xf];
+	}
+	return out;
+}
+
 string HdfsCrypto::Base64Encode(const string &data) {
 	string out;
 	size_t i = 0;

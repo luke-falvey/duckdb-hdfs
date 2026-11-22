@@ -9,6 +9,7 @@
 
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/map.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 
 namespace duckdb {
@@ -70,8 +71,13 @@ struct HdfsWalkOptions {
 	static constexpr idx_t MAX_PARALLELISM = 64;
 };
 
-//! The provider of the `hdfs` secrets this version creates and reads (CREATE SECRET (TYPE hdfs, PROVIDER config)).
+//! The providers of the `hdfs` secrets this version creates and reads. `config` names where the configuration is
+//! (CONFIG_DIR, read at each connect); `config_snapshot` holds the configuration itself (Hadoop properties).
 static constexpr const char *HDFS_SECRET_PROVIDER_CONFIG = "config";
+static constexpr const char *HDFS_SECRET_PROVIDER_SNAPSHOT = "config_snapshot";
+//! The format of the keys a `config_snapshot` secret stores (its `format_version`). A secret with a higher version
+//! was written by a newer version of the extension and is refused.
+static constexpr int32_t HDFS_SNAPSHOT_FORMAT_VERSION = 1;
 
 //! Where a connection's configuration comes from (an `hdfs` secret); empty fields fall back to the Hadoop
 //! environment (HADOOP_CONF_DIR or HADOOP_HOME/etc/hadoop, HADOOP_USER_NAME).
@@ -80,11 +86,28 @@ struct HdfsConnectionConfig {
 	string config_dir;
 	//! The user to act as (simple authentication only).
 	string user;
+	//! A configuration held in a `config_snapshot` secret: Hadoop properties (raw keys and values, as an XML file
+	//! would give them), used instead of any XML file or HADOOP_CONF_DIR. HADOOP_USER_NAME still applies when `user`
+	//! is empty. With a snapshot, `config_dir` is empty and `fingerprint` is set; `properties` itself is only filled in
+	//! when a connection is built (see HdfsFileSystem::GetConnection).
+	shared_ptr<const map<string, string>> properties;
+	//! The snapshot's Fingerprint(), stored in its secret; empty without a snapshot.
+	string fingerprint;
 
+	//! Whether this is a snapshot's configuration.
+	bool IsSnapshot() const {
+		return !fingerprint.empty();
+	}
 	//! What the connection is configured from, as one string: two configs are the same configuration iff their
-	//! identities are equal. It covers what the config names (the directory and the user), not the contents of the
-	//! files there (an edited core-site.xml keeps its identity) nor the environment variables.
+	//! identities are equal. For a CONFIG_DIR (or the environment) it covers what the config names (the directory and
+	//! the user), not the contents of the files there (an edited core-site.xml keeps its identity) nor the environment
+	//! variables; for a snapshot, its fingerprint.
 	string Identity() const;
+
+	//! A digest of a snapshot: SHA-256, as 64 lowercase hex digits, over a versioned, length-prefixed encoding of
+	//! `user` and the properties in bytewise key order. It is stored in the secret, so it must never change for the
+	//! same input.
+	static string Fingerprint(const map<string, string> &properties, const string &user);
 };
 
 //! An open file. Reads may run concurrently.

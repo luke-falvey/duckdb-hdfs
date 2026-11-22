@@ -324,6 +324,48 @@ though DuckDB's own reads would need each file listed. `HADOOP_CONF_DIR` and
 ticket cache, so allow only directories whose files you trust (a query that
 can write to an allowed directory can also write a `core-site.xml` there).
 
+#### Configuration snapshots
+
+A `config_snapshot` secret holds the Hadoop configuration itself, as the
+properties a `core-site.xml` / `hdfs-site.xml` would set, so a persistent
+secret keeps working without any file on the machine:
+
+```sql
+CREATE PERSISTENT SECRET prod (
+    TYPE hdfs,
+    PROVIDER config_snapshot,
+    SCOPE 'hdfs://prod-ns/',
+    PROPERTIES MAP {
+        'fs.defaultFS': 'hdfs://prod-ns',
+        'dfs.nameservices': 'prod-ns',
+        'dfs.ha.namenodes.prod-ns': 'nn1,nn2',
+        'dfs.namenode.rpc-address.prod-ns.nn1': 'nn1.example.com:8020',
+        'dfs.namenode.rpc-address.prod-ns.nn2': 'nn2.example.com:8020',
+        'dfs.client.failover.proxy.provider.prod-ns':
+            'org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider'
+    },
+    USER 'analytics'                -- optional; simple authentication only
+);
+```
+
+- The properties are the whole configuration: no XML file and no
+  `HADOOP_CONF_DIR` is read. `HADOOP_USER_NAME` still applies without `USER`,
+  and on a Kerberos cluster the identity is still the local ticket cache's
+  principal (the ticket and `krb5.conf` stay on the machine).
+- Values are stored as given (no `${...}` substitution, as libhdfs3 does with
+  XML files). The extension's defaults (timeouts, retries) apply on top, as
+  for `CONFIG_DIR`.
+- Credentials are refused: a property whose name contains `password`,
+  `passwd`, `secret` or `keytab`, or starts with
+  `hadoop.security.credential.`, is an error. Secrets are stored unencrypted,
+  and nothing is redacted in `duckdb_secrets()`.
+- The properties can't be set while `enable_external_access = false` (they
+  name NameNodes, the KMS and local paths); a snapshot created before external
+  access was disabled keeps working.
+- A snapshot doesn't change when the cluster does: to pick up a new
+  configuration, `CREATE OR REPLACE` the secret. A stored secret whose
+  properties were edited by hand is refused.
+
 - **Scopes match whole path components**: a secret scoped to
   `hdfs://nn:8020/data` covers `hdfs://nn:8020/data` and everything below it,
   but not `hdfs://nn:8020/data2`. The longest matching scope wins, as for other
