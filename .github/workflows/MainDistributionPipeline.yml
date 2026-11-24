@@ -12,6 +12,11 @@ on:
         required: false
         default: ''
         type: string
+      skip_macos:
+        description: 'Leave macOS out of this run (for when no macOS runner is available)'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
@@ -30,7 +35,8 @@ jobs:
       # The native HDFS client (libhdfs3, built by vcpkg from vcpkg_ports/)
       # needs POSIX sockets and doesn't support Windows or WebAssembly, so
       # restrict to the Linux/macOS desktop+server platforms.
-      exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
+      # A run started from the Actions tab with skip_macos also leaves macOS out.
+      exclude_archs: ${{ inputs.skip_macos && 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw;osx_arm64;osx_amd64' || 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw' }}
 
   code-quality-check:
     name: Code Quality Check
