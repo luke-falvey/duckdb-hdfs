@@ -322,25 +322,25 @@ SELECT v FROM read_csv('hdfs://localhost:9000/lit/data[1].csv');
 42
 
 # A long walk stops at the query deadline (one listing call at a time, so it
-# is still running when the deadline passes).
-statement ok
+# is still running when the deadline passes). The 1 ms deadline is set on a
+# connection of its own (max_execution_time is connection-local): on a slow
+# runner even `RESET max_execution_time` can take longer than 1 ms and be
+# interrupted itself, so the default connection never gets the deadline.
+statement ok con1
 SET hdfs_list_parallelism = 1;
 
-statement ok
+statement ok con1
 SET max_execution_time = 1;
 
-statement error
+statement error con1
 SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/many/**');
 ----
 Query exceeded maximum execution time
 
-statement error
+statement error con1
 SELECT count(*) FROM read_csv('hdfs://localhost:9000/many/*/*.csv');
 ----
 Query exceeded maximum execution time
-
-statement ok
-RESET max_execution_time;
 
 statement ok
 RESET hdfs_list_parallelism;
