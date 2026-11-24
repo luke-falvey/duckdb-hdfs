@@ -96,7 +96,7 @@ replaced secret replaces its connection.
 - **`std::` types.** `HdfsWalkImpl` still uses `std::vector`, `std::deque` and `std::mutex` directly; switch them to
   DuckDB's types where that doesn't fight libhdfs3's.
 - **Next DuckDB bump.** DuckDB is replacing many `ClientContext` uses with a new `Context` class (duckdb/duckdb#28314).
-  Check the `FileOpener` and setting lookups when moving past v2.0.0.
+  Check the `FileOpener` and setting lookups when moving past v2.0.1.
 
 ## Decisions
 

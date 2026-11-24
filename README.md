@@ -498,7 +498,7 @@ numbers.
 
 ## Building
 
-Targets DuckDB v2.0.0 (the commit pinned by the `duckdb` submodule). Needs a
+Targets DuckDB v2.0.1 (the commit pinned by the `duckdb` submodule). Needs a
 C++17 compiler, CMake, and [vcpkg](https://vcpkg.io) for the HDFS client and
 its dependencies (protobuf, libxml2, gsasl), plus `make` and `pkg-config`.
 vcpkg builds libhdfs3 and gsasl from the overlay ports in `vcpkg_ports/`.
@@ -514,12 +514,12 @@ make            # builds libhdfs3 (via vcpkg) + the extension + duckdb
 ```
 
 DuckDB v2 no longer derives its version from `git describe`, so a plain local
-build reports `v2.0.0-devN`. A loadable extension built that way only loads
-into that same build. To build one that loads into a stock DuckDB v2.0.0, set
+build reports `v2.0.1-devN`. A loadable extension built that way only loads
+into that same build. To build one that loads into a stock DuckDB v2.0.1, set
 the version explicitly (CI does this automatically):
 
 ```sh
-DUCKDB_VERSION=v2.0.0 make
+DUCKDB_VERSION=v2.0.1 make
 ```
 
 Artifacts:
