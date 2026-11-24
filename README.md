@@ -162,7 +162,7 @@ Behavior notes:
   `read_csv` / `glob()`. A path with wildcards makes `hdfs_ls` return the
   matched entries themselves (like `ls -d`; no matches → empty result); a
   plain directory path lists its children. Names are matched by DuckDB's own
-  glob matcher, so `?` matches one byte (as for local files). In scans,
+  glob matcher, so `?` matches one UTF-8 character (as for local files). In scans,
   globbed files are read in path order.
 - **Literal names with glob characters**: a path containing `*`, `?`, `[` or
   `{` is a pattern, in scans and `hdfs_ls` alike. One that matches nothing is
@@ -498,7 +498,7 @@ numbers.
 
 ## Building
 
-Targets DuckDB v2.0.0 (the commit pinned by the `duckdb` submodule). Needs a
+Targets DuckDB v2.0.1 (the commit pinned by the `duckdb` submodule). Needs a
 C++17 compiler, CMake, and [vcpkg](https://vcpkg.io) for the HDFS client and
 its dependencies (protobuf, libxml2, gsasl), plus `make` and `pkg-config`.
 vcpkg builds libhdfs3 and gsasl from the overlay ports in `vcpkg_ports/`.
@@ -514,12 +514,12 @@ make            # builds libhdfs3 (via vcpkg) + the extension + duckdb
 ```
 
 DuckDB v2 no longer derives its version from `git describe`, so a plain local
-build reports `v2.0.0-devN`. A loadable extension built that way only loads
-into that same build. To build one that loads into a stock DuckDB v2.0.0, set
+build reports `v2.0.1-devN`. A loadable extension built that way only loads
+into that same build. To build one that loads into a stock DuckDB v2.0.1, set
 the version explicitly (CI does this automatically):
 
 ```sh
-DUCKDB_VERSION=v2.0.0 make
+DUCKDB_VERSION=v2.0.1 make
 ```
 
 Artifacts:

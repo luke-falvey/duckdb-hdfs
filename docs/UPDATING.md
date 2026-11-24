@@ -2,7 +2,7 @@
 When a new DuckDB is released, update the extension to target it as follows:
 
 - Bump submodules
-  - `./duckdb` should be set to the latest tagged release (e.g. `v2.0.0`). CI builds DuckDB from this pinned commit.
+  - `./duckdb` should be set to the latest tagged release (e.g. `v2.0.1`). CI builds DuckDB from this pinned commit.
   - `./extension-ci-tools` should be set to the branch for that release line. Since v2.0 these branches are named
     `vX.Y-<codename>` (e.g. `v2.0-cyanoptera` for DuckDB v2.0.x); older lines used per-patch branches such as
     `v1.5.4`. Keep `branch =` in `.gitmodules` in sync.

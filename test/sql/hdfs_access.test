@@ -96,17 +96,18 @@ SELECT hdfs_exists('s3://bucket/x');
 ----
 Invalid Input Error: hdfs_exists: 's3://bucket/x' is not an hdfs:// URL (use hdfs:///path for a path on fs.defaultFS)
 
-# DuckDB doesn't canonicalize remote paths before the allowed_directories check, so a '..' component passes it;
-# it is refused before any connection is made (HDFS forbids '.' and '..' in names anyway).
+# Since v2.0.1, DuckDB's allowed_directories check refuses a '..' component in a remote path itself (with external
+# access enabled the extension refuses it, see hdfs_no_cluster.test). A '.' component passes that check; the extension
+# refuses it before any connection is made (HDFS forbids '.' and '..' in names anyway).
 statement error
 SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/allowed/../secret');
 ----
-Invalid Input Error: HDFS path 'hdfs://127.0.0.1:1/allowed/../secret' has a '..' component; HDFS paths cannot contain '.' or '..'
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/allowed/../secret" - file system operations are disabled by configuration
 
 statement error
 SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/../secret/*.csv');
 ----
-Invalid Input Error: HDFS path 'hdfs://127.0.0.1:1/allowed/../secret/*.csv' has a '..' component; HDFS paths cannot contain '.' or '..'
+<REGEX>:Permission Error: Cannot access .*"hdfs://127\.0\.0\.1:1/allowed/\.\./secret.*" - file system operations are disabled by configuration.*
 
 statement error
 SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/./a');
@@ -116,7 +117,7 @@ Invalid Input Error: HDFS path 'hdfs://127.0.0.1:1/allowed/./a' has a '.' compon
 statement error
 SELECT * FROM read_csv('hdfs://127.0.0.1:1/allowed/../secret.csv');
 ----
-<REGEX>:.*Invalid Input Error.*has a '\.\.' component.*
+<REGEX>:.*Permission Error: Cannot access .*hdfs://127\.0\.0\.1:1/allowed/\.\./secret\.csv.*disabled by configuration.*
 
 # A '.' or '..' spelled through a brace group or escapes appears only once the pattern is expanded: refused then,
 # still before connecting (the NameNode at 127.0.0.1:1 would give an IO Error). Neither the listing nor a
