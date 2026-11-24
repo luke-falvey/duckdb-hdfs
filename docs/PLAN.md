@@ -105,7 +105,7 @@ These were taken deliberately. Revisit them only with a reason.
 | Decision | Why |
 |---|---|
 | Glob results are sorted and handed over once the walk is complete (item 5). | File order, and so row order, stays fixed, as with local globs. The parallel walk finishes in no fixed order. |
-| Globs use DuckDB's matcher (`duckdb::Glob`), so `?` matches one byte. | A pattern behaves the same on local files and on HDFS, and matching takes linear time. A two-byte UTF-8 character needs `??`. |
+| Globs use DuckDB's matcher (`duckdb::Glob`), so `?` matches one UTF-8 character (one byte before DuckDB v2.0.1). | A pattern behaves the same on local files and on HDFS, and matching takes linear time. |
 | A pattern that matches nothing is tried as a literal path. | DuckDB's local glob does the same; it makes a file named `data[1].csv` readable. |
 | Hidden names (leading `_` or `.`) are skipped by default. | It's the Hadoop and Spark convention (`_SUCCESS`, `_temporary`). DuckDB's local glob doesn't skip them, so this is a documented difference. |
 | Errors map to DuckDB exception types: invalid patterns are `Invalid Input Error`, bad configuration is `Invalid Configuration Error`, everything else is `IO Error`. | It matches how DuckDB classifies errors. |

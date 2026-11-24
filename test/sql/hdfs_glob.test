@@ -71,14 +71,19 @@ query T
 FROM globbed('/data/zzz*');
 ----
 
-# Globs match names as DuckDB's local glob does: '?' is one byte, so a two-byte
-# UTF-8 character needs '??'.
+# Globs match names as DuckDB's local glob does: '?' and a character class match
+# one UTF-8 character, however many bytes it takes.
 query T
 FROM globbed('/u/data?.csv');
 ----
+/u/dataé.csv
 
 query T
 FROM globbed('/u/data??.csv');
+----
+
+query T
+FROM globbed('/u/data[é].csv');
 ----
 /u/dataé.csv
 

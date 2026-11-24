@@ -131,9 +131,10 @@ void ComponentMatching() {
 	CHECK_EQ(Walk("/d/*.txt", tree), (Strings {"/d/a.txt", "/d/b.txt", "/d/d.txt", "/d/file.txt", "/d/file3.txt"}));
 	CHECK_EQ(Walk("/d/a**c", tree), (Strings {"/d/abc", "/d/ac"})); // '**' inside a component is '*'
 	CHECK_EQ(Walk("/d/a*c", tree), (Strings {"/d/abc", "/d/ac"}));
-	CHECK_EQ(Walk("/d/data?.csv", tree), (Strings {"/d/data1.csv"}));
-	// '?' matches one byte, as for local files: a two-byte UTF-8 character needs '??'.
-	CHECK_EQ(Walk("/d/data??.csv", tree), (Strings {"/d/data12.csv", "/d/data\xc3\xa9.csv"}));
+	// '?' and a class match one UTF-8 character, as for local files (DuckDB v2.0.1+), whatever its length in bytes.
+	CHECK_EQ(Walk("/d/data?.csv", tree), (Strings {"/d/data1.csv", "/d/data\xc3\xa9.csv"}));
+	CHECK_EQ(Walk("/d/data??.csv", tree), (Strings {"/d/data12.csv"}));
+	CHECK_EQ(Walk("/d/data[\xc3\xa9].csv", tree), (Strings {"/d/data\xc3\xa9.csv"}));
 	CHECK_EQ(Walk("/d/[abc].txt", tree), (Strings {"/d/a.txt", "/d/b.txt"}));
 	CHECK_EQ(Walk("/d/file[0-9].txt", tree), (Strings {"/d/file3.txt"}));
 	CHECK_EQ(Walk("/d/[!a].txt", tree), (Strings {"/d/b.txt", "/d/d.txt"}));

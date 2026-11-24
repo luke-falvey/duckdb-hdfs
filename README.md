@@ -162,7 +162,7 @@ Behavior notes:
   `read_csv` / `glob()`. A path with wildcards makes `hdfs_ls` return the
   matched entries themselves (like `ls -d`; no matches → empty result); a
   plain directory path lists its children. Names are matched by DuckDB's own
-  glob matcher, so `?` matches one byte (as for local files). In scans,
+  glob matcher, so `?` matches one UTF-8 character (as for local files). In scans,
   globbed files are read in path order.
 - **Literal names with glob characters**: a path containing `*`, `?`, `[` or
   `{` is a pattern, in scans and `hdfs_ls` alike. One that matches nothing is
