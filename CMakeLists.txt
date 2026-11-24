@@ -16,22 +16,32 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(src/include)
 
 # The native HDFS client (ClickHouse's libhdfs3), built by the overlay port in
-# vcpkg_ports/libhdfs3. Only src/hdfs_bridge.cpp includes its headers.
+# vcpkg_ports/libhdfs3. Only src/hdfs_client.cpp includes its headers (and the
+# parity unit test, test/cpp/hdfs_hadoop_xml_test.cpp).
 find_package(libhdfs3 CONFIG REQUIRED)
 # Encryption zones: AES-CTR (OpenSSL) and the KMS REST client (libcurl).
 find_package(OpenSSL REQUIRED)
 find_package(CURL CONFIG REQUIRED)
+# config_snapshot secrets parse core-site.xml / hdfs-site.xml themselves
+# (src/hdfs_hadoop_xml.cpp).
+find_package(LibXml2 REQUIRED)
 
 set(EXTENSION_SOURCES
-    src/hdfs_extension.cpp src/hdfs_filesystem.cpp src/hdfs_functions.cpp
-    src/hdfs_bridge.cpp src/hdfs_crypto.cpp src/hdfs_glob.cpp)
+    src/hdfs_extension.cpp
+    src/hdfs_filesystem.cpp
+    src/hdfs_functions.cpp
+    src/hdfs_client.cpp
+    src/hdfs_crypto.cpp
+    src/hdfs_glob.cpp
+    src/hdfs_hadoop_xml.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 # The build_*_extension helpers use the plain target_link_libraries signature on
 # these targets, so we must match it (no PUBLIC/PRIVATE keyword).
-set(HDFS_LIBS libhdfs3::hdfs3 CURL::libcurl OpenSSL::SSL OpenSSL::Crypto)
+set(HDFS_LIBS libhdfs3::hdfs3 CURL::libcurl OpenSSL::SSL OpenSSL::Crypto
+              LibXml2::LibXml2)
 target_link_libraries(${EXTENSION_NAME} ${HDFS_LIBS})
 target_link_libraries(${LOADABLE_EXTENSION_NAME} ${HDFS_LIBS})
 

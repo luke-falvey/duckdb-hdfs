@@ -7,30 +7,69 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
-# Unit tests that need no DuckDB build or cluster: the glob engine, and the
-# encryption-zone helpers (which use the OpenSSL/libcurl that vcpkg installs
-# for the main build, so run `make` first).
-VCPKG_INSTALLED_DIR ?= $(firstword $(filter-out %/vcpkg,$(wildcard build/release/vcpkg_installed/*)))
+# C++ unit tests that need no cluster: the glob planner (brace expansion, roots,
+# hidden names, `**`), the metadata time conversion, the encryption-zone
+# helpers (against NIST vectors) and batched-listing rejection handling. They
+# link the DuckDB and vcpkg libraries of the release build, so run `make` first.
+# Globs against a real directory tree are tested with SQL on a cluster
+# (test/sql/hdfs_glob.test).
+BUILD_DIR = build/release
+VCPKG_INSTALLED_DIR ?= $(firstword $(filter-out %/vcpkg,$(wildcard $(BUILD_DIR)/vcpkg_installed/*)))
 UNIT_PKGS = libcurl libssl libcrypto
+UNIT_CXXFLAGS = -std=c++17 -O1 -Wall -Wextra -Isrc/include -Iduckdb/src/include
+DUCKDB_STATIC_LIBS = $(BUILD_DIR)/src/libduckdb_static.a $(wildcard $(BUILD_DIR)/third_party/*/libduckdb_*.a)
 
-test_unit: test_glob test_crypto test_batch
+test_unit: test_glob test_functions test_crypto test_batch test_hadoop_xml
 
 test_glob:
 	mkdir -p build/unit_test
-	$(CXX) -std=c++17 -O1 -Wall -Wextra -Isrc/include src/hdfs_glob.cpp test/cpp/hdfs_glob_test.cpp -o build/unit_test/hdfs_glob_test
+	$(CXX) $(UNIT_CXXFLAGS) -Iduckdb/third_party/utf8proc/include src/hdfs_glob.cpp test/cpp/hdfs_glob_test.cpp \
+		-Wl,--start-group $(DUCKDB_STATIC_LIBS) -Wl,--end-group -lpthread -ldl -o build/unit_test/hdfs_glob_test
 	./build/unit_test/hdfs_glob_test
 
-test_crypto:
-	@test -n "$(VCPKG_INSTALLED_DIR)" || { echo "No vcpkg packages under build/release; run make first"; exit 1; }
+test_functions:
 	mkdir -p build/unit_test
-	$(CXX) -std=c++17 -O1 -Wall -Wextra -Isrc/include src/hdfs_crypto.cpp test/cpp/hdfs_crypto_test.cpp \
+	$(CXX) $(UNIT_CXXFLAGS) -Iduckdb/third_party/fmt/include test/cpp/hdfs_functions_test.cpp \
+		-Wl,--start-group $(DUCKDB_STATIC_LIBS) -Wl,--end-group -lpthread -ldl -o build/unit_test/hdfs_functions_test
+	./build/unit_test/hdfs_functions_test
+
+test_crypto:
+	@test -n "$(VCPKG_INSTALLED_DIR)" || { echo "No vcpkg packages under $(BUILD_DIR); run make first"; exit 1; }
+	mkdir -p build/unit_test
+	$(CXX) $(UNIT_CXXFLAGS) src/hdfs_crypto.cpp test/cpp/hdfs_crypto_test.cpp \
+		-Wl,--start-group $(DUCKDB_STATIC_LIBS) -Wl,--end-group \
 		$$(PKG_CONFIG_PATH=$(VCPKG_INSTALLED_DIR)/lib/pkgconfig pkg-config --static --cflags --libs $(UNIT_PKGS)) \
-		-o build/unit_test/hdfs_crypto_test
+		-lpthread -ldl -o build/unit_test/hdfs_crypto_test
 	./build/unit_test/hdfs_crypto_test
 
 test_batch:
 	mkdir -p build/unit_test
-	$(CXX) -std=c++17 -O1 -Wall -Wextra -Isrc/include test/cpp/hdfs_batch_test.cpp -o build/unit_test/hdfs_batch_test
+	$(CXX) $(UNIT_CXXFLAGS) test/cpp/hdfs_batch_test.cpp -o build/unit_test/hdfs_batch_test
 	./build/unit_test/hdfs_batch_test
 
-.PHONY: test_unit test_glob test_crypto test_batch
+# The Hadoop XML parser is checked against libhdfs3's own (its Config class), so this links libhdfs3 too.
+HADOOP_XML_PKGS = libxml-2.0 protobuf libgsasl mit-krb5-gssapi openssl
+LIBHDFS3_INCLUDE = $(VCPKG_INSTALLED_DIR)/include/libhdfs3
+
+test_hadoop_xml:
+	@test -n "$(VCPKG_INSTALLED_DIR)" || { echo "No vcpkg packages under $(BUILD_DIR); run make first"; exit 1; }
+	mkdir -p build/unit_test
+	$(CXX) $(UNIT_CXXFLAGS) -I$(LIBHDFS3_INCLUDE) -I$(LIBHDFS3_INCLUDE)/common \
+		src/hdfs_hadoop_xml.cpp test/cpp/hdfs_hadoop_xml_test.cpp \
+		-Wl,--start-group $(DUCKDB_STATIC_LIBS) $(VCPKG_INSTALLED_DIR)/lib/libhdfs3.a -Wl,--end-group \
+		$$(PKG_CONFIG_PATH=$(VCPKG_INSTALLED_DIR)/lib/pkgconfig pkg-config --static --cflags --libs $(HADOOP_XML_PKGS)) \
+		-lpthread -ldl -o build/unit_test/hdfs_hadoop_xml_test
+	./build/unit_test/hdfs_hadoop_xml_test
+
+.PHONY: test_unit test_glob test_functions test_crypto test_batch test_hadoop_xml
+
+# DuckDB reads a persistent secret file only if it is private (mode 0600), and git checks files out as 0644: make
+# the provider-guard fixture (test/sql/hdfs_secret_provider.test) private before the SQL tests run.
+SECRET_FIXTURES = $(wildcard test/data/*/*.duckdb_secret)
+
+secret_fixture_permissions:
+	chmod 600 $(SECRET_FIXTURES)
+
+test test_release test_debug test_reldebug: secret_fixture_permissions
+
+.PHONY: secret_fixture_permissions

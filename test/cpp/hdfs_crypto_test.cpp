@@ -3,11 +3,17 @@
 
 #include "hdfs_crypto.hpp"
 
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/json_document.hpp"
+
+#include <chrono>
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
-using namespace hdfs_crypto;
+using namespace duckdb;
 
 namespace {
 
@@ -29,8 +35,23 @@ std::string Hex(const std::string &hex) {
 	return out;
 }
 
+// The message of the IOException `fn` throws ("" if it throws none).
+template <class FN>
+std::string IOError(FN &&fn) {
+	try {
+		fn();
+	} catch (const IOException &e) {
+		return ErrorData(e).RawMessage();
+	}
+	return std::string();
+}
+
+bool Contains(const std::string &haystack, const std::string &needle) {
+	return haystack.find(needle) != std::string::npos;
+}
+
 std::string Transform(const std::string &key, const std::string &iv, uint64_t offset, std::string data) {
-	AesCtrTransform(key, iv, offset, reinterpret_cast<uint8_t *>(&data[0]), data.size());
+	HdfsCrypto::AesCtrTransform(key, iv, offset, reinterpret_cast<uint8_t *>(&data[0]), data.size());
 	return data;
 }
 
@@ -61,54 +82,160 @@ void NistVector() {
 void CounterCarry() {
 	// offset / 16 is added to the IV as a 128-bit big-endian number.
 	auto iv = Hex("000000000000000000000000000000ff");
-	CHECK(CounterBlock(iv, 0) == iv);
-	CHECK(CounterBlock(iv, 15) == iv);
-	CHECK(CounterBlock(iv, 16) == Hex("00000000000000000000000000000100"));
+	CHECK(HdfsCrypto::CounterBlock(iv, 0) == iv);
+	CHECK(HdfsCrypto::CounterBlock(iv, 15) == iv);
+	CHECK(HdfsCrypto::CounterBlock(iv, 16) == Hex("00000000000000000000000000000100"));
 	auto high = Hex("0000000000000000ffffffffffffffff");
-	CHECK(CounterBlock(high, 16) == Hex("00000000000000010000000000000000"));
+	CHECK(HdfsCrypto::CounterBlock(high, 16) == Hex("00000000000000010000000000000000"));
 	auto top = Hex("ffffffffffffffffffffffffffffffff");
-	CHECK(CounterBlock(top, 16) == Hex("00000000000000000000000000000000"));
+	CHECK(HdfsCrypto::CounterBlock(top, 16) == Hex("00000000000000000000000000000000"));
 }
 
 void Base64() {
-	CHECK(Base64Encode("") == "");
-	CHECK(Base64Encode("f") == "Zg==");
-	CHECK(Base64Encode("fo") == "Zm8=");
-	CHECK(Base64Encode("foo") == "Zm9v");
-	CHECK(Base64Decode("Zm9vYmE=") == "fooba");
-	CHECK(Base64Decode("Zm9vYmE") == "fooba"); // unpadded
+	CHECK(HdfsCrypto::Base64Encode("") == "");
+	CHECK(HdfsCrypto::Base64Encode("f") == "Zg==");
+	CHECK(HdfsCrypto::Base64Encode("fo") == "Zm8=");
+	CHECK(HdfsCrypto::Base64Encode("foo") == "Zm9v");
+	CHECK(HdfsCrypto::Base64Decode("Zm9vYmE=") == "fooba");
+	CHECK(HdfsCrypto::Base64Decode("Zm9vYmE") == "fooba"); // unpadded
 	std::string bytes = Hex("fbff");
-	CHECK(Base64Encode(bytes) == "+/8=");
-	CHECK(Base64Decode("-_8") == bytes); // URL-safe, as the KMS sends it
+	CHECK(HdfsCrypto::Base64Encode(bytes) == "+/8=");
+	CHECK(HdfsCrypto::Base64Decode("-_8") == bytes); // URL-safe, as the KMS sends it
 	bool threw = false;
 	try {
-		Base64Decode("not base64!");
-	} catch (const CryptoError &) {
+		HdfsCrypto::Base64Decode("not base64!");
+	} catch (const IOException &) {
 		threw = true;
 	}
 	CHECK(threw);
 }
 
 void KmsUri() {
-	CHECK(ParseKmsUri("kms://http@kms1:9600/kms") == std::vector<std::string>({"http://kms1:9600/kms"}));
-	CHECK(ParseKmsUri("kms://https@kms1;kms2:9600/kms") ==
+	CHECK(HdfsCrypto::ParseKmsUri("kms://http@kms1:9600/kms") == std::vector<std::string>({"http://kms1:9600/kms"}));
+	CHECK(HdfsCrypto::ParseKmsUri("kms://https@kms1;kms2:9600/kms") ==
 	      std::vector<std::string>({"https://kms1:9600/kms", "https://kms2:9600/kms"}));
-	bool threw = false;
-	try {
-		ParseKmsUri("jceks://file@/tmp/keystore");
-	} catch (const CryptoError &) {
-		threw = true;
+	// The scheme is case-insensitive, as a URL scheme is.
+	CHECK(HdfsCrypto::ParseKmsUri("kms://HTTPS@kms1:9600/kms") == std::vector<std::string>({"https://kms1:9600/kms"}));
+	CHECK(Contains(IOError([] { HdfsCrypto::ParseKmsUri("jceks://file@/tmp/keystore"); }), "only kms://"));
+	// Only http and https: the URL comes from the cluster config and must not reach local files or other protocols.
+	for (auto uri : {"kms://file@/etc/passwd", "kms://gopher@kms1:70/kms", "kms://ftp@kms1/kms", "kms://@kms1/kms",
+	                 "kms://http+unix@kms1/kms"}) {
+		CHECK(Contains(IOError([&] { HdfsCrypto::ParseKmsUri(uri); }), "the scheme must be http or https"));
 	}
-	CHECK(threw);
+}
+
+// Even a URL that bypasses ParseKmsUri is refused by the HTTP client.
+void KmsProtocols() {
+	HdfsKeyCache cache;
+	auto error = IOError([&] {
+		HdfsCrypto::DecryptEncryptedKey(cache, {"file:///etc/passwd#"}, false, "alice", "k1", "k1@0",
+		                                std::string(16, 'i'), std::string(16, 'k'));
+	});
+	CHECK(Contains(error, "KMS request to file:///etc/passwd"));
+	CHECK(cache.Size() == 0);
+	CHECK(Contains(IOError([&] {
+		               HdfsCrypto::DecryptEncryptedKey(cache, {}, false, "alice", "k1", "k1@0", std::string(16, 'i'),
+		                                               std::string(16, 'k'));
+	               }),
+	               "no KMS URL configured"));
+}
+
+// The error message a KMS refusal reports, in Hadoop's JSON shape.
+void KmsErrors() {
+	CHECK(HdfsCrypto::KmsErrorMessage(
+	          R"({"RemoteException":{"message":"User:bob not allowed to do 'DECRYPT_EEK' on 'k1'",)"
+	          R"("exception":"AuthorizationException"}})") == "User:bob not allowed to do 'DECRYPT_EEK' on 'k1'");
+	CHECK(HdfsCrypto::KmsErrorMessage(R"({"message":"Key k1 not found"})") == "Key k1 not found");
+	CHECK(HdfsCrypto::KmsErrorMessage("<html>Bad Gateway</html>").empty());
+	CHECK(HdfsCrypto::KmsErrorMessage("").empty());
+	CHECK(HdfsCrypto::KmsErrorMessage("[\"message\"]").empty());
+	// Escapes, including \uXXXX, are decoded.
+	CHECK(HdfsCrypto::KmsErrorMessage(R"({"message":"caf\u00e9 \"k1\"\\x"})") == "caf\xc3\xa9 \"k1\"\\x");
+	// Only the member itself counts, not the same text inside another string, or a nested object's member.
+	CHECK(HdfsCrypto::KmsErrorMessage(R"({"note":"\"message\": \"fake\"","message":"real"})") == "real");
+	CHECK(HdfsCrypto::KmsErrorMessage(R"({"other":{"message":"nested"}})").empty());
+	CHECK(HdfsCrypto::KmsErrorMessage(R"({"message":42})").empty());
+}
+
+// The decrypt request body, and the key in the response.
+void KmsMessages() {
+	std::string name = "we\"ird\\name\n\x01";
+	auto request = HdfsCrypto::KmsDecryptRequest(name, Hex("00ff"), "key");
+	auto doc = JSONDocument::Parse(request.data(), request.size());
+	CHECK(doc->GetRoot().GetMember("name").GetString() == name);
+	CHECK(doc->GetRoot().GetMember("iv").GetString() == "AP8=");
+	CHECK(doc->GetRoot().GetMember("material").GetString() == "a2V5");
+
+	auto key = Hex("000102030405060708090a0b0c0d0e0f");
+	CHECK(HdfsCrypto::KmsDecryptedKey(R"({"name":"EK","material":")" + HdfsCrypto::Base64Encode(key) + R"("})") == key);
+	// A "material" inside another string or object isn't the key.
+	CHECK(Contains(IOError([] { HdfsCrypto::KmsDecryptedKey(R"({"name":"\"material\":\"AAAA\""})"); }),
+	               "no decrypted key"));
+	CHECK(Contains(IOError([] { HdfsCrypto::KmsDecryptedKey(R"({"x":{"material":"AAAA"}})"); }), "no decrypted key"));
+	CHECK(Contains(IOError([] { HdfsCrypto::KmsDecryptedKey("not json"); }), "no decrypted key"));
+	CHECK(Contains(IOError([] { HdfsCrypto::KmsDecryptedKey(R"({"material":null})"); }), "no decrypted key"));
+}
+
+void KeyCache() {
+	{
+		HdfsKeyCache cache;
+		CHECK(cache.Get("a").empty());
+		cache.Put("a", "key-a");
+		CHECK(cache.Get("a") == "key-a");
+		cache.Put("a", "key-a2"); // replaced
+		CHECK(cache.Get("a") == "key-a2");
+		CHECK(cache.Size() == 1);
+		// A full cache with nothing expired starts over.
+		for (idx_t i = 0; i < HdfsKeyCache::LIMIT; i++) {
+			cache.Put("k" + std::to_string(i), "v");
+		}
+		CHECK(cache.Size() == 1);
+		CHECK(cache.Get("k" + std::to_string(HdfsKeyCache::LIMIT - 1)) == "v");
+	}
+	{
+		// Entries expire after the TTL, and are dropped when looked up.
+		HdfsKeyCache cache(std::chrono::milliseconds(1));
+		cache.Put("a", "key-a");
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		CHECK(cache.Get("a").empty());
+		CHECK(cache.Size() == 0);
+	}
+	{
+		// A full cache drops its expired entries first.
+		HdfsKeyCache cache(std::chrono::milliseconds(50));
+		for (idx_t i = 0; i + 1 < HdfsKeyCache::LIMIT; i++) {
+			cache.Put("old" + std::to_string(i), "v");
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(60));
+		cache.Put("fresh", "v");
+		cache.Put("fresh2", "v"); // full now: the expired entries go, the fresh one stays
+		CHECK(cache.Size() == 2);
+		CHECK(cache.Get("fresh") == "v");
+	}
+	std::string secret = "0123456789abcdef0123456789abcdef";
+	HdfsCrypto::Wipe(secret);
+	CHECK(secret == std::string(32, '\0'));
 }
 
 } // namespace
 
+// FIPS 180-2 test vectors.
+void Sha256() {
+	CHECK(HdfsCrypto::Sha256Hex("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+	CHECK(HdfsCrypto::Sha256Hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+	CHECK(HdfsCrypto::Sha256Hex(string("a\0b", 3)) != HdfsCrypto::Sha256Hex("a"));
+}
+
 int main() {
 	NistVector();
+	Sha256();
 	CounterCarry();
 	Base64();
 	KmsUri();
+	KmsProtocols();
+	KmsErrors();
+	KmsMessages();
+	KeyCache();
 	if (failures) {
 		std::fprintf(stderr, "%d check(s) failed\n", failures);
 		return 1;

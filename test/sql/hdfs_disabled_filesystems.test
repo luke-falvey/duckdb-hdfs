@@ -1,0 +1,44 @@
+# name: test/sql/hdfs_disabled_filesystems.test
+# description: hdfs_ls, hdfs_stat and hdfs_exists obey disabled_filesystems, as reads through DuckDB's file
+# group: [sql]
+
+#              system do. A file of its own: a disabled file system can't be re-enabled in the same database.
+
+require hdfs
+
+# --- disabled_filesystems --------------------------------------------------------
+
+statement ok
+SET disabled_filesystems = 'HdfsFileSystem';
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data');
+----
+Permission Error: File system HdfsFileSystem has been disabled by configuration
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data/*.csv');
+----
+Permission Error: File system HdfsFileSystem has been disabled by configuration
+
+statement error
+SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/data');
+----
+Permission Error: File system HdfsFileSystem has been disabled by configuration
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
+----
+Permission Error: File system HdfsFileSystem has been disabled by configuration
+
+# The default FS (hdfs:///) is refused too.
+statement error
+SELECT * FROM hdfs_stat('hdfs:///data');
+----
+Permission Error: File system HdfsFileSystem has been disabled by configuration
+
+# The same as a scan.
+statement error
+SELECT * FROM read_csv('hdfs://127.0.0.1:1/data/x.csv');
+----
+Permission Error: File system HdfsFileSystem has been disabled by configuration

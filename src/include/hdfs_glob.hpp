@@ -1,106 +1,122 @@
+//===----------------------------------------------------------------------===//
+//                         DuckDB
+//
+// hdfs_glob.hpp
+//
+//===----------------------------------------------------------------------===//
+
 #pragma once
 
-// Glob pattern parsing and matching for streaming HDFS directory walks.
-//
-// The syntax follows DuckDB's globber (`*`, `?`, `[abc]`, `[a-b]`, `[!abc]`,
-// `\` escapes, and `**` as a whole component matching zero or more levels)
-// extended with Hadoop-style `{a,b}` brace alternation. Semantics mirror DuckDB
-// where they differ from Hadoop: `**` must be an entire component (elsewhere
-// consecutive `*`s collapse to one), at most one `**` per pattern, and
-// malformed character classes match nothing rather than erroring.
-//
-// Hidden entries (names starting with `.` or `_`, e.g. `_temporary`) are
-// excluded unless the plan is built with `include_hidden`. A component that
-// explicitly names the hidden character (a literal, or a pattern whose first
-// character is a possibly escaped `.`/`_`, like `_*`) still matches; wildcard
-// first characters never do, and `**` neither matches nor descends into hidden
-// directories.
-//
-// A pattern compiles to a GlobPlan: brace groups expand into a set of
-// component lists, and matching runs as a small NFA over directory levels. The
-// walk carries a set of Pos states per directory and calls GlobPlan::Step for
-// each child to learn whether to emit it and which states to descend with.
+#include "duckdb/common/common.hpp"
+#include "duckdb/common/unordered_set.hpp"
 
-#include <cstddef>
-#include <stdexcept>
-#include <string>
-#include <vector>
+namespace duckdb {
 
-namespace hdfs_glob {
+//! Whether an HDFS path is a glob pattern: it contains `*`, `?`, `[` or `{`. Unlike FileSystem::HasGlob, this
+//! includes `{` (brace alternation). Scans and hdfs_ls both use it, so they agree on what a pattern is; as in
+//! DuckDB's globber, escapes don't suppress glob mode.
+bool IsHdfsGlob(const string &path);
 
-// Raised for patterns that can't be compiled (unclosed brace group, more than
-// one `**`).
-class GlobError : public std::runtime_error {
+//! Glob patterns for HDFS directory walks: DuckDB's syntax (`*`, `?`, `[abc]`, `[a-b]`, `[!abc]`, `\` escapes, and
+//! `**` as a whole component matching zero or more levels, at most once per pattern), plus Hadoop-style `{a,b}`
+//! alternation. Components are matched with DuckDB's own glob matcher.
+//!
+//! Hidden names (a leading `.` or `_`, e.g. `_temporary`) are skipped unless the plan includes them, or a component
+//! spells the hidden character out (a literal, or a pattern starting with a possibly escaped `.`/`_`, like `_*`);
+//! `**` neither matches nor descends into them.
+//!
+//! Brace groups expand into a set of patterns (at most MAX_EXPANDED_PATTERNS), and matching runs as a small state
+//! machine over directory levels: the walk carries a set of states per directory and calls Match for each child.
+class HdfsGlobPlan {
 public:
-	explicit GlobError(const std::string &message) : std::runtime_error(message) {
-	}
-};
+	//! A position in the patterns: the directory has matched components 0..comp of pattern `pattern_idx`.
+	struct State {
+		idx_t pattern_idx;
+		idx_t comp;
+		bool operator==(const State &other) const {
+			return pattern_idx == other.pattern_idx && comp == other.comp;
+		}
+	};
+	//! The result of matching one child of a directory.
+	struct Step {
+		//! The child is a match.
+		bool emit = false;
+		//! States to descend into the child with (empty: don't descend).
+		vector<State> next;
+	};
 
-// An NFA state: the current directory has matched components 0..comp of
-// expanded pattern `pat`, so its children are matched against `comp`.
-struct Pos {
-	size_t pat = 0;
-	size_t comp = 0;
-	bool operator==(const Pos &other) const {
-		return pat == other.pat && comp == other.comp;
-	}
-};
-
-// The result of matching one directory child against a state set.
-struct Step {
-	// The child is itself a match: emit it.
-	bool emit = false;
-	// States to descend into the child with (empty: don't descend).
-	std::vector<Pos> next;
-};
-
-class GlobPlan {
 public:
-	// Throws GlobError for an invalid pattern.
-	static GlobPlan Parse(const std::string &pattern, bool include_hidden);
+	//! The most patterns brace expansion may produce: each group multiplies the count, so a few dozen groups would
+	//! otherwise exhaust memory.
+	static constexpr idx_t MAX_EXPANDED_PATTERNS = 10000;
+	//! The most brace groups (`{` that open a group, nested or not) a pattern may have: expansion recurses once per
+	//! group, and a group with one alternative never counts towards MAX_EXPANDED_PATTERNS.
+	static constexpr idx_t MAX_BRACE_GROUPS = 128;
+	//! The longest pattern accepted, in bytes (the NameNode's own path limit is 8000 characters; brace alternatives
+	//! make a pattern longer than any path it expands to).
+	static constexpr idx_t MAX_PATTERN_LENGTH = 65536;
+	//! The most bytes brace expansion may build, counting every intermediate pattern: the length and group caps
+	//! alone allow a 64 KiB pattern with 13 groups (8,192 copies of 64 KiB, about 0.5 GB outside DuckDB's memory
+	//! limit).
+	static constexpr idx_t MAX_EXPANSION_BYTES = 16ULL * 1024 * 1024;
 
-	// The literal directory (or, for an all-literal pattern, path) the walk
-	// starts from.
-	const std::string &Root() const {
+	//! Throws InvalidInputException for an invalid pattern (unclosed brace group, more than one `**`, more than
+	//! MAX_EXPANDED_PATTERNS expanded patterns, more than MAX_BRACE_GROUPS groups, longer than MAX_PATTERN_LENGTH,
+	//! more than MAX_EXPANSION_BYTES expanded, or a literal `.` or `..` component after expansion and unescaping).
+	static HdfsGlobPlan Parse(const string &pattern, bool include_hidden);
+
+	//! The pattern this plan was parsed from.
+	const string &Pattern() const {
+		return pattern;
+	}
+	//! The literal directory the walk starts from (for an all-literal pattern: the path itself).
+	const string &Root() const {
 		return root;
 	}
-	// States for the root directory's children. Empty for all-literal patterns.
-	const std::vector<Pos> &Initial() const {
+	//! States for the root's children; empty for all-literal patterns.
+	const vector<State> &Initial() const {
 		return initial;
 	}
-	// Whether the root itself is a match (some expanded pattern is fully literal).
+	//! Whether the root itself is a match (some expanded pattern is all-literal).
 	bool EmitRoot() const {
 		return emit_root;
 	}
-	// Match one child (of a directory holding `states`) by name.
-	Step Match(const std::vector<Pos> &states, const std::string &name, bool is_dir) const;
+	//! Match a child (of a directory holding `states`) by name.
+	Step Match(const vector<State> &states, const string &name, bool is_dir) const;
+
+	//! At most the first 200 bytes of `pattern` (with "..." if cut, at a UTF-8 character boundary), for error
+	//! messages: a pattern may be 64 KiB.
+	static string Excerpt(const string &pattern);
+	//! Hadoop's hidden-name convention: a leading `.` or `_`.
+	static bool IsHidden(const string &name);
+	//! Expand `{a,b}` groups into brace-free patterns. Braces inside a character class (`[{]`) or escaped (`\{`) are
+	//! literal. Throws InvalidInputException for an unclosed group, more than MAX_EXPANDED_PATTERNS results, more than
+	//! MAX_BRACE_GROUPS groups, a pattern longer than MAX_PATTERN_LENGTH or more than MAX_EXPANSION_BYTES built.
+	static vector<string> ExpandBraces(const string &pattern);
 
 private:
-	enum class Kind { CRAWL, LITERAL, PATTERN };
+	enum class ComponentKind { CRAWL, LITERAL, PATTERN };
 	struct Component {
-		Kind kind;
-		// LITERAL: unescaped text. PATTERN: the raw pattern.
-		std::string text;
+		ComponentKind kind;
+		//! LITERAL: the unescaped text. PATTERN: the raw pattern.
+		string text;
 	};
 
-	void MatchAt(Pos pos, const std::string &name, bool is_dir, Step &step) const;
+	struct StateHash {
+		size_t operator()(const State &state) const;
+	};
+	//! The states already in a Step's `next`, so adding one is O(1) however many patterns braces produced.
+	using StateSet = unordered_set<State, StateHash>;
 
-	std::vector<std::vector<Component>> patterns;
-	std::string root;
-	std::vector<Pos> initial;
+	void MatchAt(State state, const string &name, bool is_dir, Step &step, StateSet &seen) const;
+	static void ExpandBraces(const string &pattern, const string &original, vector<string> &result, idx_t &budget);
+
+	vector<vector<Component>> patterns;
+	string root;
+	vector<State> initial;
 	bool emit_root = false;
 	bool include_hidden = false;
+	string pattern;
 };
 
-// Hadoop-convention hidden name: starts with `.` or `_`.
-bool IsHidden(const std::string &name);
-
-// Expand `{a,b}` brace groups into brace-free patterns. Throws GlobError for an
-// unclosed group.
-std::vector<std::string> ExpandBraces(const std::string &pattern);
-
-// Match a single path component against a pattern (`*`, `?`, `[...]`, `\`).
-// Malformed patterns match nothing.
-bool MatchComponent(const std::string &name, const std::string &pattern);
-
-} // namespace hdfs_glob
+} // namespace duckdb

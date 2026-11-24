@@ -5,11 +5,12 @@
 require hdfs
 
 # --- settings ------------------------------------------------------------------
-# All three extension settings are registered with their documented defaults.
+# All extension settings are registered with their documented defaults.
 
 query TT
 SELECT name, value FROM duckdb_settings() WHERE name LIKE 'hdfs_%' ORDER BY name;
 ----
+hdfs_batched_listing	true
 hdfs_include_hidden	false
 hdfs_list_parallelism	16
 hdfs_skip_permission_errors	false
@@ -25,6 +26,55 @@ SELECT current_setting('hdfs_list_parallelism');
 statement ok
 RESET hdfs_list_parallelism;
 
+# Each walk starts up to hdfs_list_parallelism threads: 1 to 64.
+statement error
+SET hdfs_list_parallelism = 0;
+----
+Invalid Input Error: hdfs_list_parallelism must be between 1 and 64, got 0
+
+statement error
+SET hdfs_list_parallelism = 65;
+----
+Invalid Input Error: hdfs_list_parallelism must be between 1 and 64, got 65
+
+statement error
+SET GLOBAL hdfs_list_parallelism = 100000;
+----
+Invalid Input Error: hdfs_list_parallelism must be between 1 and 64, got 100000
+
+statement error
+SET hdfs_list_parallelism = -1;
+----
+out of range for the destination type UINT64
+
+# A rejected value leaves the setting as it was.
+query T
+SELECT current_setting('hdfs_list_parallelism');
+----
+16
+
+statement ok
+SET hdfs_list_parallelism = 1;
+
+statement ok
+RESET hdfs_list_parallelism;
+
+# --- logging -------------------------------------------------------------------
+# The HDFS log type (one entry per NameNode RPC) is registered; test/sql/hdfs_rpc_log.test counts entries.
+
+statement ok
+CALL enable_logging('HDFS');
+
+query I
+SELECT count(*) FROM duckdb_logs_parsed('HDFS');
+----
+0
+
+statement ok
+CALL disable_logging();
+
+# --- other settings ------------------------------------------------------------
+
 statement ok
 SET hdfs_include_hidden = true;
 
@@ -36,6 +86,21 @@ RESET hdfs_include_hidden;
 
 statement ok
 RESET hdfs_skip_permission_errors;
+
+# --- catalog descriptions -----------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, len(description) > 0, len(examples) > 0
+FROM duckdb_functions() WHERE function_name IN ('hdfs_ls', 'hdfs_stat', 'hdfs_exists') ORDER BY function_name;
+----
+hdfs_exists	[path]	true	true
+hdfs_ls	[path, skip_permission_errors, include_hidden]	true	true
+hdfs_stat	[path]	true	true
+
+query T
+SELECT description FROM duckdb_extensions() WHERE extension_name = 'hdfs';
+----
+Reads and writes hdfs:// URLs with a native HDFS client, and lists HDFS metadata
 
 # --- metadata function schemas -----------------------------------------------
 # DESCRIBE only binds the function, so no connection is made. Port 1 on
@@ -54,8 +119,8 @@ permissions	VARCHAR
 mode	USMALLINT
 replication	INTEGER
 block_size	BIGINT
-last_modified	TIMESTAMP
-last_accessed	TIMESTAMP
+last_modified	TIMESTAMP WITH TIME ZONE
+last_accessed	TIMESTAMP WITH TIME ZONE
 
 query TT
 SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/data'));
@@ -70,8 +135,8 @@ permissions	VARCHAR
 mode	USMALLINT
 replication	INTEGER
 block_size	BIGINT
-last_modified	TIMESTAMP
-last_accessed	TIMESTAMP
+last_modified	TIMESTAMP WITH TIME ZONE
+last_accessed	TIMESTAMP WITH TIME ZONE
 
 # --- hdfs_ls named parameters ------------------------------------------------
 # Both per-call overrides bind (alone, together, any case, either order).
@@ -101,13 +166,108 @@ include_hidden
 statement error
 DESCRIBE SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data', true);
 ----
+hdfs_ls
+
+# A NULL path is an error, not a path named "NULL".
+statement error
+SELECT * FROM hdfs_ls(NULL);
+----
+hdfs_ls: the path cannot be NULL
+
+statement error
+SELECT * FROM hdfs_stat(NULL);
+----
+hdfs_stat: the path cannot be NULL
+
+# --- invalid glob patterns ----------------------------------------------------
+# Rejected before any listing, as invalid input rather than an I/O failure.
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/a/**/b/**');
+----
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern .*Cannot use multiple '\*\*' in one path.*
+
+statement error
+SELECT * FROM read_csv('hdfs://127.0.0.1:1/a/{b/*.csv');
+----
+<REGEX>:Invalid Input Error: .*Unclosed brace group.*
+
+# Brace expansion is capped: each {a,b} group doubles the pattern count, so 14 groups (16384 patterns) are refused
+# up front instead of running out of memory.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/d/' || repeat('{a,b}', 14));
+----
+<REGEX>:Invalid Input Error: .*expands to more than 10000 patterns.*
+
+statement error
+SELECT * FROM read_csv('hdfs://127.0.0.1:1/d/' || repeat('{a,b}', 40) || '.csv');
+----
+<REGEX>:Invalid Input Error: .*expands to more than 10000 patterns.*
+
+# The other caps on brace expansion: they are checked before connecting, so an unreachable NameNode doesn't hide
+# them behind a connection error.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/' || repeat('{a}', 100000));
+----
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern .*Glob pattern is too long.*
+
+statement error
+SELECT * FROM read_csv('hdfs://127.0.0.1:1/' || repeat('{a}', 1000) || '.csv');
+----
+<REGEX>:Invalid Input Error: .*more than 128 brace groups.*
+
+# Under the length, group and count caps, but about 0.5 GB of expanded patterns: refused by the byte budget. The
+# message quotes only the first 200 bytes of the URL and of the pattern, not all 60 KB.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/d/' || repeat('x', 60000) || repeat('{a,b}', 13));
+----
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern 'hdfs://127\.0\.0\.1:1/d/x{179}\.\.\.': Glob pattern '/d/x{197}\.\.\.' is too large to expand: its brace groups would build more than 16777216 bytes of patterns\. Use fewer brace groups or a shorter pattern.{0,1000}
+
+# A literal '..' is refused before the pattern is parsed, with the same excerpt of the URL.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/' || repeat('x', 60000) || '/../*');
+----
+<REGEX>:Invalid Input Error: HDFS path 'hdfs://127\.0\.0\.1:1/x{181}\.\.\.' has a '\.\.' component; HDFS paths cannot contain '\.' or '\.\.'.{0,1000}
+
+# A brace inside a character class is a class member, not a group: the pattern is valid, and fails only for want
+# of a NameNode.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/d/[{]x');
+----
+IO Error
 
 # --- hdfs_exists ---------------------------------------------------------------
+
+query T
+SELECT hdfs_exists(NULL);
+----
+NULL
 
 query T
 SELECT typeof(hdfs_exists('hdfs://127.0.0.1:1/data'))
 ----
 BOOLEAN
+
+# Whether a path exists changes over time, so the answer must not be constant-folded into a prepared statement's
+# plan (test/sql/hdfs_glob.test checks EXECUTE sees a new file).
+query TT
+SELECT function_name, stability FROM duckdb_functions() WHERE function_name = 'hdfs_exists';
+----
+hdfs_exists	CONSISTENT_WITHIN_QUERY
+
+statement ok
+PREPARE exists_data AS SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
+
+# Each EXECUTE asks again (and fails again here) rather than replaying a result from PREPARE.
+statement error
+EXECUTE exists_data;
+----
+IO Error
+
+statement error
+EXECUTE exists_data;
+----
+IO Error
 
 # A NameNode that can't be reached is an IO error. It must not be reported as
 # "does not exist", or as an internal error from a function DuckDB thinks can't fail.
@@ -115,3 +275,37 @@ statement error
 SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
 ----
 IO Error
+
+# --- hdfs secrets ----------------------------------------------------------------
+# A secret configures the connections to the URLs in its scope (default: all of
+# hdfs://) instead of the Hadoop environment.
+
+statement ok
+CREATE SECRET hdfs_conf (TYPE hdfs, CONFIG_DIR '/nonexistent');
+
+query TTTT
+SELECT name, type, provider, scope FROM duckdb_secrets() WHERE type = 'hdfs';
+----
+hdfs_conf	hdfs	config	['hdfs://']
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
+----
+Invalid Configuration Error: Failed to connect to HDFS (hdfs://127.0.0.1:1): config_dir '/nonexistent' has no core-site.xml or hdfs-site.xml
+
+# A secret scoped to another NameNode doesn't apply.
+statement ok
+CREATE OR REPLACE SECRET hdfs_conf (TYPE hdfs, SCOPE 'hdfs://other:8020', CONFIG_DIR '/nonexistent');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
+----
+IO Error
+
+statement ok
+DROP SECRET hdfs_conf;
+
+statement error
+CREATE SECRET (TYPE hdfs, PASSWORD 'x');
+----
+Unknown parameter "password" for secret type "hdfs"

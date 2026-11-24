@@ -1,0 +1,196 @@
+# name: test/sql/hdfs_edge.test
+# description: Reads and writes at block, prefetch-window and end-of-file boundaries, and empty and 1-byte files.
+# group: [sql]
+
+require hdfs
+
+require-env HDFS_TEST_RUNNING
+
+# The test cluster uses 1 MiB blocks, and on open the client fetches the
+# locations of the first 2 blocks only (dfs.prefetchsize; see
+# test/hdfs-conf/hdfs-site.xml). Reads past 2 MiB must fetch more locations.
+# Fixtures under /edge and /ez/edge come from test/scripts/hdfs_up.sh.
+
+# payload(n): n bytes of deterministic content (hex digits), to write and compare.
+statement ok
+CREATE MACRO payload(n) AS (SELECT substr(string_agg(md5(range::VARCHAR), '' ORDER BY range), 1, n) FROM range(n // 32 + 1));
+
+# --- files written by the Java client ------------------------------------------------
+
+query III
+SELECT size, content = ''::BLOB, content IS NULL FROM read_blob('hdfs://localhost:9000/edge/java_empty.bin');
+----
+0	true	false
+
+query II
+SELECT size, block_size FROM hdfs_stat('hdfs://localhost:9000/edge/java_empty.bin');
+----
+0	1048576
+
+query I
+SELECT content FROM read_text('hdfs://localhost:9000/edge/java_empty.bin');
+----
+(empty)
+
+query II
+SELECT size, content FROM read_text('hdfs://localhost:9000/edge/java_one.bin');
+----
+1	x
+
+# An empty file reads as an empty CSV, as a local one does.
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/edge/java_empty.bin');
+----
+0
+
+# A glob that matches only the empty file.
+query I
+SELECT count(*) FROM read_blob('hdfs://localhost:9000/edge/java_empty*');
+----
+1
+
+# seq 1 1000000: 6,888,896 bytes in 7 blocks, plain and in the encryption zone.
+foreach dir edge ez/edge
+
+query III
+SELECT size, block_size, size > 2 * block_size FROM hdfs_stat('hdfs://localhost:9000/{dir}/java_seq.txt');
+----
+6888896	1048576	true
+
+statement ok
+SET threads = 1;
+
+query II
+SELECT count(*), sum(n) FROM read_csv('hdfs://localhost:9000/{dir}/java_seq.txt', header := false, columns := {'n': 'BIGINT'});
+----
+1000000	500000500000
+
+statement ok
+SET threads = 8;
+
+query II
+SELECT count(*), sum(n) FROM read_csv('hdfs://localhost:9000/{dir}/java_seq.txt', header := false, columns := {'n': 'BIGINT'}, buffer_size := 300007);
+----
+1000000	500000500000
+
+statement ok
+RESET threads;
+
+endloop
+
+# One read of the whole file (read_blob) crosses every block; the plain and the
+# decrypted bytes match.
+query I
+SELECT count(DISTINCT md5(content)) FROM read_blob(['hdfs://localhost:9000/edge/java_seq.txt', 'hdfs://localhost:9000/ez/edge/java_seq.txt']);
+----
+1
+
+# --- files DuckDB writes ---------------------------------------------------------------
+# Sizes on either side of the first block boundary (1 MiB), of the prefetch
+# window (2 MiB), and a file of several blocks that doesn't end on a boundary.
+# Encrypted writes (/ez) carry the AES-CTR position across blocks.
+
+foreach dir edge ez/edge
+
+foreach size 0 1 1048575 1048576 1048577 2097151 2097152 2097153 5255225
+
+statement ok
+COPY (SELECT payload({size})::BLOB) TO 'hdfs://localhost:9000/{dir}/duck/{size}.bin' (FORMAT BLOB);
+
+query III
+SELECT size = {size}, octet_length(content) = {size}, md5(content) = md5(payload({size}))
+FROM read_blob('hdfs://localhost:9000/{dir}/duck/{size}.bin');
+----
+true	true	true
+
+query II
+SELECT size = {size}, block_size FROM hdfs_stat('hdfs://localhost:9000/{dir}/duck/{size}.bin');
+----
+true	1048576
+
+endloop
+
+# Overwriting a multi-block file with a shorter one, then with a longer one.
+statement ok
+COPY (SELECT payload(1048577)::BLOB) TO 'hdfs://localhost:9000/{dir}/duck/5255225.bin' (FORMAT BLOB);
+
+query II
+SELECT size, md5(content) = md5(payload(1048577)) FROM read_blob('hdfs://localhost:9000/{dir}/duck/5255225.bin');
+----
+1048577	true
+
+statement ok
+COPY (SELECT payload(3145731)::BLOB) TO 'hdfs://localhost:9000/{dir}/duck/5255225.bin' (FORMAT BLOB);
+
+query II
+SELECT size, md5(content) = md5(payload(3145731)) FROM read_blob('hdfs://localhost:9000/{dir}/duck/5255225.bin');
+----
+3145731	true
+
+# A CSV of several blocks, read front to back and at scattered offsets (small
+# read buffers that don't line up with blocks).
+statement ok
+COPY (SELECT range AS v, md5(range::VARCHAR) AS s FROM range(150000)) TO 'hdfs://localhost:9000/{dir}/duck/rows.csv' (FORMAT csv, HEADER);
+
+statement ok
+SET threads = 1;
+
+query IIII
+SELECT count(*), sum(v), min(s), max(s) FROM read_csv('hdfs://localhost:9000/{dir}/duck/rows.csv', buffer_size := 300007);
+----
+150000	11249925000	00003e3b9e5336685200ae85d21b4f5e	fffffe98d0963d27015c198262d97221
+
+statement ok
+SET threads = 8;
+
+query IIII
+SELECT count(*), sum(v), min(s), max(s) FROM read_csv('hdfs://localhost:9000/{dir}/duck/rows.csv', buffer_size := 300007);
+----
+150000	11249925000	00003e3b9e5336685200ae85d21b4f5e	fffffe98d0963d27015c198262d97221
+
+statement ok
+RESET threads;
+
+endloop
+
+# The plain and encrypted copies hold the same bytes.
+query I
+SELECT count(DISTINCT md5(content)) FROM read_blob(['hdfs://localhost:9000/edge/duck/rows.csv', 'hdfs://localhost:9000/ez/edge/duck/rows.csv']);
+----
+1
+
+# --- Parquet: the first read is the footer, past the prefetched locations ----------------
+
+require parquet
+
+foreach dir edge ez/edge
+
+statement ok
+COPY (SELECT range AS n, md5(range::VARCHAR) AS h FROM range(300000))
+TO 'hdfs://localhost:9000/{dir}/duck/multi.parquet' (FORMAT parquet, ROW_GROUP_SIZE 100000);
+
+query I
+SELECT size > 4 * block_size FROM hdfs_stat('hdfs://localhost:9000/{dir}/duck/multi.parquet');
+----
+true
+
+statement ok
+SET threads = 1;
+
+query III
+SELECT count(*), sum(n), count(DISTINCT h) FROM read_parquet('hdfs://localhost:9000/{dir}/duck/multi.parquet');
+----
+300000	44999850000	300000
+
+statement ok
+SET threads = 8;
+
+query III
+SELECT count(*), sum(n), count(DISTINCT h) FROM read_parquet('hdfs://localhost:9000/{dir}/duck/multi.parquet');
+----
+300000	44999850000	300000
+
+statement ok
+RESET threads;
+
+endloop

@@ -1,0 +1,284 @@
+# name: test/sql/hdfs_access.test
+# description: hdfs_ls, hdfs_stat and hdfs_exists obey enable_external_access,
+# group: [sql]
+
+#              allowed_directories and allowed_paths, as reads through DuckDB's file system do. Needs no cluster:
+#              a refused call fails before connecting, an allowed one gets as far as the (unreachable) NameNode.
+#              A separate file because enable_external_access can't be turned back on.
+
+require hdfs
+
+# --- enable_external_access = false -------------------------------------------------
+
+# '/data/' is a local directory: it must not grant access to /data on HDFS.
+statement ok
+SET allowed_directories = ['hdfs://127.0.0.1:1/allowed', '/data/', '{TEST_DIR}/'];
+
+statement ok
+SET allowed_paths = ['hdfs://127.0.0.1:1/one.csv'];
+
+# '~' expands to an allowed directory, so only the CONFIG_DIR absolute-path rule (below) can refuse '~/hadoop'.
+statement ok
+SET home_directory = '/data';
+
+statement ok
+PREPARE ls_data AS SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data');
+
+statement ok
+PREPARE exists_data AS SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
+
+statement error
+EXECUTE ls_data;
+----
+IO Error
+
+# A Hadoop configuration in an allowed directory, for a config_snapshot secret to capture below.
+statement ok
+COPY (SELECT '<configuration><property><name>hadoop.security.authentication</name><value>captured_bogus</value></property></configuration>')
+TO '{TEST_DIR}/core-site.xml' (FORMAT csv, HEADER false);
+
+# A snapshot secret made while access is allowed keeps working once it is disabled (it reads no local file).
+statement ok
+CREATE SECRET early_snapshot (TYPE hdfs, PROVIDER config_snapshot, SCOPE 'hdfs://127.0.0.1:1/allowed/snapshot',
+    PROPERTIES MAP {'hadoop.security.authentication': 'bogus'});
+
+statement ok
+SET enable_external_access = false;
+
+# Binding needs no access, so DESCRIBE still works.
+statement ok
+DESCRIBE SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data');
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/data');
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/data" - file system operations are disabled by configuration
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/**');
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/**" - file system operations are disabled by configuration
+
+statement error
+SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/data');
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/data" - file system operations are disabled by configuration
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/data');
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/data" - file system operations are disabled by configuration
+
+# Only hdfs:// URLs are accepted. A scheme-less path would be a path on fs.defaultFS that the allowed_directories
+# check judges as a local path: with '/tmp/' allowed for local files, hdfs_ls('/tmp') would list HDFS /tmp.
+statement error
+SELECT * FROM hdfs_stat('/data');
+----
+Invalid Input Error: hdfs_stat: '/data' is not an hdfs:// URL (use hdfs:///path for a path on fs.defaultFS)
+
+statement error
+SELECT * FROM hdfs_ls('/data/x');
+----
+Invalid Input Error: hdfs_ls: '/data/x' is not an hdfs:// URL (use hdfs:///path for a path on fs.defaultFS)
+
+statement error
+SELECT hdfs_exists('/data/x');
+----
+Invalid Input Error: hdfs_exists: '/data/x' is not an hdfs:// URL (use hdfs:///path for a path on fs.defaultFS)
+
+statement error
+SELECT * FROM hdfs_ls('');
+----
+Invalid Input Error: hdfs_ls: '' is not an hdfs:// URL (use hdfs:///path for a path on fs.defaultFS)
+
+statement error
+SELECT hdfs_exists('s3://bucket/x');
+----
+Invalid Input Error: hdfs_exists: 's3://bucket/x' is not an hdfs:// URL (use hdfs:///path for a path on fs.defaultFS)
+
+# Since v2.0.1, DuckDB's allowed_directories check refuses a '..' component in a remote path itself (with external
+# access enabled the extension refuses it, see hdfs_no_cluster.test). A '.' component passes that check; the extension
+# refuses it before any connection is made (HDFS forbids '.' and '..' in names anyway).
+statement error
+SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/allowed/../secret');
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/allowed/../secret" - file system operations are disabled by configuration
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/../secret/*.csv');
+----
+<REGEX>:Permission Error: Cannot access .*"hdfs://127\.0\.0\.1:1/allowed/\.\./secret.*" - file system operations are disabled by configuration.*
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/./a');
+----
+Invalid Input Error: HDFS path 'hdfs://127.0.0.1:1/allowed/./a' has a '.' component; HDFS paths cannot contain '.' or '..'
+
+statement error
+SELECT * FROM read_csv('hdfs://127.0.0.1:1/allowed/../secret.csv');
+----
+<REGEX>:.*Permission Error: Cannot access .*hdfs://127\.0\.0\.1:1/allowed/\.\./secret\.csv.*disabled by configuration.*
+
+# A '.' or '..' spelled through a brace group or escapes appears only once the pattern is expanded: refused then,
+# still before connecting (the NameNode at 127.0.0.1:1 would give an IO Error). Neither the listing nor a
+# metadata-only scan (answered from the listing) may reach /secret.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/{..}/secret');
+----
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern 'hdfs://127\.0\.0\.1:1/allowed/\{\.\.\}/secret'.*has a '\.\.' component.*cannot contain '\.' or '\.\.'.*
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/\.\./secret/*');
+----
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern .*has a '\.\.' component.*
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/{.}{.}/secret/*');
+----
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern .*has a '\.\.' component.*
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/{x,.}/secret');
+----
+<REGEX>:Invalid Input Error: Failed to glob HDFS pattern .*has a '\.' component.*
+
+statement error
+SELECT size FROM read_blob('hdfs://127.0.0.1:1/allowed/{..}/secret/x');
+----
+<REGEX>:.*Invalid Input Error.*has a '\.\.' component.*
+
+statement error
+SELECT * FROM glob('hdfs://127.0.0.1:1/allowed/\.\./secret/*');
+----
+<REGEX>:.*Invalid Input Error.*has a '\.\.' component.*
+
+# A secret's CONFIG_DIR is read by the HDFS client itself, outside DuckDB's file system: it must be allowed like any
+# local read. '/data/' is allowed above; '/etc' is not.
+statement ok
+CREATE SECRET outside_conf (TYPE hdfs, CONFIG_DIR '/etc', SCOPE 'hdfs://127.0.0.1:1/allowed/conf');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf/x');
+----
+Permission Error: Cannot use HDFS secret 'outside_conf': with enable_external_access = false, its CONFIG_DIR '/etc' must be an absolute path in allowed_directories or allowed_paths (set them before disabling external access), or leave CONFIG_DIR out to use HADOOP_CONF_DIR
+
+# The check canonicalises '..' as for local reads: '/data/../etc' is '/etc'.
+statement ok
+CREATE OR REPLACE SECRET outside_conf (TYPE hdfs, CONFIG_DIR '/data/../etc', SCOPE 'hdfs://127.0.0.1:1/allowed/conf');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf/x');
+----
+<REGEX>:Permission Error: Cannot use HDFS secret 'outside_conf': with enable_external_access = false, its CONFIG_DIR '/data/\.\./etc' must be.*
+
+# The client is handed the string as given, so it must be the path that was checked: a '~' or 'file://' spelling
+# (which the check would expand or strip, and libhdfs3 wouldn't) is refused. Both name the allowed /data/hadoop
+# once expanded or stripped, so only the absolute-path rule refuses them.
+statement ok
+CREATE OR REPLACE SECRET outside_conf (TYPE hdfs, CONFIG_DIR '~/hadoop', SCOPE 'hdfs://127.0.0.1:1/allowed/conf');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf/x');
+----
+<REGEX>:Permission Error: Cannot use HDFS secret 'outside_conf': with enable_external_access = false, its CONFIG_DIR '~/hadoop' must be an absolute path.*
+
+statement ok
+CREATE OR REPLACE SECRET outside_conf (TYPE hdfs, CONFIG_DIR 'file:///data/hadoop', SCOPE 'hdfs://127.0.0.1:1/allowed/conf');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf/x');
+----
+<REGEX>:Permission Error: Cannot use HDFS secret 'outside_conf': with enable_external_access = false, its CONFIG_DIR 'file:///data/hadoop' must be an absolute path.*
+
+statement error
+SELECT * FROM read_csv('hdfs://127.0.0.1:1/allowed/conf/x.csv');
+----
+<REGEX>:.*Permission Error: Cannot use HDFS secret 'outside_conf'.*
+
+# An allowed one passes the check and gets as far as reading its (missing) configuration.
+statement ok
+CREATE SECRET inside_conf (TYPE hdfs, CONFIG_DIR '/data/hadoop', SCOPE 'hdfs://127.0.0.1:1/allowed/conf2');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/conf2/x');
+----
+<REGEX>:.*config_dir '/data/hadoop' has no core-site.xml or hdfs-site.xml.*
+
+# An allowed directory is a whole path component: a sibling with the same prefix is refused.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed2');
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/allowed2" - file system operations are disabled by configuration
+
+statement error
+SELECT hdfs_exists(p) FROM (VALUES ('hdfs://127.0.0.1:1/other/b'), ('hdfs://127.0.0.1:1/allowed/a')) t(p);
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/other/b" - file system operations are disabled by configuration
+
+# Allowed paths pass the check and get as far as the NameNode, which isn't there.
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed');
+----
+IO Error
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://127.0.0.1:1/allowed/sub/*.csv');
+----
+IO Error
+
+statement error
+SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/allowed/sub');
+----
+IO Error
+
+statement error
+SELECT * FROM hdfs_stat('hdfs://127.0.0.1:1/one.csv');
+----
+IO Error
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/a.csv');
+----
+IO Error
+
+# Statements prepared while access was allowed are checked again when they run.
+statement error
+EXECUTE ls_data;
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/data" - file system operations are disabled by configuration
+
+statement error
+EXECUTE exists_data;
+----
+Permission Error: Cannot access path "hdfs://127.0.0.1:1/data" - file system operations are disabled by configuration
+
+# --- config_snapshot secrets ----------------------------------------------------------
+
+# Properties name NameNodes, the KMS and local paths, so they can't be set from SQL while access is disabled...
+statement error
+CREATE SECRET late_snapshot (TYPE hdfs, PROVIDER config_snapshot, SCOPE 'hdfs://127.0.0.1:1/allowed/late',
+    PROPERTIES MAP {'fs.defaultFS': 'hdfs://elsewhere:8020'});
+----
+Permission Error: HDFS secret 'late_snapshot': PROPERTIES can't be set while enable_external_access = false
+
+# ...but one made beforehand is used without a check: the call gets as far as reading its configuration.
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/snapshot/x');
+----
+hadoop.security.authentication=bogus is not supported
+
+# CONFIG_DIR is read through DuckDB's file system, so a directory allowed_directories covers can be captured...
+statement ok
+CREATE SECRET allowed_capture (TYPE hdfs, PROVIDER config_snapshot, SCOPE 'hdfs://127.0.0.1:1/allowed/captured',
+    CONFIG_DIR '{TEST_DIR}');
+
+statement error
+SELECT hdfs_exists('hdfs://127.0.0.1:1/allowed/captured/x');
+----
+hadoop.security.authentication=captured_bogus is not supported
+
+# ...and any other can't.
+statement error
+CREATE SECRET outside_capture (TYPE hdfs, PROVIDER config_snapshot, CONFIG_DIR '/etc/hadoop');
+----
+Permission Error

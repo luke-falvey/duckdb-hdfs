@@ -25,6 +25,17 @@ SELECT * FROM read_csv('hdfs://localhost:9000/permtest/**/*.csv');
 ----
 Permission denied
 
+# A walk that fails while other workers are still listing must stop cleanly
+# (repeated: the teardown used to race with workers starting new threads).
+loop i 0 20
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://localhost:9000/permtest/**');
+----
+Permission denied
+
+endloop
+
 # Opting in prunes the forbidden subtree and keeps everything readable. The
 # locked directory itself still appears: its name comes from the parent's
 # (permitted) listing; only its contents are unknown.
@@ -68,5 +79,57 @@ Permission denied
 # hdfs_exists reports a permission failure as an error, not as "does not exist".
 statement error
 SELECT hdfs_exists('hdfs://localhost:9000/permtest/locked/b.csv');
+----
+Permission denied
+
+# --- writes without permission ----------------------------------------------------------
+# A write the NameNode refuses fails the COPY and leaves nothing behind.
+statement error
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/permtest/locked/new.csv' (FORMAT csv);
+----
+Permission denied
+
+statement error
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/permtest/open/new.csv' (FORMAT csv);
+----
+Permission denied
+
+query I
+SELECT hdfs_exists('hdfs://localhost:9000/permtest/open/new.csv');
+----
+false
+
+# --- secret scopes match whole path components --------------------------------------------
+# A secret scoped to /permtest/lock does not cover /permtest/locked: the read stays guest's.
+statement ok
+CREATE SECRET as_superuser (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest/lock', USER 'hadoop');
+
+statement error
+SELECT * FROM read_csv('hdfs://localhost:9000/permtest/locked/b.csv');
+----
+Permission denied
+
+# Scoped to the directory itself (with or without a trailing '/'), it applies.
+statement ok
+CREATE OR REPLACE SECRET as_superuser (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest/locked', USER 'hadoop');
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/permtest/locked/b.csv');
+----
+3
+
+statement ok
+CREATE OR REPLACE SECRET as_superuser (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest/locked/', USER 'hadoop');
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/permtest/locked/b.csv');
+----
+3
+
+statement ok
+DROP SECRET as_superuser;
+
+statement error
+SELECT * FROM read_csv('hdfs://localhost:9000/permtest/locked/b.csv');
 ----
 Permission denied

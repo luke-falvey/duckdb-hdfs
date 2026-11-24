@@ -9,6 +9,26 @@
         <name>dfs.client.use.datanode.hostname</name>
         <value>true</value>
     </property>
+    <!--
+      Small blocks (1 MiB, the NameNode's minimum) and a short block-location
+      prefetch, so the tests' files span several blocks and reads go past the
+      locations fetched on open (dfs.prefetchsize blocks, here 2 MiB).
+      dfs.default.blocksize and dfs.prefetchsize are libhdfs3's keys;
+      dfs.blocksize is Hadoop's. The benchmark (test/bench/run_bench.sh) drops
+      all three for the defaults.
+    -->
+    <property>
+        <name>dfs.default.blocksize</name>
+        <value>1048576</value>
+    </property>
+    <property>
+        <name>dfs.blocksize</name>
+        <value>1048576</value>
+    </property>
+    <property>
+        <name>dfs.prefetchsize</name>
+        <value>2</value>
+    </property>
     <property>
         <name>dfs.replication</name>
         <value>1</value>

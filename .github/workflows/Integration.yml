@@ -1,0 +1,91 @@
+#
+# Builds the extension on Linux and runs the tests the distribution pipeline can't: the C++ unit tests, the Docker
+# HDFS cluster tests (test/scripts/run_hdfs_tests.sh), the Kerberos suite in every wire-protection mode
+# (test/scripts/run_kerberos_tests.sh), and the benchmark's NameNode RPC ceilings (test/bench/run_bench.sh --check).
+#
+name: Integration Tests
+on:
+  # Pushes to the long-lived branches only: a push to a pull request's branch already runs as pull_request, and
+  # running both doubles a multi-hour job. Docs-only changes don't run it.
+  push:
+    branches: [main, duckdb-review]
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+# One group per pull request or branch, so a new push cancels the run it supersedes; on main and duckdb-review every
+# commit keeps its own run (its sha is in the group).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ (github.ref != 'refs/heads/main' && github.ref != 'refs/heads/duckdb-review') || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Unit and cluster tests (linux_amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      GEN: ninja
+      # The vcpkg commit the distribution pipeline uses (extension-ci-tools' _extension_distribution.yml,
+      # input vcpkg_commit). Keep the two in step; see docs/UPDATING.md.
+      VCPKG_COMMIT: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      VCPKG_TARGET_TRIPLET: x64-linux-release
+      VCPKG_HOST_TRIPLET: x64-linux-release
+      # DuckDB's public read-only cache for the common ports, and this workflow's own cache for the rest (the
+      # overlay ports in vcpkg_ports/: libhdfs3, gsasl, krb5).
+      VCPKG_BINARY_SOURCES: "clear;http,https://vcpkg-cache.duckdb.org,read;files,${{ github.workspace }}/.vcpkg-cache,readwrite"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -y -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ninja-build ccache pkg-config autoconf \
+            automake libtool bison
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.vcpkg-cache
+          key: vcpkg-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg_ports/**') }}
+          restore-keys: vcpkg-${{ env.VCPKG_COMMIT }}-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-integration-${{ hashFiles('.gitmodules') }}-${{ github.sha }}
+          restore-keys: ccache-integration-${{ hashFiles('.gitmodules') }}-
+
+      - name: Set up vcpkg
+        run: |
+          mkdir -p .vcpkg-cache
+          git clone https://github.com/microsoft/vcpkg vcpkg
+          git -C vcpkg checkout -q "${VCPKG_COMMIT}"
+          vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Build
+        run: make release
+
+      - name: Unit tests
+        run: make test_unit
+
+      - name: SQL tests (no cluster)
+        run: make test
+
+      - name: Cluster tests (Docker)
+        run: test/scripts/run_hdfs_tests.sh
+
+      - name: Kerberos tests (Docker, every wire-protection mode)
+        run: test/scripts/run_kerberos_tests.sh
+
+      - name: Benchmark RPC ceilings
+        env:
+          BENCH_QUICK: 1
+        run: test/bench/run_bench.sh --runs 1 --check

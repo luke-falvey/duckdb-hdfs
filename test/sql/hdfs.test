@@ -14,8 +14,6 @@
 
 require hdfs
 
-require parquet
-
 require-env HDFS_TEST_RUNNING
 
 # The effective user comes from the Hadoop environment (HADOOP_USER_NAME here,
@@ -41,18 +39,6 @@ query I
 SELECT count(*) FROM read_csv('hdfs:///test/data.csv');
 ----
 3
-
-# --- reading Parquet over hdfs:// --------------------------------------------
-
-query I
-SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/data.parquet');
-----
-5
-
-query IT
-SELECT id, name FROM read_parquet('hdfs://localhost:9000/test/data.parquet') ORDER BY id LIMIT 1;
-----
-0	v0
 
 # --- globbing ----------------------------------------------------------------
 
@@ -231,6 +217,12 @@ SELECT * FROM hdfs_ls('hdfs://localhost:9000/test/**/a/**');
 ----
 multiple '**'
 
+# The sticky bit shows as 't', as in `hdfs dfs -ls`, and is part of mode (01777 = 1023).
+query TI
+SELECT permissions, mode FROM hdfs_stat('hdfs://localhost:9000/sticky');
+----
+rwxrwxrwt	1023
+
 # hdfs_stat returns exactly one row for a single path, file or directory.
 query TT
 SELECT name, type FROM hdfs_stat('hdfs://localhost:9000/test/nested');
@@ -246,6 +238,7 @@ data.parquet	file
 statement error
 SELECT * FROM hdfs_stat('hdfs://localhost:9000/test/does_not_exist');
 ----
+Failed to stat HDFS path 'hdfs://localhost:9000/test/does_not_exist'
 
 # hdfs_exists is a scalar boolean predicate (true for files and directories).
 query I
@@ -262,6 +255,95 @@ query I
 SELECT count(*) FROM range(1) WHERE hdfs_exists('hdfs://localhost:9000/test/does_not_exist');
 ----
 0
+
+# A walk abandoned after the first row (LIMIT) stops its workers cleanly; the
+# loop repeats it because teardown used to race with workers starting threads.
+loop i 0 20
+
+query I
+SELECT count(*) FROM (SELECT path FROM hdfs_ls('hdfs://localhost:9000/**', include_hidden := true) LIMIT 1);
+----
+1
+
+endloop
+
+# More rows than one output vector (2048): 1,100 partition directories, each
+# holding one file.
+statement ok
+COPY (SELECT range AS p, range AS v FROM range(1100)) TO 'hdfs://localhost:9000/many' (FORMAT csv, PARTITION_BY (p));
+
+query III
+SELECT count(*), count(*) FILTER (type = 'directory'), count(DISTINCT path) FROM hdfs_ls('hdfs://localhost:9000/many/**');
+----
+2200	1100	2200
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/many/*/*.csv');
+----
+1100
+
+query I
+SELECT count(*) FROM (SELECT * FROM hdfs_ls('hdfs://localhost:9000/many/**') LIMIT 0);
+----
+0
+
+# The same walk listing one directory per NameNode call.
+statement ok
+SET hdfs_batched_listing = false;
+
+query II
+SELECT count(*), count(*) FILTER (type = 'directory') FROM hdfs_ls('hdfs://localhost:9000/many/**');
+----
+2200	1100
+
+query I
+SELECT count(*) FROM glob('hdfs://localhost:9000/many/*/*.csv');
+----
+1100
+
+statement ok
+RESET hdfs_batched_listing;
+
+# Glob results come back sorted by path, as with local globs, although the
+# walk lists directories in parallel.
+query I
+SELECT list(file) = list_sort(list(file)) FROM glob('hdfs://localhost:9000/many/*/*.csv');
+----
+true
+
+# A file whose name contains glob characters: the pattern matches nothing, so
+# the path is taken literally (as DuckDB's local glob does).
+statement ok
+COPY (SELECT 42 AS v) TO 'hdfs://localhost:9000/lit/data[1].csv' (FORMAT csv, HEADER);
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:9000/lit/data[1].csv');
+----
+42
+
+# A long walk stops at the query deadline (one listing call at a time, so it
+# is still running when the deadline passes).
+statement ok
+SET hdfs_list_parallelism = 1;
+
+statement ok
+SET max_execution_time = 1;
+
+statement error
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/many/**');
+----
+Query exceeded maximum execution time
+
+statement error
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/many/*/*.csv');
+----
+Query exceeded maximum execution time
+
+statement ok
+RESET max_execution_time;
+
+statement ok
+RESET hdfs_list_parallelism;
 
 # --- hidden entries (/hidtest fixtures) ---------------------------------------
 # Names starting with '_' or '.' (Hadoop's hidden convention) are excluded from
@@ -359,6 +441,141 @@ SELECT count(*) FROM glob('hdfs://localhost:9000/hidtest/**');
 statement ok
 RESET hdfs_include_hidden;
 
+# --- hdfs secrets -------------------------------------------------------------------
+
+# A secret scoped to /permtest acts as the unprivileged user "guest" there,
+# while the rest of the cluster keeps the environment's (super)user.
+statement ok
+CREATE SECRET as_guest (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest', USER 'guest');
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
+----
+Permission denied
+
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/permtest/open');
+----
+1
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/data.csv');
+----
+3
+
+statement ok
+DROP SECRET as_guest;
+
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
+----
+1
+
+# Scopes match whole path components: a secret for /permtest/lock doesn't apply
+# to /permtest/locked (here the environment's superuser can list it).
+statement ok
+CREATE SECRET as_guest_prefix (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest/lock', USER 'guest');
+
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
+----
+1
+
+statement ok
+DROP SECRET as_guest_prefix;
+
+# Replacing a secret replaces its connection: the new USER takes effect.
+statement ok
+CREATE SECRET as_who (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest/', USER 'guest');
+
+statement error
+SELECT * FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
+----
+Permission denied
+
+statement ok
+CREATE OR REPLACE SECRET as_who (TYPE hdfs, SCOPE 'hdfs://localhost:9000/permtest/', USER 'hadoop');
+
+query I
+SELECT count(*) FROM hdfs_ls('hdfs://localhost:9000/permtest/locked');
+----
+1
+
+statement ok
+DROP SECRET as_who;
+
+# hdfs_reset_connections() drops the cached connections; the next access
+# reconnects.
+query I
+SELECT connections_dropped > 0 FROM hdfs_reset_connections();
+----
+true
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/data.csv');
+----
+3
+
+query I
+SELECT connections_dropped FROM hdfs_reset_connections();
+----
+1
+
+query I
+SELECT connections_dropped FROM hdfs_reset_connections();
+----
+0
+
+# --- logging --------------------------------------------------------------------
+
+# Opens, reads, writes and closes show up in DuckDB's FileSystem log.
+statement ok
+CALL enable_logging('FileSystem');
+
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/logged.csv' (FORMAT csv);
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/logged.csv');
+----
+1
+
+query II
+SELECT DISTINCT fs, op FROM duckdb_logs_parsed('FileSystem') WHERE path = 'hdfs://localhost:9000/test/logged.csv' ORDER BY op;
+----
+HdfsFileSystem	CLOSE
+HdfsFileSystem	OPEN
+HdfsFileSystem	READ
+HdfsFileSystem	WRITE
+
+statement ok
+CALL disable_logging();
+
+# --- error handling ----------------------------------------------------------
+
+# Opening a non-existent file surfaces a clear IO error.
+statement error
+SELECT * FROM read_csv('hdfs://localhost:9000/test/does_not_exist.csv');
+----
+No files found that match the pattern "hdfs://localhost:9000/test/does_not_exist.csv"
+
+# --- everything below needs the parquet extension ------------------------
+# Kept last, so the tests above still run without it.
+
+require parquet
+
+# --- reading Parquet over hdfs:// --------------------------------------------
+
+query I
+SELECT count(*) FROM read_parquet('hdfs://localhost:9000/test/data.parquet');
+----
+5
+
+query IT
+SELECT id, name FROM read_parquet('hdfs://localhost:9000/test/data.parquet') ORDER BY id LIMIT 1;
+----
+0	v0
+
 # --- writing (COPY TO) then reading back -------------------------------------
 # Writes go under nested/ so they can't perturb the /test/*.{csv,parquet} globs.
 
@@ -435,6 +652,83 @@ SELECT hdfs_exists('hdfs://localhost:9000/test/nested/failed_part');
 ----
 false
 
+# A single-file COPY that fails partway leaves no file behind: the aborted
+# write is removed, never completed (an HDFS close publishes the file).
+statement error
+COPY (SELECT CASE WHEN range = 500000 THEN error('boom') ELSE range END AS v FROM range(1000000))
+TO 'hdfs://localhost:9000/test/nested/aborted.csv' (FORMAT csv);
+----
+boom
+
+query I
+SELECT hdfs_exists('hdfs://localhost:9000/test/nested/aborted.csv');
+----
+false
+
+statement error
+COPY (SELECT CASE WHEN range = 500000 THEN error('boom') ELSE range END AS v FROM range(1000000))
+TO 'hdfs://localhost:9000/test/nested/aborted.parquet' (FORMAT parquet);
+----
+boom
+
+query I
+SELECT hdfs_exists('hdfs://localhost:9000/test/nested/aborted.parquet');
+----
+false
+
+# A failing USE_TMP_FILE overwrite keeps the original file intact, and the
+# temporary file is gone.
+statement error
+COPY (SELECT CASE WHEN range = 50000 THEN error('boom') ELSE 3 END AS v FROM range(100000))
+TO 'hdfs://localhost:9000/test/nested/tmpfile.csv' (FORMAT csv, HEADER, USE_TMP_FILE true);
+----
+boom
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:9000/test/nested/tmpfile.csv');
+----
+2
+
+query I
+SELECT hdfs_exists('hdfs://localhost:9000/test/nested/tmp_tmpfile.csv');
+----
+false
+
+# Writing over an existing file without USE_TMP_FILE replaces it; a file that
+# didn't exist is created exclusively (DuckDB's CSV writer asks for that).
+statement ok
+COPY (SELECT 1 AS v) TO 'hdfs://localhost:9000/test/nested/replaced.csv' (FORMAT csv, HEADER);
+
+statement ok
+COPY (SELECT 2 AS v) TO 'hdfs://localhost:9000/test/nested/replaced.csv' (FORMAT csv, HEADER);
+
+query I
+SELECT v FROM read_csv('hdfs://localhost:9000/test/nested/replaced.csv');
+----
+2
+
+# Partition directories are created one level at a time (CreateDirectoryExtended
+# honours SINGLE): as for local files, the output directory's parent must exist.
+statement error
+COPY (SELECT range % 2 AS a, range AS v FROM range(12))
+TO 'hdfs://localhost:9000/test/nested/no_parent/part' (FORMAT csv, PARTITION_BY (a));
+----
+Failed to create HDFS directory
+
+query I
+SELECT hdfs_exists('hdfs://localhost:9000/test/nested/no_parent');
+----
+false
+
+statement ok
+COPY (SELECT range % 2 AS a, range % 3 AS b, range AS v FROM range(12))
+TO 'hdfs://localhost:9000/test/nested/deep_part' (FORMAT csv, PARTITION_BY (a, b));
+
+query I
+SELECT count(*) FROM read_csv('hdfs://localhost:9000/test/nested/deep_part/*/*/*.csv');
+----
+12
+
 # Concurrent positional reads: a multi-row-group Parquet file read by many
 # threads at once.
 statement ok
@@ -490,6 +784,7 @@ RESET threads;
 statement error
 SELECT * FROM read_parquet('hdfs://localhost:9000/.reserved/raw/ez/roundtrip.parquet');
 ----
+No magic bytes found at end of file
 
 # CTR encryption keeps the size: the plaintext and stored sizes match.
 query I
@@ -512,9 +807,8 @@ SELECT v FROM read_csv('hdfs://localhost:9000/ez/tmp.csv');
 
 # --- caching and read paths ----------------------------------------------------
 
-# A file overwritten between two scans is re-read, not served from DuckDB's
-# external file cache (validated by modification time and size). Both versions
-# have the same size, so only the modification time tells them apart.
+# DuckDB counts hdfs:// as a local scheme, so its external file cache keeps
+# HDFS reads only with cache_local_files.
 statement ok
 SET enable_external_file_cache = true;
 
@@ -526,6 +820,28 @@ SELECT v FROM read_parquet('hdfs://localhost:9000/test/cache.parquet');
 ----
 1
 
+query I
+SELECT count(*) FROM duckdb_external_file_cache() WHERE path LIKE 'hdfs://%/test/cache.parquet';
+----
+0
+
+statement ok
+SET cache_local_files = true;
+
+query I
+SELECT v FROM read_parquet('hdfs://localhost:9000/test/cache.parquet');
+----
+1
+
+query I
+SELECT count(*) > 0 FROM duckdb_external_file_cache() WHERE path LIKE 'hdfs://%/test/cache.parquet';
+----
+true
+
+# A file overwritten between two scans is re-read, not served from the cache
+# (validated by modification time and size). Both versions have the same
+# size, so only the modification time tells them apart.
+
 statement ok
 COPY (SELECT 2 AS v) TO 'hdfs://localhost:9000/test/cache.parquet' (FORMAT parquet);
 
@@ -533,6 +849,9 @@ query I
 SELECT v FROM read_parquet('hdfs://localhost:9000/test/cache.parquet');
 ----
 2
+
+statement ok
+RESET cache_local_files;
 
 # A CSV larger than DuckDB's read buffer: one thread reads it front to back,
 # several threads read it at scattered offsets on shared streams; both must
@@ -581,9 +900,65 @@ SELECT count(DISTINCT md5(content)) FROM read_blob(['hdfs://localhost:9000/test/
 statement ok
 RESET threads;
 
-# --- error handling ----------------------------------------------------------
+# --- URLs keep the caller's authority ----------------------------------------------
 
-# Opening a non-existent file surfaces a clear IO error.
-statement error
-SELECT * FROM read_csv('hdfs://localhost:9000/test/does_not_exist.csv');
+# Spellings of a host that differ only in case share one connection; listings and globs still return URLs in the
+# spelling of the call, whichever spelling connected first (as hdfs_stat does). Secret scopes and allowed paths
+# are matched against these URLs as given.
+query I
+SELECT count(*) > 0 FROM hdfs_ls('hdfs://localhost:9000/test');
 ----
+true
+
+query II
+SELECT count(*) > 0, bool_and(starts_with(path, 'hdfs://LOCALHOST:9000/test/')) FROM hdfs_ls('hdfs://LOCALHOST:9000/test');
+----
+true	true
+
+query I
+SELECT bool_and(starts_with(path, 'hdfs://LOCALHOST:9000/test/')) FROM hdfs_ls('hdfs://LOCALHOST:9000/test/*.csv');
+----
+true
+
+query I
+SELECT bool_and(starts_with(filename, 'hdfs://LOCALHOST:9000/test/')) FROM read_csv('hdfs://LOCALHOST:9000/test/seq*.csv', filename = true);
+----
+true
+
+# --- EXPORT / IMPORT DATABASE --------------------------------------------------------
+
+# EXPORT DATABASE writes schema.sql and load.sql through handles it drops without Close(): the destructor commits
+# them. A round trip through HDFS proves both files arrive whole. (Kept last: it switches the default database.)
+statement ok
+ATTACH ':memory:' AS export_src;
+
+statement ok
+USE export_src;
+
+statement ok
+CREATE TABLE t AS SELECT range AS id, 'v' || range AS s FROM range(1000);
+
+statement ok
+CREATE VIEW v AS SELECT id FROM t WHERE id % 2 = 0;
+
+statement ok
+EXPORT DATABASE 'hdfs://localhost:9000/test/export_db' (FORMAT parquet);
+
+statement ok
+ATTACH ':memory:' AS export_dst;
+
+statement ok
+USE export_dst;
+
+statement ok
+IMPORT DATABASE 'hdfs://localhost:9000/test/export_db';
+
+query III
+SELECT count(*), sum(id), max(s) FROM t;
+----
+1000	499500	v999
+
+query I
+SELECT count(*) FROM v;
+----
+500
